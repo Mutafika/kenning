@@ -1,0 +1,10 @@
+/target
+*.db
+*.oplog
+*.lock.tmp
+.DS_Store
+
+# エンジニアリング記録 (local のみ、push しない)
+/PLAN.md
+/docs/zenn-draft.md
+/.cargo/
