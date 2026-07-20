@@ -21,9 +21,10 @@ kenning callers finish_with_oplog     # that's it — the index builds itself on
 ## Why
 
 AI coding agents explore code with `grep` + reading whole files. That works, but it burns
-tokens: a "what is impacted if I change X?" question costs a chain of greps and file reads
-(we measured ~24 KB of tool output for one such question on a mid-size crate). The precise
-answer is a handful of `path:line` rows (~1.2 KB — about **21× less**, one call instead of seven).
+tokens: *"what breaks if I change X?"* becomes a recursive chain of greps and reads —
+hundreds of tool calls for a single question (808 on enchudb, measured below). kenning's
+`impact` answers it from a pre-baked graph in one reply: **13–52× fewer bytes** across the
+benchmark corpora, and the deeper the question the wider the gap.
 
 The classic precise answer is a language server — but rust-analyzer runs resident at
 multi-GB RSS to answer one question at a time, and an agent asks in bursts, from many
@@ -114,7 +115,7 @@ Run it yourself: `./bench/corpus.sh && ./bench/run.sh` — pinned corpora (tokio
 fixed random seed, methodology self-described next to every table. Full output:
 [bench/RESULTS.md](bench/RESULTS.md).
 
-| Suite | tokio (722 files) | ripgrep (100 files) | enchudb (174 files) | What it measures |
+| Suite | tokio (722 files) | ripgrep (100 files) | enchudb (175 files) | What it measures |
 |---|---|---|---|---|
 | **agent** — bytes to answer "who calls X?" | **5.3×** less, 15 calls → 1 | **2.3×** less, 3 calls → 1 | **10.2×** less, 30 calls → 1 | 20 fixed questions, grep-route modeled *optimistically* (lower bound) vs actual `callers` output |
 | **beyond** — "what breaks if I change X?" (`impact`) | **46×**, 321 calls → 1 | **13×**, 75 calls → 1 | **52×**, 808 calls → 1 | transitive-caller BFS: grep route = the manual grep+read recursion an agent actually performs |
@@ -161,10 +162,10 @@ detection is complete. The differences: median 564–878 ms per question (repo w
 call-shape patterns the user must enumerate) vs 13–19 ms (indexed), and no name resolution —
 it cannot say *which* definition a call belongs to, and has no impact/path/faceted/cross-repo.
 
-- Index build: ~1k LOC/ms (enchudb: 174 files / 2,880 symbols / 25,895 call-sites in ~360 ms).
+- Index build: ~1k LOC/ms (enchudb: 175 files / 2,905 symbols / 26,131 call-sites in ~360 ms).
 - Incremental update after a small edit: ~18 ms. Staleness check per query: ~10 ms.
 - `bake`: one rust-analyzer batch run (peak ≈ 5 GB for ~30–50 s), then **zero** resident memory.
-  Resolution on enchudb: 26.6 % (syn only) → 39.7 % (baked, features=all). The unresolved
+  Resolution on enchudb: 26.6 % (syn only) → 39.8 % (baked, features=all). The unresolved
   remainder is dominated by std/external-crate calls, which are still listed as labeled candidates.
 
 ## Deliberate trade-offs — what we don't do, and what it cost

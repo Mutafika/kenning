@@ -1,142 +1,195 @@
 # kenning
 
-enchudb を **コード探索エンジン** として使う PoC。Rust ソースを `syn` でパースして
-symbol / call の fact を enchudb に積み、**faceted 等値 AND + who-calls を µs** で引く。
+**Rust のためのセマンティックコード検索 — AI コーディングエージェント向けに設計。**
+[English README](README.md)
 
+*[kenning](https://en.wikipedia.org/wiki/Kenning) は、概念を凝縮した短い名前に畳む
+古ノルド語の技法 — 海を「鯨の道 (whale-road)」と呼ぶような。このツールはそれをコード
+ベースに対してやる: コールグラフ全体を、エージェントが実際に必要とする数行に圧縮する。
+"ken"（＝知りうる範囲）の意味も含んでいる。*
 
-
-## 使い方
-
-**顧客は「コード探索する AI」**。価値は grep 全マッチ + ファイル通読を、精密な少数行に圧縮すること。
-出力は `path:line<TAB>詳細` = そのまま Read に渡せる (装飾/計測なし・決定的順序)。
+`kenning` は、エージェント（や人間）がコードベースを探索するときに実際に問う質問 —
+*誰がこれを呼ぶ? 変えたら何が壊れる? どの型がこの trait を実装している?* — に、
+ミリ秒で答える。事前に焼いた fact データベースから。常駐する language server も、
+ギガ単位の RAM も、index の儀式も要らない。
 
 ```bash
-cargo install --git https://github.com/Mutafika/kenning   # これだけ (enchudb は pin 済み git dep)
-# ↑ checkout 済みなら cargo install --path . でも可
-
-# 儀式ゼロ: repo 内で聞くだけ。db は ~/.cache/kenning/ に自動作成・古ければ自動増分 update。
-cd <rust-repo> && kenning callers <name>
-
-# 精密化 (rust-analyzer を窯として一発。常駐なし・空きゲート・直列 lock):
-kenning bake                                   # RA scip (features=all 注入) → 精密 index
-
-# 手動制御したい時だけ (db は末尾引数 / --db / env KENNING_DB):
-./target/release/kenning index  [dir] [db]     # full index (root と時刻を db に焼く=自己記述)
-./target/release/kenning update [dir] [db]     # 変更/追加/削除だけ増分 re-index (full と同一結果)
-
-# 探索 (共通 flag: --db <path> / --limit <n>)
-./target/release/kenning def <name>            # 定義位置 + シグネチャ (hover 相当)
-./target/release/kenning read <name> [container]     # 定義本体をそのまま出す (def + Read の 1 手化)
-./target/release/kenning find <substr>         # 名前の部分一致 (発見用、大小無視)
-./target/release/kenning text <term>            # 全文検索 + enclosing symbol 注釈 (grep superset)
-./target/release/kenning callers <name> [container]  # 精密 who-calls (確実 ∪ 未確定候補を位置付き)
-./target/release/kenning callees <name> [container]  # X が呼ぶ先 (outgoing calls、callers の鏡)
-./target/release/kenning edges                       # 全 cross-file call edge の集計 TSV (依存グラフの素材)
-./target/release/kenning refs <name> [container]     # 正確 find-all-refs (要 --scip、型/読み書きも)
-./target/release/kenning impact <name> [container]   # 推移的 callers = 変えると壊れる範囲 (逆 BFS)
-./target/release/kenning tests <name> [container]    # これに届くテスト = impact ∩ is_test
-./target/release/kenning impls <trait|type>          # go-to-implementation (trait↔型)
-./target/release/kenning across <name>              # 全 repo 横断 (repo 跨ぎ精密参照、要 bake)
-./target/release/kenning path <from> <to>            # from→to の呼び出し経路 1 本 (前方 BFS)
-./target/release/kenning search kind:method vis:pub container:Engine  # faceted 等値 AND
-./target/release/kenning outline <path>        # ファイルの symbol 一覧 (Read せず構造把握)
-./target/release/kenning stats                 # 規模 + 名前解決率
+cd your-rust-repo
+kenning callers finish_with_oplog     # これだけ — index は初回クエリで自分で建つ
 ```
 
-`update` は内容 hash で変わったファイルだけ再 parse し、未変更ファイルからの参照 (incoming edge) も
-再解決するので **full 再 index と同一結果**。小ファイル編集で ~18ms（full 再 index ~206ms の ~11x）。
+## なぜ
 
-index は **自己記述**（root と build 時刻を db に焼く）。query 時に root を stat-walk して、index 後に
-更新されたファイルがあれば **stderr に「index が古い→update しろ」と警告**（stdout の path:line は汚さない）。
-編集後に黙って古い結果を返さないための信頼担保。速度重視ループは `KENNING_NO_STALE=1` で無効化。
+AI コーディングエージェントは `grep` ＋ファイル通読でコードを探索する。動くが、token を
+焼く: 「X を変えたら何が壊れる?」は grep とファイル読みの再帰的な連鎖になる — 1 問で
+数百回の tool 呼び出し（enchudb で 808 回、下記で実測）。kenning の `impact` は事前に
+焼いたグラフから 1 レスポンスで答える: ベンチ corpus 全体で **13–52× 少ないバイト**、
+そして問いが深いほど差が広がる。
 
-## 実測 (再現可能スイート — `./bench/corpus.sh && ./bench/run.sh`)
+古典的な精密解は language server だが、rust-analyzer は 1 問ずつ答えるために複数 GB の
+RSS で常駐する。一方でエージェントはバースト的に、多数の repo から、しばしばそのメモリが
+存在しない SSH 先のマシンで問う。
 
-corpus は tag 固定・乱数は固定 seed・手法は表の直上に自己記述。全文は [bench/RESULTS.md](bench/RESULTS.md)。
+`kenning` は第三の道を採る — Meta の Glean や Google の Kythe と同じ形を、ローカルの
+単一バイナリまで縮小したもの:
 
-- **agent** (「誰が呼ぶ?」20 問の tool 出力バイト): 中央値 **2.3x** (ripgrep) / **5.3x** (tokio) /
-  **10.2x** (enchudb) 圧縮、呼び出し 3-30 回 → 1 回。grep 経路は楽観モデル (= 下限)。
-  優位はシンボルの被呼の広さに比例 — 綺麗に設計された ripgrep が正直な床
-- **beyond** (サーチ以外): `impact` (壊れる範囲) = **13-52x**・tool 呼び出し 75-808 回 → 1 回
-  (grep 経路 = agent が実際にやる手動 BFS を模す)。`impls` 10-23x / `outline` 7-12x /
-  `def` 6-10x。**深い問いほど差が開く** — ripgrep でも who-calls 2.3x に対し impact は 13x
-- **quality** (ランダム 100 シンボル): grep `\bname\(` ヒットのノイズ率 中央値 33-43%
-  (最悪例: enchudb `len` = 988 ヒット中、確実 caller は 46)
-- **micro**: faceted AND / def / 確実 callers = 125ns–4µs (warm)
-- **vs rust-analyzer** ([bench/VS-RA.md](bench/VS-RA.md)): cold→who-calls 可能まで、
-  RA `analysis-stats` = 39s / 6.1GB (enchudb) vs kenning index = 0.45s / 175MB・常駐 0。
-  精度差と features の注記は表の直下に明記
-- **vs ast-grep** (agent スイート内、同じ質問): 構造一致は 確実∪候補 とほぼ完全一致
-  (`tie` 321=321、`clone` 621=224+397) = **独立実装による検出完全性の相互検証**。
-  差は速度 (walk 564-878ms vs index 13-19ms) と、名前解決・impact/faceted の有無
-- **vs CodeQL** ([bench/VS-CODEQL.md](bench/VS-CODEQL.md)): 同じ RA ベース facts 構図の本家。
-  構築 68 分/9.9GB/301MB vs 2.4s/174MB/67MB、who-calls 1 問 cache 済でも 47.5s vs 0.1s。
-  lib コードの回答は 44=44 で完全一致 (3 本目の相互検証)、CodeQL は tests/ をほぼ欠落
-- **vs Glean (Meta)** ([bench/VS-GLEAN.md](bench/VS-GLEAN.md)): **同じ .scip を両者に食わせた**
-  serving 層だけの純粋対決 (OrbStack/Rosetta)。取込 8.0s/702MB vs 0.52s/268MB、
-  find-refs 1 問 ~1.0s vs 0.011s、回答は 57 vs 58 で実質一致 (4 本目の相互検証)。
-  disk は Glean 勝ち (14MB vs 87MB)、古い SCIP への耐性も Glean (as-is serve) の設計が上
+1. **Parse**: 全 `.rs` を `syn` でパース（速い・cfg 非依存・ビルド不要）→ symbol /
+   call-site / impl を、埋め込み faceted データベース
+   ([enchudb](https://github.com/Mutafika/enchudb)) の行にする。
+2. **Bake**（任意・コマンド一発）: rust-analyzer を*一度だけ*バッチコンパイラとして走らせ
+   （`kenning bake`）、その SCIP 出力を取り込んで syn の fact と位置 join する。call 解決が
+   rust-analyzer とちょうど同じ正確さになる — そして rust-analyzer は終了する。
+3. **Serve**: fact DB から µs でクエリに答える。全列が自動 index されるので、faceted な
+   連言（`kind:method vis:pub container:Engine calls:unwrap`）は scan でなくバケット交差。
+
+index は自己維持する: 古いファイルは毎クエリで検出され（~10 ms の stat-walk）増分再 index
+される（小編集で ~18 ms）ので、答えが黙って古くなることはない。
+
+## インストール
+
+```bash
+cargo install --git https://github.com/Mutafika/kenning
+```
+
+これでインストールは全部 — ストレージエンジン
+[enchudb](https://github.com/Mutafika/enchudb) は pin された git 依存として一緒に入る。
+精密モード（`bake`）を使うなら rust-analyzer も用意する
+（`rustup component add rust-analyzer`）。
+
+kenning と enchudb を並べて開発する場合は、両方を横に checkout して
+`.cargo/config.toml` で依存をローカルの checkout に向ける:
+
+```toml
+[patch."https://github.com/Mutafika/enchudb"]
+enchudb = { path = "../enchudb" }
+enchudb-oplog = { path = "../enchudb/crates/enchudb-oplog" }
+```
+
+## コマンド
+
+```
+kenning def     <name>              定義 + シグネチャ + doc 1 行目 (hover 相当)
+kenning read    <name> [container]  定義本体をそのまま出力 (def + ファイル読みを 1 手に)
+kenning find    <substr>            名前の部分一致 (発見用)
+kenning text    <term>              全文検索 + enclosing symbol 注釈 (grep superset)
+kenning callers <name> [container]  who-calls: 確実 ∪ 未確定候補を位置付きで
+kenning callees <name> [container]  呼ぶ先 (outgoing)
+kenning edges                       全 cross-file call edge を集計 (from\tto\tcount TSV)
+kenning refs    <name> [container]  find-all-references (要 bake; 型参照・読み書きも)
+kenning impls   <trait|type>        go-to-implementation (双方向)
+kenning impact  <name> [container]  推移的 callers = 変更の影響範囲 (逆 BFS)
+kenning tests   <name> [container]  この symbol に届くテスト = impact ∩ is_test
+kenning path    <from> <to>         A から B への呼び出し経路 1 本 (前方 BFS)
+kenning across  <name>              index 済み全 repo 横断の精密参照
+kenning search  kind:method vis:pub container:Engine   faceted 等値 AND
+kenning outline <path>              ファイルを読まずに構造把握
+kenning bake                        rust-analyzer を 1 回走らせ SCIP 取込 → RA 級精度
+kenning stats                       index 規模 + 解決率
+```
+
+出力は stdout の決定的な `path:line<TAB>詳細` 行（進捗は stderr）— 各行はそのまま
+ファイルリーダに渡せる。repo には `CLAUDE.md` が同梱され、Claude 系エージェントが
+プロンプトなしで正しいサブコマンドを選べる。
 
 ## 設計の要点
 
-- **index は derived artifact** → VCS の中には混ぜない。local で持ち gitignore。
-- **完全 standalone** — 外部 VCS (sf 等) とは統合しない。freshness は自前の増分 `update` で持つ
-  （将来は daemon + file-watcher で scan ゼロに）。
-- **enchudb backend**: 全列自動 index の faceted 等値 AND が設計点。schema は Kythe/Glean/SCIP/CodeQL 参考。
+- **誠実な完全性。** `callers` は 3 つのラベル付き集合を返す: *確実*（解決済みエッジの
+  逆引き — 誤検出なし）、*候補*（未解決の同名 call-site — 要確認）、*別定義に確定*。
+  和集合は grep-complete で、ラベルがどの行を無条件に信じてよいか教える。推測は一切しない。
+- **cfg-blind 回収。** rust-analyzer は活性な cfg 構成しか解析しないので、SCIP は off の
+  `#[cfg(...)]` ブランチ内で沈黙する。`syn` は全ブランチを見る。SCIP が沈黙する所は
+  保守的な syn resolver にフォールバック — kenning は rust-analyzer 自身が取りこぼす
+  impl や caller を見つける。
+- **GIGO は明示的。** 精度は食わせた SCIP に等しい。`bake` は `--config-path` で
+  `features = "all"` を注入する（tokio ではこれが解決 call edge 177 と 6,760 の差になる）。
+  解決率は隠さず表示する。
+- **index は派生物。** `~/.cache/kenning/` に住み、repo の中には入らず、repo root で
+  keying。いつ消してもよい — 次の質問で建て直す。
+- **repo 横断。** SCIP symbol は大域的に一意（crate + version）なので、`across` はある
+  repo の定義 symbol を、index 済み全 repo の外部参照テーブルと join する — 単一
+  workspace の language server にはできない repo 跨ぎの find-references。
 
-## 名前解決 (Phase 1 実装済)
+## 実測（再現可能スイート、逸話ではない）
 
-2-pass で callee を解決: `Type::f()`/`Self::f()`/`mod::f()` の修飾一致 or 同名ユニークで確定し、
-解決先 sym の eid を `call.callee_sym` に持つ。**推測はしない**(曖昧・外部型は未解決のまま)。
-→ who-calls が「名前一致(混ざる)」から「特定定義への呼び出しだけ」に絞れる。
+自分で回せる: `./bench/corpus.sh && ./bench/run.sh` — tag 固定の corpus
+（tokio @ tokio-1.43.0）、固定乱数 seed、手法は各表の直上に自己記述。全文:
+[bench/RESULTS.md](bench/RESULTS.md)。
 
-実測 (enchudb self-index, 24850 call-sites): 解決率 **26.6%** (unique 5150 / qualified 1466)、
-ambiguous 7093 (`x.f()` の型推論待ち) / external 11141 (std/外部 crate)。
+| スイート | tokio (722 files) | ripgrep (100 files) | enchudb (175 files) | 測るもの |
+|---|---|---|---|---|
+| **agent** — 「誰が X を呼ぶ?」の答えまでのバイト数 | **5.3×** 少・15 呼→1 | **2.3×** 少・3 呼→1 | **10.2×** 少・30 呼→1 | 固定 20 問、grep 経路は*楽観*モデル（下限）vs 実際の `callers` 出力 |
+| **beyond** — 「X を変えたら何が壊れる?」(`impact`) | **46×**・321 呼→1 | **13×**・75 呼→1 | **52×**・808 呼→1 | 推移的 caller BFS: grep 経路 = エージェントが実際にやる手動 grep+read 再帰 |
+| **quality** — ランダム 100 symbol の grep ノイズ | 中央値 43% | 中央値 33% | 中央値 33% | `\bname\(` ヒットのうち def/コメント/文字列/別 symbol の割合 = 無駄に読む行 |
+| **micro** — warm クエリ遅延 | 125 ns – 4 µs | 同等 | 125 ns – 2.3 µs | faceted カウント・def 検索・精密逆引き callers |
 
-### SCIP による正確化 (`index --scip <f>`)
+同じスイートは他の非サーチクエリも測る: `impls`（go-to-implementation）10–23×、
+`outline`（読まずに構造把握）7–12×（442 KB のファイルが 42× に圧縮）、`def`（hover:
+位置 + シグネチャ + doc 行）6–10×。faceted クエリは grep 等価物が存在しない — µs で走り、
+比ではなく能力として報告する。パターンに注目: **問いが深いほど差が開く** — ripgrep では
+素の who-calls は 2.3× だが推移的 impact は 13×、grep 経路は BFS の hop ごとに掛け算になるから。
 
-rust-analyzer の SCIP 出力 (`rust-analyzer scip .`) を食い、occurrence を **(rel_path, line, col) で
-位置 join** して callee_sym を正確化する (syn=facet+call 検出、SCIP=解決 の結婚)。
+このばらつきが正直な物語: 優位は symbol がどれだけ広く呼ばれるかに比例する。ripgrep —
+小さく、よく分割されていることで有名 — が床（2.3×、中央値の symbol は 3 箇所から呼ばれる）；
+enchudb のホットな symbol（30 箇所）は 10.2×。最悪例は grep が最も溺れる所:
+enchudb の `len` = 988 grep ヒットのうち、ローカルな `len` の確実な caller は 46。
 
-- SCIP 列は **UTF-8 バイトオフセット**、syn (proc-macro2) は char 単位なので、非 ASCII 行では
-  `Scip::load` で byte→char 変換して join を合わせる。
-- **SCIP が沈黙する call-site**(主に `#[cfg(feature=…)]`/`#[cfg(test)]` の非活性コード。syn は
-  cfg-blind に全ブランチを見るが rust-analyzer は活性 cfg しか解析しない)は、保守的 syn resolver に
-  **フォールバック**して best-effort 回収する。
-- 二層: **`refs` は SCIP-pure**(occurrence のみ) / **`callers` は SCIP + syn 回収**(cfg 域も拾う)。
+**vs rust-analyzer** ([bench/VS-RA.md](bench/VS-RA.md), `./bench/vs-ra.sh`):
+cold から「who-calls に答えられる」までの時間とメモリ — RA（`analysis-stats`、RA 自身の
+ベンチツール）: enchudb で 39 s / 6.1 GB、対して kenning syn index: 0.45 s / 175 MB、
+以後の常駐ゼロ。精度のトレードと feature スコープの注記は表の隣に明記。
 
-実測 (enchudb, 25796 call-sites, async-blob 無効で SCIP 生成): 解決 **35.4%** = SCIP 確定 7113 +
-syn 回収 2030。診断は `KENNING_DIAG_NOOCC=1 kenning index …` で no-occ の内訳(doc欠落/cfg位置ズレ)。
+**vs CodeQL** ([bench/VS-CODEQL.md](bench/VS-CODEQL.md), `./bench/vs-codeql.sh`):
+GitHub の「code as data」エンジン。その Rust extractor も rust-analyzer ベース — 同じ
+アーキテクチャを、ナビゲーションでなくセキュリティ解析向けに作ったもの。enchudb で:
+DB 構築 **68 分 / 9.9 GB / 301 MB** vs 2.4 s / 174 MB / 67 MB；who-calls 1 問が
+**cache 済でも 47.5 s** vs 0.1 s。lib コードでは回答が完全一致（44 = 44 — 3 本目の独立
+相互検証）；CodeQL は現状 `tests/` の caller をほぼ落とす（57 行 vs 117）。QL は kenning が
+決してやらない問い（taint tracking）を聞ける — 別の仕事、同じ facts の発想。
 
-## grep / rust-analyzer との違い (実測)
+**vs Glean (Meta)** ([bench/VS-GLEAN.md](bench/VS-GLEAN.md), `./bench/vs-glean.sh`):
+最も純粋な対決 — Glean の Rust 経路も rust-analyzer SCIP なので、**まったく同じ .scip
+ファイル**を両エンジンに食わせ、serving 層だけを比べた。取込 8.0 s / 702 MB vs
+0.52 s / 268 MB；find-refs 1 問 ~1.0 s vs 0.011 s（Rosetta で説明できるのはせいぜい
+2–3×）；回答は一致（57 vs 58、def-role のカウント差 — 4 本目の独立相互検証）。Glean は
+facts の disk（14 MB vs 87 MB — こちらは syn コールグラフと facet も載せている）で勝ち、
+live source に join しないので古い SCIP も優雅に serve できる。
 
-- **vs grep**: grep はテキスト一致だけ → who-calls は def/コメント/別型の同名 method が混ざる
-  (`block_on(` = tokio で 184 生ヒット、うち確実な `Runtime::block_on` 呼びは 82)。`refs Engine`
-  も grep 996 vs SCIP 確定 623。さらに **faceted AND / impact / path** は grep 原理的に不可。
-- **vs rust-analyzer**: 確定 edge は RA の SCIP を位置 join したもの = **RA と同じ正確さ**。RA は
-  6GB 常駐 LSP で 1 問ずつ返すが、kenning は offline に焼いて faceted 合成 + 推移的 graph + µs
-  CLI で返す serving 層。精度は食わせた SCIP の feature 網羅に依存(GIGO): 同じ tokio でも
-  `default=[]` の SCIP は 177 確定、`--features full` なら 6760 確定。
-- **速さ**: 単発は rg と互角(~5ms)。勝ちは grep 不可の問い + 長命プロセスでの反復(warm 1.58µs)。
+**vs ast-grep**（構造検索; 同じ質問、agent スイート内）: その構造一致は kenning の
+確実 ∪ 候補 集合とほぼ完全に一致（`tie` 321 = 321、`clone` 621 = 224+397）— call-site
+検出が完全であることの独立相互検証。差は: 1 問あたり中央値 564–878 ms（repo walk、
+ユーザーが列挙する 3 つの call 形パターン）vs 13–19 ms（index 済み）、そして名前解決が
+ない — call が*どの*定義に属すか言えず、impact/path/faceted/cross-repo も無い。
+
+- index 構築: ~1k LOC/ms（enchudb: 175 files / 2,905 symbols / 26,131 call-sites を約 360 ms）。
+- 小編集後の増分 update: ~18 ms。クエリごとの鮮度チェック: ~10 ms。
+- `bake`: rust-analyzer のバッチ 1 回（peak ≈ 5 GB で ~30–50 s）、その後 **常駐ゼロ**。
+  enchudb の解決率: 26.6%（syn のみ）→ 39.8%（baked, features=all）。残る未解決は
+  std / 外部 crate の call が主で、これらもラベル付き候補として列挙される。
 
 ## 設計の取引 — やらないこと、とその代償
 
 上の数字は全部「何かをやらない」ことで買っている。台帳:
 
-| やらないこと | 買ったもの | 代償 (実測・実感) |
+| やらないこと | 買ったもの | 代償（実測・実感） |
 |---|---|---|
-| 型推論 (`x.f()` の受け手) | 構築 0.5s / 増分 18ms / cfg 全ブランチ | syn 層 13-26% 止まり。精密は bake (40s/5GB 一発) |
-| hover / 補完 / 診断 | 常駐ゼロ、LSP 実装不要 | 人間のエディタにはならない。型は `cargo check` |
-| マクロ展開 | per-file parse の速さ | マクロ生成の call/impl はどの層からも見えない |
-| 常駐 / watcher | RAM 0、運用ゼロ、SSH 先 OK | 毎クエリ stat-walk 10-20ms が床 |
-| SCIP の as-is serve (live ソースに位置 join) | 答えが常に今のコードを指す | bake が古びると精密層が剥がれる (Glean 戦で refs=0 を実地で踏んだ。`upd_since_bake` が警告) |
-| 推測 (解決の偽装) | 確実層に誤りゼロ | 「候補」の目視はエージェントに残る |
-| 汎用クエリ言語 (Angle/QL) | 学習コスト 0、µs | taint tracking 等は CodeQL の領分のまま |
-| 多言語 (今は) | Rust に深く (cfg 回収・trait 帰属) | TS/Python repo では無力 (schema 自体は言語中立) |
-| disk 節約 | 全列自動 index + syn 層並走 | 87MB vs Glean 14MB |
+| 型推論（`x.f()` の受け手） | 0.5 s 構築、18 ms 増分、cfg 全ブランチ被覆 | syn のみの解決は 13–26% 止まり；精密は `bake`（40 s / 5 GB の RA 1 回）が要る |
+| hover / 補完 / 診断 | 常駐ゼロ、LSP プロトコル不要 | 人間のエディタにはならない；型はエージェントが `cargo check` で得る |
+| マクロ展開 | per-file の parse 速度 | マクロ内で生まれる call / impl はどの層からも見えない |
+| 常駐サーバ / file watcher | RAM 0、運用ゼロ、SSH 先で動く | 毎クエリ ~10–20 ms の stat-walk が床；warm-µs の数字は in-process のみ |
+| SCIP の as-is serve（代わりに live source へ位置 join） | 答えが常に今のコードを指す | 古い bake は精密 facts を落とす（Glean 戦で `refs → 0` を実地で踏んだ；`upd_since_bake` が警告） |
+| 推測（解決の偽装をしない） | 確実集合に誤検出ゼロ | エージェントは*候補*バケットの目視が残る |
+| 汎用クエリ言語（Angle/QL） | 学習コストゼロ、µs の答え | 任意の関係クエリ（taint tracking）は CodeQL の領分のまま |
+| Rust 以外の言語（今は） | 深さ（cfg 回収、trait コンテナ） | TS/Python repo では無力；fact schema 自体は言語中立 |
+| disk 節約 | 全列自動 index + syn グラフを SCIP と並走 | 同じ corpus で 87 MB vs Glean の 14 MB |
 
-**15 コマンドで足りるのか？** 閉集合ではなく「エージェントが実際に聞く質問の語彙」を
-dogfood で育てたもの。実運用でナビゲーション質問が聞けず grep に戻った例は今のところ無く、
-長尾は grep+Read への fallback で受ける。欠けが見つかった時の追加コストが安いのが本体 —
-facts は既に store にあるので、新コマンド = 合成半日 (実例: `tests <name>` = impact ∩ is_test
-を既存 facts の組み合わせだけで即日追加)。**資産はコマンド一覧ではなく schema。**
+**~15 コマンドで足りるのか？** 閉じた集合ではない — エージェントが実際に聞く質問の語彙
+（定義 / 利用者 / 呼ぶ先 / 影響範囲 / 実装 / 経路 / 構造）を dogfooding で育てたもの。実運用で
+逃げ道（grep + ファイル読み）が要ったのは長い尾に対してで、ナビゲーションではない。欠けが
+出たら新コマンドは午後の仕事であってプロジェクトではない: facts は既に store にある —
+`tests <name>`（どのテストがこの symbol を通るか）は文字通り `impact ∩ is_test` で、既存の
+facts の合成として一度の作業で足せた。資産はコマンド一覧ではなく schema。
+
+## ライセンス
+
+MIT。ストレージエンジン ([enchudb](https://github.com/Mutafika/enchudb)) は別ライセンス
+（FSL-1.1-Apache-2.0）。
