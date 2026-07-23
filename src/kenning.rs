@@ -85,7 +85,7 @@ fn is_test_attrs(attrs: &[syn::Attribute]) -> bool {
         a.path()
             .segments
             .last()
-            .map_or(false, |s| s.ident == "test") // #[test] / #[tokio::test] / #[…::test]
+            .is_some_and(|s| s.ident == "test") // #[test] / #[tokio::test] / #[…::test]
     })
 }
 
@@ -782,7 +782,7 @@ fn rust_files(dir: &str) -> impl Iterator<Item = std::path::PathBuf> {
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let p = entry.path();
-            if p.extension().map_or(true, |e| e != "rs") {
+            if p.extension().is_none_or(|e| e != "rs") {
                 return None;
             }
             Some(p.to_path_buf())
