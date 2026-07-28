@@ -1508,6 +1508,46 @@ fn find_ra() -> Option<String> {
     })
 }
 
+/// `/usr/bin/time -l` の統計 (別ファイルに逃がしたもの) から peak RSS を MB で拾う。
+fn parse_peak_mb(stats: &str) -> Option<u64> {
+    stats
+        .lines()
+        .find(|l| l.contains("maximum resident set size"))
+        .and_then(|l| l.trim().split(' ').next())
+        .and_then(|n| n.parse::<u64>().ok())
+        .map(|b| b / 1_048_576)
+}
+
+/// rust-analyzer の stderr から診断に効く行だけ拾う。
+/// panic は「`thread 'main' panicked at ...:`」の**次行**がメッセージ本体なので連れてくる。
+/// 何も引っかからなければ末尾 5 行に落とす (従来挙動)。
+fn ra_error_lines(errs: &str) -> String {
+    const MARK: [&str; 5] = ["panicked", "panic:", "error", "invariant", "fatal"];
+    let lines: Vec<&str> = errs.lines().collect();
+    let mut take = vec![false; lines.len()];
+    for (i, l) in lines.iter().enumerate() {
+        let low = l.to_ascii_lowercase();
+        if MARK.iter().any(|m| low.contains(m)) {
+            take[i] = true;
+            if low.contains("panic") && i + 1 < lines.len() {
+                take[i + 1] = true;
+            }
+        }
+    }
+    let picked: Vec<&str> =
+        lines.iter().enumerate().filter(|(i, _)| take[*i]).map(|(_, l)| *l).take(20).collect();
+    if !picked.is_empty() {
+        return picked.join("\n");
+    }
+    let mut tail: Vec<&str> = lines.iter().rev().take(5).copied().collect();
+    tail.reverse();
+    if tail.is_empty() {
+        "(rust-analyzer は stderr に何も出さなかった)".to_string()
+    } else {
+        tail.join("\n")
+    }
+}
+
 pub fn run_bake(dir: &str) {
     let Some(root) = repo_root_of(dir) else {
         eprintln!("# repo root が見つからない ({dir})。repo 内で実行を。");
@@ -1553,6 +1593,10 @@ pub fn run_bake(dir: &str) {
     // ── SCIP 生成 (features=all を --config-path で注入。Cargo.toml は触らない) ──
     let scip_path = format!("{}.scip", db.trim_end_matches(".db"));
     let cfg_path = format!("{}.racfg.json", db.trim_end_matches(".db"));
+    // time(1) の統計は -o で別ファイルへ逃がす。子の stderr を汚さない = 失敗時に
+    // rust-analyzer の panic/error がそのまま読める (末尾 5 行が time のフッターに潰されない)。
+    let stats_path = format!("{}.time", db.trim_end_matches(".db"));
+    let use_time = std::path::Path::new("/usr/bin/time").exists();
     let use_all = std::env::var_os("KENNING_BAKE_DEFAULT_FEATURES").is_none();
     let n_src = rust_files(&root_s).count();
     let mut peak_mb = 0u64;
@@ -1566,24 +1610,35 @@ pub fn run_bake(dir: &str) {
             "# bake: rust-analyzer scip {} (features={}) — peak ~{:.1}GB / 数十秒〜数分、常駐なし",
             root_s, if all { "all" } else { "default" }, needed_mb as f64 / 1024.0
         );
-        let mut cmd = std::process::Command::new("/usr/bin/time");
-        cmd.args(["-l", &ra, "scip", &root_s, "--output", &scip_path]);
+        let _ = std::fs::remove_file(&stats_path);
+        let mut cmd = if use_time {
+            let mut c = std::process::Command::new("/usr/bin/time");
+            c.args(["-l", "-o", &stats_path, &ra]);
+            c
+        } else {
+            std::process::Command::new(&ra)
+        };
+        cmd.args(["scip", &root_s, "--output", &scip_path]);
         if all {
             cmd.args(["--config-path", &cfg_path]);
         }
-        let out = cmd.current_dir(&root_s).output().expect("spawn time+rust-analyzer");
+        let out = match cmd.current_dir(&root_s).output() {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("# bake 失敗: rust-analyzer を起動できない ({ra}): {e}");
+                std::process::exit(1);
+            }
+        };
         let errs = String::from_utf8_lossy(&out.stderr);
-        peak_mb = errs
-            .lines()
-            .find(|l| l.contains("maximum resident set size"))
-            .and_then(|l| l.trim().split(' ').next())
-            .and_then(|n| n.parse::<u64>().ok())
-            .map(|b| b / 1_048_576)
-            .unwrap_or(0);
+        peak_mb = std::fs::read_to_string(&stats_path).ok().and_then(|s| parse_peak_mb(&s)).unwrap_or(0);
         if !out.status.success() || !std::path::Path::new(&scip_path).exists() {
             eprintln!("# bake 失敗 (features={}):", if all { "all" } else { "default" });
-            eprintln!("{}", errs.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
-            if all { continue; } else { std::process::exit(1); }
+            eprintln!("{}", ra_error_lines(&errs));
+            if all {
+                continue;
+            }
+            eprintln!("# 真因を直に見るなら: (cd {root_s} && {ra} scip .)");
+            std::process::exit(1);
         }
         // sanity: features=all が相互排他 cfg 等で薄い SCIP を吐いたら default で焼き直す。
         let n_docs = std::fs::read(&scip_path)
@@ -1604,9 +1659,11 @@ pub fn run_bake(dir: &str) {
     }
     if !baked {
         eprintln!("# bake 失敗 (all/default 両方)");
+        eprintln!("# 真因を直に見るなら: (cd {root_s} && {ra} scip .)");
         std::process::exit(1);
     }
     let _ = std::fs::remove_file(&cfg_path);
+    let _ = std::fs::remove_file(&stats_path);
 
     // ── SCIP 込みで full 再 index → meta に bake 情報を焼く ──
     run_index(&root_s, &db, Some(&scip_path));
@@ -3596,6 +3653,41 @@ pub fn cmd_bench(args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peak_mb_from_time_stats_file() {
+        let stats = "        0.53 real         0.31 user         0.11 sys\n          2598292024  maximum resident set size\n                   0  average shared memory size\n";
+        assert_eq!(parse_peak_mb(stats), Some(2477));
+        assert_eq!(parse_peak_mb("no stats here\n"), None);
+    }
+
+    #[test]
+    fn ra_error_lines_picks_panic_not_time_footer() {
+        // 実例 (#3): panic は stderr の先頭側、time の統計は末尾 → 末尾 5 行では真因が消える。
+        let errs = "\
+Loading metadata...
+thread 'main' panicked at crates/rust-analyzer/src/cli/scip.rs:227:17:
+Invariant violation: file emitted multiple times.
+note: run with `RUST_BACKTRACE=1` to display a backtrace
+               41390  voluntary context switches
+              590206  involuntary context switches
+        209737249375  instructions retired
+         71152919364  cycles elapsed
+          2598292024  peak memory footprint";
+        let got = ra_error_lines(errs);
+        assert!(got.contains("panicked at"), "panic 行を拾えていない: {got}");
+        // panic 行の次行 (メッセージ本体) も連れてくる
+        assert!(got.contains("Invariant violation: file emitted multiple times."), "{got}");
+        assert!(!got.contains("cycles elapsed"), "time の統計を混ぜている: {got}");
+    }
+
+    #[test]
+    fn ra_error_lines_falls_back_to_tail() {
+        // マーカーが一つも無ければ従来通り末尾 5 行
+        let errs = "a\nb\nc\nd\ne\nf\ng";
+        assert_eq!(ra_error_lines(errs), "c\nd\ne\nf\ng");
+        assert!(ra_error_lines("").contains("stderr に何も出さなかった"));
+    }
 
     #[test]
     fn bake_lock_reclaims_dead_pid_but_respects_live() {

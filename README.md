@@ -55,6 +55,15 @@ That's the whole install — the [enchudb](https://github.com/Mutafika/enchudb) 
 pulled in as a pinned git dependency. For precise mode (`bake`), also have rust-analyzer
 available (`rustup component add rust-analyzer`).
 
+If your global git config rewrites GitHub HTTPS URLs to SSH — `url."git@github.com:".insteadOf
+https://github.com/`, a common setup — cargo's bundled libgit2 cannot authenticate the
+rewritten URL and the enchudb fetch fails with *"no authentication methods succeeded"*.
+Hand the fetch to the git CLI, which honours the rewrite and your ssh key:
+
+```bash
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/Mutafika/kenning
+```
+
 Hacking on kenning and enchudb together? Check out both side by side and point the
 dependency at your checkout via `.cargo/config.toml`:
 

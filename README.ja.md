@@ -56,6 +56,15 @@ cargo install --git https://github.com/Mutafika/kenning
 精密モード（`bake`）を使うなら rust-analyzer も用意する
 （`rustup component add rust-analyzer`）。
 
+グローバル git 設定で GitHub の HTTPS URL を SSH に書き換えている場合
+（`url."git@github.com:".insteadOf https://github.com/`、わりと一般的）、cargo 内蔵の
+libgit2 が書き換え後の URL を認証できず、enchudb の fetch が *"no authentication methods
+succeeded"* で落ちる。fetch を git CLI に委譲すれば書き換えも ssh key もそのまま通る:
+
+```bash
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/Mutafika/kenning
+```
+
 kenning と enchudb を並べて開発する場合は、両方を横に checkout して
 `.cargo/config.toml` で依存をローカルの checkout に向ける:
 
