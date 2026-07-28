@@ -5,8 +5,10 @@ grep+Read の代わりに、精密な少数行 (`path:line<TAB>詳細` = その�
 
 ## ルール (1 行)
 
-**Rust repo でシンボル軸の問い (定義 / 呼び元 / 呼び先 / 実装 / 影響範囲 / faceted) は、repo 内で
-`kenning <cmd>` を直接叩く — db 管理は考えなくていい (自動)。コメント/文字列の全文検索だけ grep。**
+**Rust repo 内の検索は kenning。** シンボル軸の問い (定義 / 呼び元 / 呼び先 / 実装 / 影響範囲 /
+faceted) は `kenning <cmd>`、全文検索は `kenning text` — **`.rs` も `.md`/`.toml`/`.yml` も同じ 1 本**で、
+文脈注釈が付く分 grep の上位互換。db 管理は考えなくていい (自動)。
+grep に落ちるのは対象外だけ: binary / 1MiB 超 / gitignore 済み / 生成 lock ファイル、あとは正規表現。
 
 ## 使い方 (儀式ゼロ: cd して聞くだけ)
 
@@ -19,7 +21,7 @@ kenning callers <name>          # 変更があれば自動増分 update (進捗�
 kenning def     <name>              # 定義位置 + シグネチャ + doc 1 行目 (hover 相当)
 kenning read    <name> [container]  # 定義本体をそのまま出す (def + Read の 1 手化。まずこれ)
 kenning find    <substr>            # 名前の部分一致 (発見用)
-kenning text    <term>              # 全文検索 + どの関数内かの注釈 (grep superset)
+kenning text    <term>              # 全文検索 + 文脈注釈 (.rs=関数 / .md=見出し階層 / .toml=[table])
 kenning callers <name> [container]  # who-calls: 確実 ∪ 未確定候補を位置付き
 kenning callees <name> [container]  # X が呼ぶ先 (outgoing)
 kenning edges                       # 全 cross-file call edge の集計 TSV (from TAB to TAB count)。依存グラフの素材

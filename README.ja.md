@@ -80,7 +80,8 @@ enchudb-oplog = { path = "../enchudb/crates/enchudb-oplog" }
 kenning def     <name>              定義 + シグネチャ + doc 1 行目 (hover 相当)
 kenning read    <name> [container]  定義本体をそのまま出力 (def + ファイル読みを 1 手に)
 kenning find    <substr>            名前の部分一致 (発見用)
-kenning text    <term>              全文検索 + enclosing symbol 注釈 (grep superset)
+kenning text    <term>              全テキストファイルの全文検索 + 文脈注釈
+                                    (.rs=enclosing symbol / .md=見出し階層 / .toml=[table])
 kenning callers <name> [container]  who-calls: 確実 ∪ 未確定候補を位置付きで
 kenning callees <name> [container]  呼ぶ先 (outgoing)
 kenning edges                       全 cross-file call edge を集計 (from\tto\tcount TSV)

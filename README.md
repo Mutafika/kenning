@@ -79,7 +79,8 @@ enchudb-oplog = { path = "../enchudb/crates/enchudb-oplog" }
 kenning def     <name>              definition + signature + first doc line (hover)
 kenning read    <name> [container]  print the definition body itself (def + file-read in one step)
 kenning find    <substr>            fuzzy name discovery
-kenning text    <term>              full-text search, annotated with enclosing symbol
+kenning text    <term>              full-text search over every text file, annotated with
+                                    context (.rs: enclosing symbol, .md: heading path, .toml: table)
 kenning callers <name> [container]  who-calls: confirmed ∪ unresolved candidates, with positions
 kenning callees <name> [container]  outgoing calls
 kenning edges                       all cross-file call edges, aggregated (from\tto\tcount TSV)

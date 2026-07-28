@@ -40,13 +40,39 @@ const V_PRIV: u32 = 3;
 const VIS_NAMES: &[&str] = &["pub", "crate", "restricted", "priv"];
 
 const LANG_RUST: u32 = 0;
+const LANG_MD: u32 = 1;
+const LANG_TOML: u32 = 2;
+const LANG_YAML: u32 = 3;
+/// container 抽出関数を持たない全テキスト。注釈なしで通す (形式追加が索引追加をブロックしない)。
+const LANG_TEXT: u32 = 4;
+
+/// text index に載せるファイルの上限 (bytes)。minified/生成物/データファイルの安全弁。
+/// 超えるものは索引せず grep 側に残す — `text` は query 時に本文を読むので、ここが速度の支配項。
+const TEXT_MAX_BYTES: u64 = 1 << 20; // 1 MiB
+/// binary 判定で嗅ぐ先頭 bytes 数。
+const BINARY_SNIFF: usize = 8192;
+
+/// 索引しない生成ファイル。`target/` を枝刈りするのと同じ理由 — 人が書いたものではなく、
+/// hit 数が多いので本命 (Cargo.toml の依存行、設計 doc) を limit の外へ押し出す。
+/// バージョンを知りたい時は `cargo tree` 等の専用ツールのほうが正確。
+const GENERATED_FILES: &[&str] = &[
+    "Cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "Gemfile.lock",
+    "composer.lock",
+    "go.sum",
+];
 
 /// index 意味論の版。facet の付け方など「schema は同じでも値の意味が変わる」変更で bump する。
 /// 版違いの db は増分 update せず full 再 index (update_with_heal 経由、.scip 再利用) に落とす。
 /// v2: crate_ を dir heuristic (crates/<name>/ のみ) → 最寄り祖先 Cargo.toml の package name に変更。
 /// v3: sym に doc 列 (doc コメント 1 行目) を追加。
 /// v4: sym に end_line 列 (item 終端行) を追加 — `read` が定義本体を切り出す下端。
-const INDEX_VER: u32 = 4;
+/// v5: file 表に非 Rust テキスト (md/toml/yml/…) も載せる — `text` の対象が .rs 限定でなくなった。
+const INDEX_VER: u32 = 5;
 
 /// このプロセスで鮮度チェック済みか。parse_opts の auto 経路 (maybe_auto_update / auto-index) が
 /// 立てる。open_ro 側の warn_if_stale が同じ stat-walk を繰り返さないため — 非 Rust の大 dir を
@@ -789,6 +815,123 @@ fn rust_files(dir: &str) -> impl Iterator<Item = std::path::PathBuf> {
         })
 }
 
+/// 拡張子 → lang。抽出関数を持たない形式は LANG_TEXT (注釈なしで索引されるだけ)。
+fn lang_of(path: &std::path::Path) -> u32 {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "rs" => LANG_RUST,
+        "md" | "markdown" => LANG_MD,
+        "toml" => LANG_TOML,
+        "yml" | "yaml" => LANG_YAML,
+        _ => LANG_TEXT,
+    }
+}
+
+/// NUL byte を含むか (git と同じ binary 判定規約)。先頭 BINARY_SNIFF bytes だけ嗅ぐ。
+fn is_probably_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(BINARY_SNIFF).any(|&b| b == 0)
+}
+
+/// dir 以下の **.rs 以外の索引対象テキスト**を列挙。形式は問わない (binary とサイズ超過だけ落とす)。
+/// .gitignore/.ignore/隠し dir を尊重 = ripgrep と同じ規約なので、生成物・vendor・巨大データを
+/// 索引に持ち込まない。target/ は gitignore に頼らず明示的に枝刈り (ignore されていない repo 対策)。
+/// .rs 側の walk (rust_files) はここを通さない — syn 経路の既存挙動を変えないため。
+fn text_files(dir: &str) -> impl Iterator<Item = std::path::PathBuf> {
+    ignore::WalkBuilder::new(dir)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(|e| e.depth() == 0 || e.file_name() != "target")
+        .build()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        .filter(|e| e.path().extension().is_none_or(|x| x != "rs"))
+        .filter(|e| !GENERATED_FILES.contains(&e.file_name().to_string_lossy().as_ref()))
+        .filter(|e| e.metadata().is_ok_and(|m| m.len() <= TEXT_MAX_BYTES))
+        .map(|e| e.path().to_path_buf())
+}
+
+/// text index 用の読み込み。binary / 非 UTF-8 / サイズ超過は None = 索引しない (嘘を出さない)。
+fn read_text_file(p: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(p).ok()?;
+    if bytes.len() as u64 > TEXT_MAX_BYTES || is_probably_binary(&bytes) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// 非 Rust テキストを file 表に載せる。sym は持たない — `text` の全文検索対象になるだけで、
+/// 本文は query 時に読む (索引に持つのは path/hash/loc のみ = 肥大しない)。
+fn index_text_file(file_t: &Table, acc: &mut Acc, path_s: &str, src: &str) {
+    let crate_name = crate_of(path_s, &mut acc.crate_cache);
+    file_t
+        .insert()
+        .set("path", path_s)
+        .set("crate_", crate_name)
+        .set("lang", lang_of(std::path::Path::new(path_s)))
+        .set("loc", src.lines().count() as u32)
+        .set("hash", hash_u32(src))
+        .commit()
+        .unwrap();
+}
+
+/// 非 Rust テキストの container 注釈を「(行, container)」の昇順で返す (`text` が hit 行から逆引き)。
+/// .rs の enclosing symbol と同じ使い勝手を、形式ごとの小さい抽出で埋める。
+/// 抽出関数を持たない形式は空 = 注釈なしで通す。**索引ではなく query 時に本文から作る**ので
+/// 形式を足しても index 版は動かない。
+fn text_containers(lang: u32, src: &str) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    // (深さ, 見出し/キー) のスタック。md は heading level、yaml は indent 幅を深さに使う。
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    for (i, raw) in src.lines().enumerate() {
+        let ln = (i + 1) as u32;
+        match lang {
+            LANG_MD => {
+                let t = raw.trim_start();
+                let level = t.bytes().take_while(|&b| b == b'#').count();
+                if level == 0 || level > 6 || !t[level..].starts_with(' ') {
+                    continue;
+                }
+                let title = t[level..].trim().trim_end_matches('#').trim().to_string();
+                if title.is_empty() {
+                    continue;
+                }
+                stack.retain(|(d, _)| *d < level);
+                stack.push((level, title));
+                out.push((ln, stack.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join(" > ")));
+            }
+            LANG_TOML => {
+                let t = raw.trim();
+                if let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                    let name = inner.trim_start_matches('[').trim_end_matches(']').trim();
+                    if !name.is_empty() {
+                        out.push((ln, name.to_string()));
+                    }
+                }
+            }
+            LANG_YAML => {
+                let indent = raw.len() - raw.trim_start().len();
+                let t = raw.trim_start();
+                if t.starts_with('#') || t.starts_with('-') {
+                    continue;
+                }
+                let Some(key) = t.split(':').next().filter(|k| {
+                    !k.is_empty()
+                        && k.len() < t.len()
+                        && k.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c))
+                }) else {
+                    continue;
+                };
+                stack.retain(|(d, _)| *d < indent);
+                stack.push((indent, key.to_string()));
+                out.push((ln, stack.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join(".")));
+            }
+            _ => break, // 抽出関数なし = 注釈なし
+        }
+    }
+    out
+}
+
 // ─────────────────────────── index コマンド ───────────────────────────
 
 /// index のエントリ。table の eid 予約はファイル数から見積もるが、symbol 密度が高い
@@ -839,7 +982,9 @@ fn run_index_inner(dir: &str, path: &str, scip_path: Option<&str>, cap_mult: u32
     // growable なので不足したら enchudb が伸ばす (build 時コストのみ)。ref は --scip 時のみ大きく。
     // cap_mult は枯渇リトライ時に上がる (1 → 4 → 16 → 64)。file 数は不変なので掛けない。
     let n_files_est = rust_files(dir).count().max(1) as u32;
-    let file_cap = (n_files_est * 2).max(1_024);
+    // file 表だけは非 Rust テキストも載る (sym/call 系の見積りは Rust ファイル数のまま)。
+    let n_text_est = text_files(dir).count() as u32;
+    let file_cap = ((n_files_est + n_text_est) * 2).max(1_024);
     let sym_cap = (n_files_est * 64).max(8_192) * cap_mult; // enchudb 実測 ~17 sym/file、余裕 64
     let call_cap = (n_files_est * 400).max(32_768) * cap_mult; // 実測 ~154 call/file、余裕 400
     let ref_cap = if scip_path.is_some() { (n_files_est * 400).max(32_768) * cap_mult } else { 1_024 };
@@ -954,6 +1099,13 @@ fn run_index_inner(dir: &str, path: &str, scip_path: Option<&str>, cap_mult: u32
             n_skip += 1;
         }
     }
+    // ── pass1b: 非 Rust テキストを file 表に載せる (sym 無し = `text` の対象が増えるだけ) ──
+    let mut n_text = 0u64;
+    for p in text_files(dir) {
+        let Some(src) = read_text_file(&p) else { continue };
+        index_text_file(&file_t, &mut acc, &p.to_string_lossy(), &src);
+        n_text += 1;
+    }
     let n_sym = sym_t.all().count().unwrap() as u64;
     let parse_el = t.elapsed();
 
@@ -1032,8 +1184,8 @@ fn run_index_inner(dir: &str, path: &str, scip_path: Option<&str>, cap_mult: u32
     let resolved = res_counts[R_UNIQUE as usize] + res_counts[R_QUALIFIED as usize];
 
     eprintln!(
-        "indexed: {} files / {} symbols / {} call-sites (parse {:?} + resolve {:?}, {} parse-skip)",
-        n_files, n_sym, n_call, parse_el, resolve_el, n_skip
+        "indexed: {} files (+{} text) / {} symbols / {} call-sites (parse {:?} + resolve {:?}, {} parse-skip)",
+        n_files, n_text, n_sym, n_call, parse_el, resolve_el, n_skip
     );
     if acc.scip.is_some() {
         eprintln!(
@@ -1236,6 +1388,12 @@ fn update_inner(db: Database, dir: &str) {
             cur.insert(p.to_string_lossy().into_owned(), src);
         }
     }
+    // 非 Rust テキストも同じ hash 差分に載せる (rust_files と text_files は .rs で排他)。
+    for p in text_files(dir) {
+        if let Some(src) = read_text_file(&p) {
+            cur.insert(p.to_string_lossy().into_owned(), src);
+        }
+    }
 
     // 3. 分類。to_add = 変更 ∪ 新規 (再 index)、to_remove = 変更 ∪ 削除 (旧 facts 消去)。
     let mut to_add: Vec<(String, String)> = Vec::new();
@@ -1291,6 +1449,11 @@ fn update_inner(db: Database, dir: &str) {
     let mut acc = Acc::default();
     let mut n_skip = 0u64;
     for (p, src) in &to_add {
+        // 非 Rust は syn に食わせない (parse 失敗を skip として数えてしまう) — file 行だけ差し替え。
+        if lang_of(std::path::Path::new(p)) != LANG_RUST {
+            index_text_file(&file_t, &mut acc, p, src);
+            continue;
+        }
         if !index_one_file(&file_t, &sym_t, &mut acc, dir, p, src) {
             n_skip += 1;
         }
@@ -1711,9 +1874,11 @@ fn read_meta(db: &Database) -> Option<(String, u32)> {
     Some((txt(er.get("root")), num(er.get("built_at"))))
 }
 
-/// root 以下で index 時刻より新しい .rs の数 (stat のみ、read しないので軽い)。
+/// root 以下で index 時刻より新しいファイルの数 (stat のみ、read しないので軽い)。
+/// .rs と index 対象テキストの両方を見る — 片方だけだと md 編集が黙って古いまま残る。
 fn count_stale(root: &str, built_at: u32) -> usize {
     rust_files(root)
+        .chain(text_files(root))
         .filter(|p| {
             std::fs::metadata(p)
                 .and_then(|m| m.modified())
@@ -2403,17 +2568,27 @@ pub fn cmd_text(args: &[String]) {
         v.sort();
     }
 
-    let mut files: Vec<(String, EntityId)> =
-        file_t.all().find().unwrap().into_iter().map(|e| (txt(file_t.entity(e).get("path")), e)).collect();
+    let mut files: Vec<(String, EntityId, u32)> = file_t
+        .all()
+        .find()
+        .unwrap()
+        .into_iter()
+        .map(|e| {
+            let er = file_t.entity(e);
+            (txt(er.get("path")), e, num(er.get("lang")))
+        })
+        .collect();
     files.sort();
     let mut shown = 0usize;
     let mut total = 0usize;
-    for (path, fe) in &files {
+    for (path, fe, lang) in &files {
         let Ok(src) = std::fs::read_to_string(path) else { continue };
         if !src.to_lowercase().contains(&needle_l) {
             continue; // ファイル単位の早期スキップ
         }
         let syms = syms_by_file.get(fe);
+        // 非 Rust は sym を持たないので、本文から container を作る (見出し階層 / [table] / キーパス)。
+        let containers = if *lang == LANG_RUST { Vec::new() } else { text_containers(*lang, &src) };
         for (i, line) in src.lines().enumerate() {
             if !line.to_lowercase().contains(&needle_l) {
                 continue;
@@ -2427,9 +2602,12 @@ pub fn cmd_text(args: &[String]) {
             let text = line.trim();
             // enclosing symbol: 通常は「line <= ln の最後の定義」の中。`///` は次の定義の doc、
             // `//!` はモジュール doc (どの item のものでもない)。end 無しの近似。
-            let is_mod_doc = text.starts_with("//!");
+            let is_mod_doc = *lang == LANG_RUST && text.starts_with("//!");
             let is_doc = text.starts_with("///");
-            let encl = if is_mod_doc {
+            let encl = if *lang != LANG_RUST {
+                let idx = containers.partition_point(|(l, _)| *l <= ln);
+                (idx > 0).then(|| (containers[idx - 1].1.clone(), "in"))
+            } else if is_mod_doc {
                 None
             } else {
                 syms.and_then(|v| {
@@ -2457,7 +2635,7 @@ pub fn cmd_text(args: &[String]) {
         println!("… (+{} 件省略、--limit {total} で全部)", total - shown);
     }
     if total == 0 {
-        println!("# \"{needle}\" は index 済みファイルに無い (対象は .rs のみ。他は grep で)");
+        println!("# \"{needle}\" は index 済みファイルに無い (.rs + テキスト全般。binary と >1MiB と gitignore 済みは対象外)");
     }
 }
 
@@ -2961,9 +3139,14 @@ pub fn cmd_stats(args: &[String]) {
     let sym_t = db.get_table("sym").unwrap();
     let call_t = db.get_table("call").unwrap();
     let n_call = call_t.all().count().unwrap();
+    // file 表には非 Rust テキストも載る。合算だけ出すと「Rust の規模」に見えてしまうので分けて出す。
+    let n_rust = file_t.where_eq("lang", LANG_RUST).count().unwrap();
+    let n_text = file_t.all().count().unwrap() - n_rust;
     println!(
-        "index: {} files / {} symbols / {} call-sites",
-        file_t.all().count().unwrap(),
+        "index: {} files ({} rust + {} text) / {} symbols / {} call-sites",
+        n_rust + n_text,
+        n_rust,
+        n_text,
         sym_t.all().count().unwrap(),
         n_call
     );
@@ -3653,6 +3836,59 @@ pub fn cmd_bench(args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_containers_md_tracks_heading_hierarchy() {
+        let src = "# 設計原則\nintro\n## 紐が本質\nbody\n### 詳細\nx\n## 別の節\ny\n#notaheading\n";
+        let got = text_containers(LANG_MD, src);
+        assert_eq!(got[0], (1, "設計原則".to_string()));
+        assert_eq!(got[1], (3, "設計原則 > 紐が本質".to_string()));
+        assert_eq!(got[2], (5, "設計原則 > 紐が本質 > 詳細".to_string()));
+        // 浅い見出しに戻ると深い方は落ちる
+        assert_eq!(got[3], (7, "設計原則 > 別の節".to_string()));
+        // `#` 直後に空白が無いものは見出しではない (Rust の属性や C の #include を拾わない)
+        assert_eq!(got.len(), 4);
+    }
+
+    #[test]
+    fn text_containers_toml_and_yaml() {
+        let toml = "x = 1\n[package]\nname = \"a\"\n[[bin]]\nname = \"b\"\n";
+        assert_eq!(text_containers(LANG_TOML, toml), vec![(2, "package".to_string()), (4, "bin".to_string())]);
+
+        let yaml = "jobs:\n  build:\n    runs-on: ubuntu\n  test:\n    x: 1\n";
+        let got = text_containers(LANG_YAML, yaml);
+        assert_eq!(got[1], (2, "jobs.build".to_string()));
+        assert_eq!(got[2], (3, "jobs.build.runs-on".to_string()));
+        // インデントが戻れば深い方は落ちる
+        assert_eq!(got[3], (4, "jobs.test".to_string()));
+
+        // 抽出関数を持たない形式は注釈なし
+        assert!(text_containers(LANG_TEXT, "anything\ngoes\n").is_empty());
+    }
+
+    #[test]
+    fn text_files_skips_rs_binary_and_oversize() {
+        let d = tmp_tree("textfiles");
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("a.rs"), "fn main() {}").unwrap();
+        std::fs::write(d.join("README.md"), "# hi").unwrap();
+        std::fs::write(d.join("sub/conf.toml"), "[x]").unwrap();
+        std::fs::write(d.join("noext"), "#!/bin/sh").unwrap(); // 拡張子なしも対象 (形式は問わない)
+        std::fs::write(d.join("Cargo.lock"), "[[package]]").unwrap(); // 生成物は索引しない
+        std::fs::write(d.join("blob.dat"), [1u8, 0, 2, 3]).unwrap(); // NUL 入り = binary
+        std::fs::write(d.join("big.txt"), vec![b'x'; (TEXT_MAX_BYTES + 1) as usize]).unwrap();
+
+        let mut got: Vec<String> = text_files(&d.to_string_lossy())
+            .map(|p| p.strip_prefix(&d).unwrap().to_string_lossy().into_owned())
+            .collect();
+        got.sort();
+        // .rs は rust_files 側、big.txt はサイズ上限で walk 段階から落ちる
+        assert_eq!(got, ["README.md", "blob.dat", "noext", "sub/conf.toml"]);
+        // binary は読み込み段で落ちる (walk では拡張子で判断しない)
+        assert!(read_text_file(&d.join("blob.dat")).is_none());
+        assert!(read_text_file(&d.join("README.md")).is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn peak_mb_from_time_stats_file() {

@@ -203,6 +203,58 @@ fn tests_command_finds_reaching_test() {
     assert!(out.contains("#test"), "test marker missing:\n{out}");
 }
 
+/// `text` covers every text file, not just `.rs` — with per-format context annotation,
+/// and with generated / binary / oversize files deliberately left out of the index.
+#[test]
+fn text_searches_non_rust_files_with_context() {
+    let dir = tmp();
+    write_fixture(&dir, OTHER_RS);
+    std::fs::write(dir.join("DESIGN.md"), "# Design\nintro\n## Storage\nuses zzmarker here\n").unwrap();
+    std::fs::write(dir.join("conf.toml"), "[server]\nendpoint = \"zzmarker\"\n").unwrap();
+    std::fs::write(dir.join("ci.yml"), "jobs:\n  build:\n    run: zzmarker\n").unwrap();
+    std::fs::write(dir.join("run.sh"), "#!/bin/sh\necho zzmarker\n").unwrap(); // 拡張子なしでも通る
+    std::fs::write(dir.join("Cargo.lock"), "# zzmarker\n").unwrap(); // 生成物 = 索引しない
+    std::fs::write(dir.join("blob.bin"), b"zzmarker\0\0".as_slice()).unwrap(); // binary = 索引しない
+    let db = dir.join("k.db");
+    index(&dir, &db);
+
+    let out = query(&["text", "zzmarker"], &db);
+    // .md は見出し階層、.toml は [table]、.yml はキーパスが container になる。
+    assert!(out.contains("DESIGN.md:4\tuses zzmarker here\t(in Design > Storage)"), "md:\n{out}");
+    assert!(out.contains("conf.toml:2"), "toml missing:\n{out}");
+    assert!(out.contains("(in server)"), "toml table container missing:\n{out}");
+    assert!(out.contains("ci.yml:3"), "yaml missing:\n{out}");
+    assert!(out.contains("(in jobs.build.run)"), "yaml key path missing:\n{out}");
+    // 抽出関数を持たない形式は注釈なしで通る (索引はされる)
+    assert!(out.contains("run.sh:2"), "extension-less text file missing:\n{out}");
+    // 除外されるべきもの
+    assert!(!out.contains("Cargo.lock"), "generated lock must not be indexed:\n{out}");
+    assert!(!out.contains("blob.bin"), "binary must not be indexed:\n{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 非 Rust の編集も増分 update が拾う (拾えないと md が黙って古いまま残る)。
+#[test]
+fn incremental_update_picks_up_markdown_edit() {
+    let dir = tmp();
+    write_fixture(&dir, OTHER_RS);
+    std::fs::write(dir.join("NOTES.md"), "# Notes\nbefore\n").unwrap();
+    let db = dir.join("k.db");
+    index(&dir, &db);
+    assert!(query(&["text", "zzafter"], &db).contains("index 済みファイルに無い"));
+
+    std::fs::write(dir.join("NOTES.md"), "# Notes\n## Later\nzzafter\n").unwrap();
+    let upd = kenning()
+        .args(["update", dir.to_str().unwrap(), db.to_str().unwrap()])
+        .output()
+        .expect("spawn kenning update");
+    assert!(upd.status.success(), "update failed: {upd:?}");
+
+    let out = query(&["text", "zzafter"], &db);
+    assert!(out.contains("NOTES.md:3\tzzafter\t(in Notes > Later)"), "md edit not picked up:\n{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn incremental_update_matches_full_reindex() {
     let dir = tmp();

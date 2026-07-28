@@ -19,6 +19,9 @@ syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 walkdir = "2"
+# 非 Rust テキストの索引対象を決める walk。.gitignore/.ignore を尊重する (= ripgrep と同じ規約)
+# ので、生成物・vendor・巨大データが text index に紛れ込まない。.rs 側の walk は walkdir のまま。
+ignore = "0.4"
 # 正確な名前解決 = rust-analyzer の SCIP 出力を食う (occurrence を位置で syn と join)。
 scip = "0.5"
 protobuf = "3"
