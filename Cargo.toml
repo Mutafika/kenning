@@ -9,11 +9,12 @@ repository = "https://github.com/Mutafika/kenning"
 
 [dependencies]
 # クエリエンジン = enchudb (紐/円柱、全列自動 index の faceted 等値 AND が設計点)。
-# git dep (rev = 0.13.1 release) — `cargo install --git .../kenning` が単体で通る。
+# git dep は release tag で pin する — v0.14.0 以降は annotated tag なので `git rev-parse vX` は
+# tag object の hash を返す (commit ではない)。生 hash を書くとそこで事故るため tag 指定にする。
 # ローカル開発で兄弟 dir の enchudb を使う時は .cargo/config.toml の [patch] で差し替え
 # (gitignore 済み。patch 有効中は Cargo.lock が書き換わるので commit に混ぜない)。
-enchudb = { git = "https://github.com/Mutafika/enchudb", rev = "af2018c0212f7adf18ab4db91832f1ec39ed5489" }
-enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", rev = "af2018c0212f7adf18ab4db91832f1ec39ed5489" }
+enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.14.4" }
+enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.14.4" }
 # indexer = syn で Rust ソースをパースして symbol/call fact を抽出。
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
