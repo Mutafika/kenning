@@ -789,30 +789,38 @@ fn index_one_file(file_t: &Table, sym_t: &Table, acc: &mut Acc, root: &str, path
     true
 }
 
-/// walkdir で dir 以下の index 対象 .rs を列挙 (target/ と隠し dir は除外)。
+/// index 対象の walk 規約 (.rs / それ以外の共通土台)。**ripgrep と同じ規約**:
+/// .gitignore / .ignore / 隠し dir を尊重する。生成物の展開先や vendor 複製が index に入ると、
+/// 本体とほぼ同一のコピーが `def` の重複シンボル・`text` の重複ヒットになり、しかもコピーは
+/// 展開時点のスナップショット = 古い (#12)。
+///
+/// target/ だけは gitignore に頼らず**明示枝刈り** (ignore していない repo 対策)。
+/// パス文字列の後段フィルタでなく filter_entry なのは、target/ 数十万ファイルを列挙してから捨てると
+/// staleness stat-walk が毎クエリ秒単位になるため (filter_entry なら降りない)。
+///
+/// `KENNING_NO_IGNORE=1` で ignore 規則だけ無効化 — gitignore 済みだが実際に compile される
+/// 生成 .rs を持つ repo の逃げ道 (hidden / target の枝刈りは残る)。
+fn index_walk(dir: &str) -> ignore::WalkBuilder {
+    let respect = std::env::var_os("KENNING_NO_IGNORE").is_none();
+    let mut b = ignore::WalkBuilder::new(dir);
+    b.hidden(true) // .git / .claude / .turbo … 正規の source は隠し dir に住まない
+        .ignore(respect)
+        .git_ignore(respect)
+        .git_global(respect)
+        .git_exclude(respect)
+        .parents(respect)
+        .filter_entry(|e| e.depth() == 0 || e.file_name() != "target");
+    b
+}
+
+/// dir 以下の index 対象 .rs を列挙 (walk 規約は index_walk)。
 fn rust_files(dir: &str) -> impl Iterator<Item = std::path::PathBuf> {
-    walkdir::WalkDir::new(dir)
-        .into_iter()
-        // ビルド生成物 (target) と隠しディレクトリ全部 (.git / .claude / .turbo …) を
-        // **ディレクトリごと枝刈り** — rg の hidden 除外と同じ規約。正規の Rust source は隠し dir に
-        // 住まない一方、VCS/ツールの内部 store が .rs を持ち込むと重複混入する。
-        // (パス文字列の後段フィルタだと target/ 数十万ファイルを列挙してから捨てる = staleness
-        //  stat-walk が毎クエリ秒単位になる。filter_entry なら降りない。)
-        .filter_entry(|e| {
-            if e.depth() == 0 {
-                return true; // root 自身は名前に依らず歩く ("." 起動や隠し dir 直指定を殺さない)
-            }
-            let n = e.file_name().to_string_lossy();
-            n != "target" && !n.starts_with('.')
-        })
+    index_walk(dir)
+        .build()
         .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let p = entry.path();
-            if p.extension().is_none_or(|e| e != "rs") {
-                return None;
-            }
-            Some(p.to_path_buf())
-        })
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+        .map(|e| e.path().to_path_buf())
 }
 
 /// 拡張子 → lang。抽出関数を持たない形式は LANG_TEXT (注釈なしで索引されるだけ)。
@@ -832,16 +840,10 @@ fn is_probably_binary(bytes: &[u8]) -> bool {
 }
 
 /// dir 以下の **.rs 以外の索引対象テキスト**を列挙。形式は問わない (binary とサイズ超過だけ落とす)。
-/// .gitignore/.ignore/隠し dir を尊重 = ripgrep と同じ規約なので、生成物・vendor・巨大データを
-/// 索引に持ち込まない。target/ は gitignore に頼らず明示的に枝刈り (ignore されていない repo 対策)。
-/// .rs 側の walk (rust_files) はここを通さない — syn 経路の既存挙動を変えないため。
+/// walk 規約は rust_files と共通 (index_walk) — 片方だけ gitignore を尊重すると、同じ
+/// `kenning text` の中で vendor/*.md は落ちるのに vendor/*.rs は出る、という不整合になる (#12)。
 fn text_files(dir: &str) -> impl Iterator<Item = std::path::PathBuf> {
-    ignore::WalkBuilder::new(dir)
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .filter_entry(|e| e.depth() == 0 || e.file_name() != "target")
+    index_walk(dir)
         .build()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
@@ -3878,9 +3880,7 @@ mod tests {
         std::fs::write(d.join("blob.dat"), [1u8, 0, 2, 3]).unwrap(); // NUL 入り = binary
         std::fs::write(d.join("big.txt"), vec![b'x'; (TEXT_MAX_BYTES + 1) as usize]).unwrap();
 
-        let mut got: Vec<String> = text_files(&d.to_string_lossy())
-            .map(|p| p.strip_prefix(&d).unwrap().to_string_lossy().into_owned())
-            .collect();
+        let mut got: Vec<String> = text_files(&d.to_string_lossy()).map(|p| rel_in(&d, &p)).collect();
         got.sort();
         // .rs は rust_files 側、big.txt はサイズ上限で walk 段階から落ちる
         assert_eq!(got, ["README.md", "blob.dat", "noext", "sub/conf.toml"]);
@@ -3979,6 +3979,11 @@ note: run with `RUST_BACKTRACE=1` to display a backtrace
         d
     }
 
+    /// walk の結果を root からの相対で見る (assert を読みやすく)。
+    fn rel_in(root: &Path, p: &Path) -> String {
+        p.strip_prefix(root).unwrap().to_string_lossy().into_owned()
+    }
+
     #[test]
     fn pkg_name_of_reads_package_name() {
         let d = tmp_tree("pkg");
@@ -4022,14 +4027,43 @@ note: run with `RUST_BACKTRACE=1` to display a backtrace
         for f in ["src/a.rs", "target/debug/gen.rs", ".store/blobs/snap.rs", ".git/hook.rs", "sub/b.rs", "src/.hidden.rs"] {
             std::fs::write(d.join(f), "").unwrap();
         }
-        let mut got: Vec<String> = rust_files(&d.to_string_lossy())
-            .map(|p| p.strip_prefix(&d).unwrap().to_string_lossy().into_owned())
-            .collect();
+        let mut got: Vec<String> = rust_files(&d.to_string_lossy()).map(|p| rel_in(&d, &p)).collect();
         got.sort();
         assert_eq!(got, ["src/a.rs", "sub/b.rs"]);
         // root 自身が隠し名でも depth 0 は素通し (直指定で index できる)
         let hidden_root = d.join(".store/blobs");
         assert_eq!(rust_files(&hidden_root.to_string_lossy()).count(), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #12: gitignore 済みパスは .rs / 非 .rs のどちらの walk からも落ちる (= rg と同じ規約)。
+    /// 生成物の展開先や vendor 複製が index に入ると、本体とほぼ同一のコピーが def の重複シンボルに
+    /// なる。`text` 側 (.md) だけ落ちて `.rs` は出る、という**片肺の不整合**も同時に見張る。
+    #[test]
+    fn walks_respect_gitignore_for_rs_and_text() {
+        let d = tmp_tree("gitignore");
+        for sub in [".git", "src", "vendor/src"] {
+            std::fs::create_dir_all(d.join(sub)).unwrap();
+        }
+        std::fs::write(d.join(".gitignore"), "/vendor/\n").unwrap();
+        for f in ["src/lib.rs", "vendor/src/lib.rs"] {
+            std::fs::write(d.join(f), "pub fn helper_fn() {}").unwrap();
+        }
+        for f in ["notes.md", "vendor/notes.md"] {
+            std::fs::write(d.join(f), "helper_fn").unwrap();
+        }
+        let rs: Vec<String> = rust_files(&d.to_string_lossy()).map(|p| rel_in(&d, &p)).collect();
+        assert_eq!(rs, ["src/lib.rs"], "gitignore 済みの .rs が index 対象に残っている");
+        let mut txt: Vec<String> = text_files(&d.to_string_lossy()).map(|p| rel_in(&d, &p)).collect();
+        txt.sort();
+        assert_eq!(txt, ["notes.md"], "非 .rs 側の規約が .rs 側とずれている"); // .gitignore 自身は隠しファイル
+
+        // 逃げ道: gitignore 済みだが実際に compile される生成 .rs を持つ repo 向け。
+        // (env は同一プロセス内の他テストに漏れるため、この 1 テスト内で set → 即 remove)
+        unsafe { std::env::set_var("KENNING_NO_IGNORE", "1") };
+        let n = rust_files(&d.to_string_lossy()).count();
+        unsafe { std::env::remove_var("KENNING_NO_IGNORE") };
+        assert_eq!(n, 2, "KENNING_NO_IGNORE=1 で ignore 規則を外せていない");
         let _ = std::fs::remove_dir_all(&d);
     }
 

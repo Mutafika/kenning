@@ -36,6 +36,9 @@ kenning outline <path>              # ファイル構造 (Read せず)
 kenning stats                       # 規模と名前解決率
 ```
 
+索引対象は **rg と同じ規約** (.gitignore / .ignore / 隠し dir を尊重、`target/` は常に除外)。
+gitignore 済みだが実際に compile される生成 `.rs` を持つ repo だけ `KENNING_NO_IGNORE=1`。
+
 手動制御が要る時だけ: `--db <path>` / env `KENNING_DB` (明示 db は自動 index しない)、
 `KENNING_NO_AUTO=1` (魔法全停止)、`KENNING_NO_STALE=1` (鮮度チェックのみ停止)。
 binary は `~/.cargo/bin/kenning` (cargo install --path . 済み)。

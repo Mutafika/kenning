@@ -353,7 +353,6 @@ dependencies = [
  "quote",
  "scip",
  "syn",
- "walkdir",
 ]
 
 [[package]]
