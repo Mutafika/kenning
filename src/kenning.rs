@@ -257,6 +257,13 @@ fn repo_root_of(dir: &str) -> Option<std::path::PathBuf> {
     topmost_cargo
 }
 
+/// dir を絶対パスへ正規化 (解決できなければそのまま)。index/update の入口で必ず通す —
+/// 相対のまま焼くと file.path が `./src/…` になり、別 cwd から叩いた時に出力の `path:line` を
+/// そのまま Read へ渡せなくなる (#13 の別件)。meta.root も同じ理由で絶対に保つ。
+fn abs_dir(dir: &str) -> String {
+    std::fs::canonicalize(dir).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| dir.to_string())
+}
+
 /// repo root → 自動 db パス (`~/.cache/kenning/<name>-<hash8>.db`)。db 管理を意識させない。
 fn auto_db_path(root: &std::path::Path) -> Option<String> {
     let home = std::env::var("HOME").ok()?;
@@ -940,6 +947,7 @@ fn text_containers(lang: u32, src: &str) -> Vec<(u32, String)> {
 /// プロジェクト (コンパイラ等) では過小になり枯渇し得る。その時は capacity を上げて自動リトライ
 /// (tight-by-default で open を速く保ちつつ、外れ値でも落ちない)。
 pub fn run_index(dir: &str, path: &str, scip_path: Option<&str>) {
+    let dir = &abs_dir(dir);
     let mut cap_mult = 1u32;
     loop {
         // 予約枯渇 (enchudb の unwrap 失敗) を捕まえるため panic を握りつぶして試行。
@@ -979,6 +987,12 @@ fn run_index_inner(dir: &str, path: &str, scip_path: Option<&str>, cap_mult: u32
     if let Some(sp) = scip_path {
         eprintln!("(SCIP 正確解決: {})", sp);
     }
+
+    // built_at は index の **開始**時刻 (完了時刻ではない)。完了時刻を焼くと、index 中に別プロセスが
+    // 編集したファイルが「mtime < built_at」に収まり、以後の mtime ベース stale 判定を**永久に**
+    // すり抜ける (#13: シンボルの同定は正しいのに行番号だけ 1 週間古い、の正体)。開始時刻なら
+    // 最悪 1 回だけ余分な増分 update が走るだけで自己修復する。
+    let started_at = now_secs();
 
     // eid 予約は実データ規模 (ファイル数) から見積もる。過剰予約はファイルを太らせ open を遅くする。
     // growable なので不足したら enchudb が伸ばす (build 時コストのみ)。ref は --scip 時のみ大きく。
@@ -1274,11 +1288,11 @@ fn run_index_inner(dir: &str, path: &str, scip_path: Option<&str>, cap_mult: u32
 
     // 自己記述メタを焼く (root は絶対パスに正規化して、cwd に依らず update/staleness を効かせる)。
     let meta_t = db.get_table("meta").unwrap();
-    let root_abs = std::fs::canonicalize(dir).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| dir.to_string());
+    let root_abs = abs_dir(dir);
     let mut ins = meta_t
         .insert()
         .set("root", root_abs.as_str())
-        .set("built_at", now_secs())
+        .set("built_at", started_at) // index 開始時刻 (理由は started_at の定義箇所)
         .set("nfiles", n_files as u32)
         .set("ver", INDEX_VER);
     // SCIP を食ったならこの index は baked。時刻は .scip の mtime (= RA が facts を生成した時) —
@@ -1318,6 +1332,7 @@ fn run_index_inner(dir: &str, path: &str, scip_path: Option<&str>, cap_mult: u32
 /// 未変更ファイルは再パースしない (増分の肝)。名前解決の一貫性は、変更で影響を受けた
 /// symbol 名 (`affected`) の incoming call を再解決することで保つ ⇒ full 再 index と同一結果。
 pub fn run_update(dir: &str, path: &str) {
+    let dir = &abs_dir(dir);
     eprintln!("=== kenning update: {} → {} ===", dir, path);
     // 既存 DB を書込可能で開く (drop で永続 / entity_in は新 eid を再発行)。
     // db ファイルがまだ無ければ full index にフォールバック (update = 初回でも動く)。
@@ -1375,6 +1390,9 @@ fn update_inner(db: Database, dir: &str) {
     let call_t = db.get_table("call").unwrap();
     let impl_t = db.get_table("impl"); // 旧 index には無い (Option)
     let t = Instant::now();
+    // 走査**開始**時刻を焼く (完了時刻ではない)。理由は run_index_inner の started_at と同じ — この
+    // update 中に編集されたファイルを、次のクエリの mtime 判定で必ず拾い直せるようにする (#13)。
+    let started_at = now_secs();
 
     // 1. 既存 file 表 (path → (eid, hash))。
     let mut prev: HashMap<String, (EntityId, u32)> = HashMap::new();
@@ -1395,6 +1413,15 @@ fn update_inner(db: Database, dir: &str) {
         if let Some(src) = read_text_file(&p) {
             cur.insert(p.to_string_lossy().into_owned(), src);
         }
+    }
+
+    // 2.5 walk が 1 件も拾えないのに db には行がある = root がずれている / 権限で読めない、の類。
+    // ここで素通しすると「全ファイルが消えた」と解釈して db を丸ごと空にしてしまう (復旧は full
+    // 再 index)。差分を捨てて警告に留める方が安全 (#13)。
+    if cur.is_empty() && !prev.is_empty() {
+        eprintln!("# ⚠ {dir} で index 対象ファイルが 0 件 (db には {} 件)。root がずれている疑いがあるため update を中止。", prev.len());
+        eprintln!("# root を指定して: kenning index <repo> / 全部 ignore していないか `git check-ignore -v <file>` を確認。");
+        return;
     }
 
     // 3. 分類。to_add = 変更 ∪ 新規 (再 index)、to_remove = 変更 ∪ 削除 (旧 facts 消去)。
@@ -1429,7 +1456,7 @@ fn update_inner(db: Database, dir: &str) {
                 let (root_s, nfiles) = (txt(er.get("root")), num(er.get("nfiles")));
                 let (baked, peak, upd) = (er.get("baked_at"), er.get("bake_peak_mb"), er.get("upd_since_bake"));
                 meta_t.entity(e).delete().unwrap();
-                let mut ins = meta_t.insert().set("root", root_s.as_str()).set("built_at", now_secs()).set("nfiles", nfiles).set("ver", INDEX_VER);
+                let mut ins = meta_t.insert().set("root", root_s.as_str()).set("built_at", started_at).set("nfiles", nfiles).set("ver", INDEX_VER);
                 if let Some(Value::Number(b)) = baked {
                     ins = ins.set("baked_at", b as u32);
                     if let Some(Value::Number(p)) = peak { ins = ins.set("bake_peak_mb", p as u32); }
@@ -1533,7 +1560,7 @@ fn update_inner(db: Database, dir: &str) {
     // meta を再スタンプ (built_at を現在に)。bake 情報は持ち越し + 変更数を積算 (閾値で bake 推奨)。
     // 旧 index (meta 表 / bake 列なし) は present なフィールドだけ扱い後方互換。
     if let Some(meta_t) = db.get_table("meta") {
-        let root_abs = std::fs::canonicalize(dir).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| dir.to_string());
+        let root_abs = abs_dir(dir);
         let nfiles = file_t.all().count().unwrap() as u32;
         let old = meta_t.all().find().unwrap().into_iter().next();
         let (baked_at, peak_mb, upd_sb) = old
@@ -1545,7 +1572,7 @@ fn update_inner(db: Database, dir: &str) {
         for e in meta_t.all().find().unwrap() {
             meta_t.entity(e).delete().unwrap(); // 更新は delete+reinsert (Null tie を避ける)
         }
-        let mut ins = meta_t.insert().set("root", root_abs.as_str()).set("built_at", now_secs()).set("nfiles", nfiles).set("ver", INDEX_VER);
+        let mut ins = meta_t.insert().set("root", root_abs.as_str()).set("built_at", started_at).set("nfiles", nfiles).set("ver", INDEX_VER);
         if let Some(Value::Number(b)) = baked_at {
             let upd = match upd_sb { Some(Value::Number(u)) => u as u32, _ => 0 } + n_changed as u32;
             ins = ins.set("baked_at", b as u32).set("upd_since_bake", upd);
@@ -1876,33 +1903,57 @@ fn read_meta(db: &Database) -> Option<(String, u32)> {
     Some((txt(er.get("root")), num(er.get("built_at"))))
 }
 
-/// root 以下で index 時刻より新しいファイルの数 (stat のみ、read しないので軽い)。
+/// root 以下の walk を stat だけで見る → (index 時刻より新しいファイル数, 走査できたファイル数)。
 /// .rs と index 対象テキストの両方を見る — 片方だけだと md 編集が黙って古いまま残る。
-fn count_stale(root: &str, built_at: u32) -> usize {
-    rust_files(root)
-        .chain(text_files(root))
-        .filter(|p| {
-            std::fs::metadata(p)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .is_some_and(|d| d.as_secs() as u32 > built_at)
-        })
-        .count()
+/// **seen も返す**のが要点: stale 0 には「本当に最新」と「root がずれて 1 件も見えていない」の
+/// 2 通りがあり、後者を「最新」と読むと黙って古い facts を返し続ける (#13)。
+fn walk_stats(root: &str, built_at: u32) -> (usize, usize) {
+    let mut stale = 0;
+    let mut seen = 0;
+    for p in rust_files(root).chain(text_files(root)) {
+        seen += 1;
+        // `>=` (`>` ではない): mtime も built_at も秒粒度なので、index 開始と同じ秒に入った編集は
+        // `>` だと永久に見えない。等値も stale 側に倒す方が安全 — 空振りしても update 側が built_at
+        // を「その update の開始時刻」で焼き直すので、余分な no-op update は 1 回で収束する。
+        let newer = std::fs::metadata(&p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .is_some_and(|d| d.as_secs() as u32 >= built_at);
+        if newer {
+            stale += 1;
+        }
+    }
+    (stale, seen)
 }
+
+/// index が焼かれてからの経過 (日)。警告文と「念のため update」の閾値に使う。
+fn age_days(built_at: u32) -> u32 {
+    now_secs().saturating_sub(built_at) / 86_400
+}
+
+/// mtime 判定を信じ切る上限。これを超えて古い db は、stale 0 に見えても一度 hash 差分を取り直す。
+/// mtime は巻き戻る (git checkout / rsync / touch -t) ので、mtime だけだと取りこぼしが永続化する。
+const TRUST_MTIME_MAX_AGE: u32 = 7 * 86_400;
 
 /// index が古ければ stderr に警告 (stdout の path:line は汚さない)。KENNING_NO_STALE で無効化。
 fn warn_if_stale(db: &Database, db_path: &str) {
     if std::env::var_os("KENNING_NO_STALE").is_some() || STALE_CHECKED.load(Ordering::Relaxed) {
         return; // auto 経路が同一プロセスで確認/更新済みなら walk を繰り返さない
     }
-    let Some((root, built_at)) = read_meta(db) else { return };
+    let Some((root, built_at)) = read_meta(db) else {
+        eprintln!("# ⚠ index に meta が無い (旧版) → 鮮度を確認できない。`kenning index <repo>` で焼き直しを。");
+        return;
+    };
     if root.is_empty() || built_at == 0 {
+        eprintln!("# ⚠ index の root/built_at が空 → 鮮度を確認できない。`kenning index <repo>` で焼き直しを。");
         return;
     }
-    let n = count_stale(&root, built_at);
-    if n > 0 {
-        eprintln!("# ⚠ index が古い: {root} で {n} ファイルが index 後に更新。`kenning update {db_path}` で最新に。");
+    let (stale, seen) = walk_stats(&root, built_at);
+    if seen == 0 {
+        eprintln!("# ⚠ {root} で index 対象ファイルが 0 件 → 鮮度を確認できない (repo を移動した / 全て ignore?)。");
+    } else if stale > 0 {
+        eprintln!("# ⚠ index が古い ({} 日前): {root} で {stale} ファイルが index 後に更新。`kenning update {db_path}` で最新に。", age_days(built_at));
     }
 }
 
@@ -2091,8 +2142,18 @@ fn maybe_auto_update(db_path: &str) {
     // どの経路でも open_ro 側 warn_if_stale の再 walk は不要。
     STALE_CHECKED.store(true, Ordering::Relaxed);
     let (root, built_at, ver) = {
-        let Ok(db) = Database::open_readonly(db_path) else { return };
-        let Some((r, b)) = read_meta(&db) else { return };
+        let db = match Database::open_readonly(db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                // 黙って返ると「鮮度を確認した上で最新」と区別が付かない (#13)。
+                eprintln!("# ⚠ index を開けないので鮮度を確認できない ({db_path}: {e}) → 古い結果の可能性。");
+                return;
+            }
+        };
+        let Some((r, b)) = read_meta(&db) else {
+            eprintln!("# ⚠ index に meta が無い (旧版) → 鮮度を確認できない。`kenning index <repo>` で焼き直しを。");
+            return;
+        };
         let v = db
             .get_table("meta")
             .and_then(|t| t.all().find().unwrap().into_iter().next().map(|e| match t.entity(e).get("ver") {
@@ -2103,20 +2164,41 @@ fn maybe_auto_update(db_path: &str) {
         (r, b, v)
     }; // ← readonly を閉じてから書込 open する
     let ver_old = ver != INDEX_VER; // 版違い: ファイル無変更でも full 再 index へ (update_inner が panic → heal)
-    if root.is_empty() || built_at == 0 || (!ver_old && count_stale(&root, built_at) == 0) {
+    if root.is_empty() || built_at == 0 {
+        eprintln!("# ⚠ index の root/built_at が空 → 鮮度を確認できない。`kenning index <repo>` で焼き直しを。");
         return;
+    }
+    if !std::path::Path::new(&root).is_dir() {
+        eprintln!("# ⚠ index の root が無い ({root}) → 鮮度を確認できない (repo を移動/削除?)。`kenning index <repo>` で焼き直しを。");
+        return;
+    }
+    let mut why_old = "index が古い";
+    if !ver_old {
+        let (stale, seen) = walk_stats(&root, built_at);
+        if seen == 0 {
+            eprintln!("# ⚠ {root} で index 対象ファイルが 0 件 → 鮮度を確認できない (全て ignore されている?)。");
+            return;
+        }
+        if stale == 0 {
+            // mtime 上は最新。ただし mtime は巻き戻る (git checkout / rsync / touch -t) ので、
+            // 古い db では一度だけ hash 差分で答え合わせする (update 側が全ファイル読んで比較する)。
+            if age_days(built_at) * 86_400 < TRUST_MTIME_MAX_AGE {
+                return;
+            }
+            why_old = "index が古い (mtime 上は最新だが念のため hash 照合)";
+        }
     }
     match Database::open(db_path) {
         Ok(db) => {
             if ver_old {
                 eprintln!("# index の版が古い (v{ver} → v{INDEX_VER}) → full 再 index ({root})");
             } else {
-                eprintln!("# index が古い → 自動増分 update ({root})");
+                eprintln!("# {why_old} → 自動増分 update ({root})");
             }
             update_with_heal(db, &root, db_path); // 旧 schema/旧版なら full 再 index で自己修復
         }
         Err(e) => {
-            eprintln!("# ⚠ index が古いが lock を取れない ({e}) → 古い結果で回答。後で `kenning update` を。");
+            eprintln!("# ⚠ index が {} 日前だが lock を取れない ({e}) → 古い結果で回答。後で `kenning update` を。", age_days(built_at));
         }
     }
 }
@@ -4033,6 +4115,24 @@ note: run with `RUST_BACKTRACE=1` to display a backtrace
         // root 自身が隠し名でも depth 0 は素通し (直指定で index できる)
         let hidden_root = d.join(".store/blobs");
         assert_eq!(rust_files(&hidden_root.to_string_lossy()).count(), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #13: index の**開始**時刻を built_at に焼き、同一秒の編集も stale に数える。
+    /// 完了時刻を焼く + `>` 比較だと、index 実行中に編集されたファイルが「mtime < built_at」に
+    /// 収まって以後の鮮度判定を永久にすり抜け、「シンボルは正しいのに行番号だけ古い」が固定する。
+    #[test]
+    fn walk_stats_counts_edit_made_during_index() {
+        let d = tmp_tree("stale");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/a.rs"), "fn a() {}").unwrap();
+        let started_at = now_secs(); // = index 開始時刻 (built_at に焼く値)
+        std::fs::write(d.join("src/a.rs"), "fn a() {}\nfn b() {}").unwrap(); // index 中の編集
+        let (stale, seen) = walk_stats(&d.to_string_lossy(), started_at);
+        assert_eq!(seen, 1, "走査できたファイル数");
+        assert_eq!(stale, 1, "index 開始と同じ秒の編集を取りこぼしている");
+        // root が消えていれば seen=0 → 呼び側はこれを「最新」ではなく「確認できない」と扱う
+        assert_eq!(walk_stats(&d.join("nope").to_string_lossy(), started_at), (0, 0));
         let _ = std::fs::remove_dir_all(&d);
     }
 
