@@ -1,6 +1,6 @@
 [package]
 name = "kenning"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"        # edition 2024 の下限 (必須条件)。厳密な最小版は未網羅検証
 description = "Semantic code search for Rust, built for AI coding agents — rust-analyzer facts baked into an embedded faceted DB, served in microseconds"
