@@ -177,6 +177,12 @@ struct Scip {
     pos2idx: HashMap<(String, u32, u32), usize>,
     doc_paths: HashSet<String>, // SCIP が解析した doc の rel_path 集合 (no-occ 診断用)
 }
+/// SCIP の `metadata.project_root` (file:// URI) を絶対パスに。無ければ None。
+fn scip_project_root(idx: &scip::types::Index) -> Option<String> {
+    let p = idx.metadata.as_ref()?.project_root.trim_start_matches("file://").trim_end_matches('/').to_string();
+    if p.is_empty() { None } else { Some(p) }
+}
+
 impl Scip {
     /// `root` = index 対象ディレクトリ。SCIP のバイト列を char 列に直すのに元ソースを読む。
     fn load(path: &str, root: &str) -> Scip {
@@ -184,13 +190,22 @@ impl Scip {
         let bytes = std::fs::read(path).expect("read .scip");
         let idx = scip::types::Index::parse_from_bytes(&bytes).expect("decode .scip");
         let root = root.trim_end_matches('/');
+        // SCIP の relative_path は **SCIP 自身の project_root** 基準。bake が repo root ではなく
+        // その下の cargo workspace を焼いた場合 (#4)、index root とは原点がずれるので、その差分を
+        // 鍵に足して join を合わせる。原点が一致する従来の .scip では prefix = "" (無変化)。
+        let scip_root = scip_project_root(&idx).unwrap_or_else(|| root.to_string());
+        let prefix = if scip_root == root { String::new() } else { rel_of(&scip_root, root) };
+        if prefix.starts_with('/') {
+            eprintln!("# ⚠ .scip の project_root ({scip_root}) が index root ({root}) の外 → 精密 facts は join できない");
+        }
         let mut occ = Vec::new();
         let mut pos2idx = HashMap::new();
         let mut doc_paths = HashSet::new();
         for doc in &idx.documents {
-            doc_paths.insert(doc.relative_path.clone());
+            let rel = if prefix.is_empty() { doc.relative_path.clone() } else { format!("{prefix}/{}", doc.relative_path) };
+            doc_paths.insert(rel.clone());
             // doc の元ソースを 1 度だけ読み、行→char 列変換に使う(読めなければ byte 列のまま)。
-            let src_lines: Option<Vec<String>> = std::fs::read_to_string(format!("{}/{}", root, doc.relative_path))
+            let src_lines: Option<Vec<String>> = std::fs::read_to_string(format!("{}/{}", scip_root, doc.relative_path))
                 .ok()
                 .map(|s| s.lines().map(str::to_string).collect());
             for o in &doc.occurrences {
@@ -203,9 +218,9 @@ impl Scip {
                         .and_then(|ls| ls.get(line0 as usize))
                         .map(|l| byte_col_to_char(l, byte_col))
                         .unwrap_or(byte_col);
-                    pos2idx.insert((doc.relative_path.clone(), line0, col0), occ.len());
+                    pos2idx.insert((rel.clone(), line0, col0), occ.len());
                     occ.push(ScipOcc {
-                        rel_path: doc.relative_path.clone(),
+                        rel_path: rel.clone(),
                         line0,
                         col0,
                         symbol: o.symbol.clone(),
@@ -310,6 +325,79 @@ fn pkg_name_of(cargo_toml: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// manifest が `[workspace]` を持つか (簡易 parse)。workspace root を判定する。
+fn manifest_has_workspace(cargo_toml: &Path) -> bool {
+    std::fs::read_to_string(cargo_toml).is_ok_and(|s| s.lines().any(|l| l.trim() == "[workspace]"))
+}
+
+/// root 以下の **独立した cargo project** の manifest dir を列挙 (walk は index_walk = ignore 準拠なので
+/// gitignore 済み / 隠し dir の死んだ tree は最初から入らない)。workspace member のように上位 manifest
+/// を持つものは、その上位だけを残す (RA が読む単位に合わせる)。
+fn cargo_projects_under(root: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = index_walk(&root.to_string_lossy())
+        .build()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name() == "Cargo.toml")
+        .filter_map(|e| e.path().parent().map(|p| p.to_path_buf()))
+        .collect();
+    dirs.sort();
+    let mut top: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        if !top.iter().any(|t| d.starts_with(t)) {
+            top.push(d); // sort 済みなので祖先が先に入る = 子は落ちる
+        }
+    }
+    top
+}
+
+/// bake (rust-analyzer scip) に渡すディレクトリを決める。
+///
+/// RA は渡した path (かその祖先) の Cargo.toml を **1 つだけ**読む。無ければ直下の子を探し、
+/// 1 つなら黙ってそれを、複数なら `Error: more than one project` で落ちる。git root をそのまま
+/// 渡すと、root が cargo project でない repo では「本命でない crate が黙って焼かれる」か
+/// 「関係ない兄弟 project のせいで bake 全体が失敗する」になる (#4)。
+///
+/// なので cwd を含む **cargo workspace の root** を返す: 最寄り祖先 Cargo.toml から repo root まで
+/// 登り、`[workspace]` を持つ最上位があればそれ (member 全体を焼く)、無ければ最寄り。
+fn bake_target_of(dir: &str, root: &Path) -> Result<PathBuf, String> {
+    let start = std::fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir));
+    let root = &std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()); // 比較の前に原点を揃える
+    let mut nearest: Option<PathBuf> = None;
+    let mut workspace: Option<PathBuf> = None;
+    let mut cur = Some(start.as_path());
+    while let Some(p) = cur {
+        if p.join("Cargo.toml").exists() {
+            if nearest.is_none() {
+                nearest = Some(p.to_path_buf());
+            }
+            if manifest_has_workspace(&p.join("Cargo.toml")) {
+                workspace = Some(p.to_path_buf()); // 上へ行くほど上書き = 最上位が残る
+            }
+        }
+        if p == root {
+            break; // repo の外は見ない
+        }
+        cur = p.parent();
+    }
+    if let Some(d) = workspace.or(nearest) {
+        return Ok(d);
+    }
+    // cwd の系統に Cargo.toml が無い repo (crates/ 直下に並ぶ / server+web の混在など)。
+    // RA に任せると黙って 1 つ選ぶか落ちるので、こちらで数えて選択を促す。
+    let projects = cargo_projects_under(root);
+    match projects.len() {
+        0 => Err(format!("# bake 対象の cargo project が無い ({})。Cargo.toml のある場所で実行を。", root.display())),
+        1 => Ok(projects[0].clone()),
+        n => {
+            let list = projects.iter().take(8).map(|p| format!("#   {}", p.display())).collect::<Vec<_>>().join("\n");
+            Err(format!(
+                "# repo に独立した cargo project が {n} 個あり、どれを焼くか決められない:\n{list}\n\
+                 # 焼きたい crate へ cd してから `kenning bake` を (rust-analyzer は 1 project しか読めない)。"
+            ))
+        }
+    }
 }
 
 /// path から crate 名を解決: 最寄り祖先 Cargo.toml の package name (見つからなければ "root")。
@@ -1752,6 +1840,28 @@ pub fn run_bake(dir: &str) {
     };
     let cache = std::path::Path::new(&db).parent().map(|p| p.to_path_buf()).unwrap_or_else(std::env::temp_dir);
 
+    // ── scip の対象は repo root ではなく「cwd を含む cargo workspace」(#4) ──
+    // db と index の範囲は repo root のまま = 精密 facts が workspace、syn 層が repo 全体。
+    let bake_dir = match bake_target_of(dir, &root) {
+        Ok(d) => d,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+    };
+    let bake_s = bake_dir.to_string_lossy().to_string();
+    if bake_s != root_s {
+        let others: Vec<String> = cargo_projects_under(&root)
+            .into_iter()
+            .filter(|p| !p.starts_with(&bake_dir))
+            .map(|p| rel_of(&p.to_string_lossy(), &root_s))
+            .collect();
+        eprintln!("# bake 対象: {bake_s} (repo root ではなく cwd の cargo workspace)");
+        if !others.is_empty() {
+            eprintln!("# ⚠ workspace 外の cargo project {} 個 ({}) は精密 facts の対象外 (syn 層のまま)。", others.len(), others.join(", "));
+        }
+    }
+
     // ── ゲート: 空きメモリ。必要量 = 前回 peak × 1.3 (無ければ保守的に 6GB)。 ──
     let needed_mb = Database::open_readonly(&db)
         .ok()
@@ -1790,7 +1900,7 @@ pub fn run_bake(dir: &str) {
     let stats_path = format!("{}.time", db.trim_end_matches(".db"));
     let use_time = std::path::Path::new("/usr/bin/time").exists();
     let use_all = std::env::var_os("KENNING_BAKE_DEFAULT_FEATURES").is_none();
-    let n_src = rust_files(&root_s).count();
+    let n_src = rust_files(&bake_s).count(); // 「薄い SCIP」判定は bake 対象の規模と比べる
     let mut peak_mb = 0u64;
     let mut baked = false;
     for attempt in 0..2 {
@@ -1800,7 +1910,7 @@ pub fn run_bake(dir: &str) {
         }
         eprintln!(
             "# bake: rust-analyzer scip {} (features={}) — peak ~{:.1}GB / 数十秒〜数分、常駐なし",
-            root_s, if all { "all" } else { "default" }, needed_mb as f64 / 1024.0
+            bake_s, if all { "all" } else { "default" }, needed_mb as f64 / 1024.0
         );
         let _ = std::fs::remove_file(&stats_path);
         let mut cmd = if use_time {
@@ -1810,11 +1920,11 @@ pub fn run_bake(dir: &str) {
         } else {
             std::process::Command::new(&ra)
         };
-        cmd.args(["scip", &root_s, "--output", &scip_path]);
+        cmd.args(["scip", &bake_s, "--output", &scip_path]);
         if all {
             cmd.args(["--config-path", &cfg_path]);
         }
-        let out = match cmd.current_dir(&root_s).output() {
+        let out = match cmd.current_dir(&bake_s).output() {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("# bake 失敗: rust-analyzer を起動できない ({ra}): {e}");
@@ -1829,7 +1939,7 @@ pub fn run_bake(dir: &str) {
             if all {
                 continue;
             }
-            eprintln!("# 真因を直に見るなら: (cd {root_s} && {ra} scip .)");
+            eprintln!("# 真因を直に見るなら: (cd {bake_s} && {ra} scip .)");
             std::process::exit(1);
         }
         // sanity: features=all が相互排他 cfg 等で薄い SCIP を吐いたら default で焼き直す。
@@ -1851,7 +1961,7 @@ pub fn run_bake(dir: &str) {
     }
     if !baked {
         eprintln!("# bake 失敗 (all/default 両方)");
-        eprintln!("# 真因を直に見るなら: (cd {root_s} && {ra} scip .)");
+        eprintln!("# 真因を直に見るなら: (cd {bake_s} && {ra} scip .)");
         std::process::exit(1);
     }
     let _ = std::fs::remove_file(&cfg_path);
@@ -4115,6 +4225,39 @@ note: run with `RUST_BACKTRACE=1` to display a backtrace
         // root 自身が隠し名でも depth 0 は素通し (直指定で index できる)
         let hidden_root = d.join(".store/blobs");
         assert_eq!(rust_files(&hidden_root.to_string_lossy()).count(), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #4: bake に渡すのは repo root ではなく「cwd を含む cargo workspace」。
+    /// rust-analyzer は 1 project しか読めず、root が cargo project でない repo では黙って別 crate を
+    /// 焼く / `more than one project` で落ちる。死んだ tree (.attic 等) は index_walk が最初から外す。
+    #[test]
+    fn bake_target_is_workspace_not_repo_root() {
+        let d = tmp_tree("baketarget");
+        let ws = d.join("ws");
+        std::fs::create_dir_all(ws.join("crates/core/src")).unwrap();
+        std::fs::create_dir_all(d.join(".attic/dead")).unwrap(); // 隠し dir = 死んだ tree
+        std::fs::write(ws.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/*\"]\n").unwrap();
+        std::fs::write(ws.join("crates/core/Cargo.toml"), "[package]\nname = \"core\"\n").unwrap();
+        std::fs::write(d.join(".attic/dead/Cargo.toml"), "[package]\nname = \"dead\"\n").unwrap();
+
+        // member から叩いても workspace root を焼く (member 単体だと cross-crate が解けない)
+        let got = bake_target_of(&ws.join("crates/core").to_string_lossy(), &d).unwrap();
+        assert_eq!(got, std::fs::canonicalize(&ws).unwrap());
+        // repo root には Cargo.toml が無い → 生きている project は ws だけなのでそれを選ぶ
+        let got = bake_target_of(&d.to_string_lossy(), &d).unwrap();
+        assert_eq!(got, std::fs::canonicalize(&ws).unwrap());
+        assert_eq!(cargo_projects_under(&d).len(), 1, ".attic の死んだ project を数えている");
+
+        // 独立 project が 2 つ = RA では決められない → 黙って 1 つ選ばず、選択を促して落とす
+        std::fs::create_dir_all(d.join("other/src")).unwrap();
+        std::fs::write(d.join("other/Cargo.toml"), "[package]\nname = \"other\"\n").unwrap();
+        let err = bake_target_of(&d.to_string_lossy(), &d).unwrap_err();
+        assert!(err.contains("2 個"), "{err}");
+        assert!(err.contains("cd"), "どこへ cd すべきか出ていない: {err}");
+        // cwd が片方の中なら曖昧さは無い
+        let got = bake_target_of(&d.join("other/src").to_string_lossy(), &d).unwrap();
+        assert_eq!(got, std::fs::canonicalize(d.join("other")).unwrap());
         let _ = std::fs::remove_dir_all(&d);
     }
 
