@@ -2925,17 +2925,22 @@ pub fn cmd_across(args: &[String]) {
     let mut symbols: Vec<String> = Vec::new(); // 定義側のグローバル一意 symbol
     let mut opened = 0usize;
     println!("# across \"{name}\" — {} repo index を走査:", dbs.len());
-    for dbp in &dbs {
-        let Ok(db) = Database::open_readonly(dbp) else { continue };
-        opened += 1;
+    // db は互いに独立 (open は syscall 支配) なので thread で撒く。出力は入力順に戻すので決定的。
+    let pass1: Vec<(String, Vec<String>, bool)> = par_dbs(&dbs, |dbp| {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let mut syms: Vec<String> = Vec::new();
+        let Ok(db) = Database::open_readonly(dbp) else { return (out, syms, false) };
         let repo = read_meta(&db)
             .map(|(r, _)| r.rsplit('/').next().unwrap_or(&r).to_string())
             .unwrap_or_else(|| dbp.rsplit('/').next().unwrap_or(dbp).to_string());
-        let (Some(file_t), Some(sym_t), Some(call_t)) = (db.get_table("file"), db.get_table("sym"), db.get_table("call")) else { continue };
+        let (Some(file_t), Some(sym_t), Some(call_t)) = (db.get_table("file"), db.get_table("sym"), db.get_table("call")) else {
+            return (out, syms, true);
+        };
         let defs = sym_t.where_eq("name", name.as_str()).find().unwrap_or_default();
         let name_calls = call_t.where_eq("callee", name.as_str()).count().unwrap_or(0);
         if defs.is_empty() && name_calls == 0 {
-            continue;
+            return (out, syms, true);
         }
         let paths = file_paths(&file_t);
         let mut precise = 0usize;
@@ -2943,13 +2948,21 @@ pub fn cmd_across(args: &[String]) {
             precise += call_t.where_eq("callee_sym", Value::Ref(d)).count().unwrap_or(0);
             let s = txt(sym_t.entity(d).get("symbol"));
             if !s.is_empty() {
-                symbols.push(s);
+                syms.push(s);
             }
         }
-        println!("{repo}: 定義 {} / 確実 callers {} / 名前一致 call {}", defs.len(), precise, name_calls);
+        let _ = writeln!(out, "{repo}: 定義 {} / 確実 callers {} / 名前一致 call {}", defs.len(), precise, name_calls);
         for &d in defs.iter().take(3) {
-            println!("  {}", fmt_sym(&sym_t, &paths, d));
+            let _ = writeln!(out, "  {}", fmt_sym(&sym_t, &paths, d));
         }
+        (out, syms, true)
+    });
+    for (out, syms, ok) in pass1 {
+        if ok {
+            opened += 1;
+        }
+        print!("{out}");
+        symbols.extend(syms);
     }
 
     // pass2: 定義 symbol を全 repo の extref と突き合わせ = repo を跨いだ精密参照。
@@ -2958,25 +2971,36 @@ pub fn cmd_across(args: &[String]) {
     if !symbols.is_empty() {
         let mut n_x = 0usize;
         let mut shown = 0usize;
-        for dbp in &dbs {
-            let Ok(db) = Database::open_readonly(dbp) else { continue };
-            let Some(extref_t) = db.get_table("extref") else { continue };
-            let Some(file_t) = db.get_table("file") else { continue };
+        // pass1 と同じく db 単位で撒く。limit の適用は入力順に戻してから (出力は逐次版と同じ)。
+        let pass2: Vec<Vec<String>> = par_dbs(&dbs, |dbp| {
+            use std::fmt::Write as _;
+            let mut lines: Vec<String> = Vec::new();
+            let Ok(db) = Database::open_readonly(dbp) else { return lines };
+            let Some(extref_t) = db.get_table("extref") else { return lines };
+            let Some(file_t) = db.get_table("file") else { return lines };
             let repo = read_meta(&db)
                 .map(|(r, _)| r.rsplit('/').next().unwrap_or(&r).to_string())
                 .unwrap_or_default();
             let paths = file_paths(&file_t);
             for s in &symbols {
                 for r in extref_t.where_eq("symbol", s.as_str()).find().unwrap_or_default() {
-                    n_x += 1;
-                    if shown >= limit {
-                        continue;
-                    }
-                    shown += 1;
                     let er = extref_t.entity(r);
                     let p = paths.get(&ref_of(er.get("file"))).cloned().unwrap_or_default();
-                    println!("  ✕ {repo} → {name}: {p}:{}\t[{}]", num(er.get("line")), role_name(num(er.get("role"))));
+                    let mut line = String::new();
+                    let _ = write!(line, "  ✕ {repo} → {name}: {p}:{}\t[{}]", num(er.get("line")), role_name(num(er.get("role"))));
+                    lines.push(line);
                 }
+            }
+            lines
+        });
+        for lines in pass2 {
+            for line in lines {
+                n_x += 1;
+                if shown >= limit {
+                    continue;
+                }
+                shown += 1;
+                println!("{line}");
             }
         }
         if n_x > 0 {
@@ -2989,6 +3013,29 @@ pub fn cmd_across(args: &[String]) {
         }
     }
     eprintln!("# ({opened}/{} db を走査。各 repo の鮮度は個別 query 時に自動 update)", dbs.len());
+}
+
+/// cache 内の db を thread で撒いて処理し、**入力順**で結果を返す。
+/// 1 db の open は syscall (open/fstat/mmap) 支配で CPU をほぼ使わないので、
+/// 逐次だと db 数 × open 代がそのまま wall-clock に乗る。
+fn par_dbs<T: Send>(dbs: &[String], f: impl Fn(&String) -> T + Sync) -> Vec<T> {
+    let n = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4).min(dbs.len());
+    if n <= 1 {
+        return dbs.iter().map(f).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<T>>> = (0..dbs.len()).map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|sc| {
+        for _ in 0..n {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(dbp) = dbs.get(i) else { break };
+                let v = f(dbp);
+                *slots[i].lock().unwrap() = Some(v);
+            });
+        }
+    });
+    slots.into_iter().map(|m| m.into_inner().unwrap().expect("slot filled")).collect()
 }
 
 /// SCIP role bit → 表示名。
