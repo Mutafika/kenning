@@ -16,6 +16,7 @@
 //! で解決、曖昧・外部は推測しない)。indexer は `syn` 2.x (per-file / macro 非展開)。
 
 use enchudb::schema::{Database, Table, Value};
+use enchudb::FaultKind;
 use enchudb_oplog::EntityId;
 use quote::ToTokens;
 use std::collections::{HashMap, HashSet};
@@ -72,7 +73,9 @@ const GENERATED_FILES: &[&str] = &[
 /// v3: sym に doc 列 (doc コメント 1 行目) を追加。
 /// v4: sym に end_line 列 (item 終端行) を追加 — `read` が定義本体を切り出す下端。
 /// v5: file 表に非 Rust テキスト (md/toml/yml/…) も載せる — `text` の対象が .rs 限定でなくなった。
-const INDEX_VER: u32 = 5;
+// v6 (2026-08): enchudb 0.14.4 → 0.25.1。意味論は不変だが、旧 enchudb で作った db を一度焼き直して
+// growable lazy commit (実 disk 半減) と新 recovery に乗せるため bump (次クエリで自動 heal、repo あたり ~1s)。
+const INDEX_VER: u32 = 6;
 
 /// このプロセスで鮮度チェック済みか。parse_opts の auto 経路 (maybe_auto_update / auto-index) が
 /// 立てる。open_ro 側の warn_if_stale が同じ stat-walk を繰り返さないため — 非 Rust の大 dir を
@@ -279,10 +282,15 @@ fn abs_dir(dir: &str) -> String {
     std::fs::canonicalize(dir).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| dir.to_string())
 }
 
+/// 自動導出 db の置き場 (`~/.cache/kenning`)。作らない (無ければ「index が無い」と同義)。
+fn cache_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(Path::new(&home).join(".cache/kenning"))
+}
+
 /// repo root → 自動 db パス (`~/.cache/kenning/<name>-<hash8>.db`)。db 管理を意識させない。
 fn auto_db_path(root: &std::path::Path) -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let cache = std::path::Path::new(&home).join(".cache/kenning");
+    let cache = cache_dir()?;
     std::fs::create_dir_all(&cache).ok()?;
     let root_s = root.to_string_lossy();
     let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "repo".into());
@@ -291,11 +299,10 @@ fn auto_db_path(root: &std::path::Path) -> Option<String> {
 
 /// dir の db パスを解決: env KENNING_DB > repo root からの自動導出。main.rs の index/update 用。
 pub fn default_db_for(dir: &str) -> Option<String> {
-    if let Ok(v) = std::env::var("KENNING_DB") {
-        if !v.is_empty() {
+    if let Ok(v) = std::env::var("KENNING_DB")
+        && !v.is_empty() {
             return Some(v);
         }
-    }
     repo_root_of(dir).and_then(|r| auto_db_path(&r))
 }
 
@@ -315,14 +322,13 @@ fn pkg_name_of(cargo_toml: &Path) -> Option<String> {
             in_pkg = t == "[package]";
             continue;
         }
-        if in_pkg {
-            if let Some(v) = t.strip_prefix("name").and_then(|r| r.trim_start().strip_prefix('=')) {
+        if in_pkg
+            && let Some(v) = t.strip_prefix("name").and_then(|r| r.trim_start().strip_prefix('=')) {
                 let v = v.trim().trim_matches('"');
                 if !v.is_empty() {
                     return Some(v.to_string());
                 }
             }
-        }
     }
     None
 }
@@ -628,14 +634,13 @@ fn first_doc_line(attrs: &[syn::Attribute]) -> String {
         if !a.path().is_ident("doc") {
             continue;
         }
-        if let syn::Meta::NameValue(nv) = &a.meta {
-            if let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) = &nv.value {
+        if let syn::Meta::NameValue(nv) = &a.meta
+            && let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) = &nv.value {
                 let t = s.value().trim().to_string();
                 if !t.is_empty() {
                     return t.chars().take(100).collect();
                 }
             }
-        }
     }
     String::new()
 }
@@ -707,8 +712,8 @@ fn walk_item(it: &syn::Item, ctx: &mut Ctx, acc: &mut Acc, sym_t: &Table) {
             let type_name = clean_type(&i.self_ty);
             // `impl Trait for Type` なら impl edge を記録 (go-to-implementation 用)。
             // trait 名 = path 末尾 seg、line も同 seg の Ident span (Type の span は trait 不要で避ける)。
-            if let Some((_, tpath, _)) = &i.trait_ {
-                if let Some(seg) = tpath.segments.last() {
+            if let Some((_, tpath, _)) = &i.trait_
+                && let Some(seg) = tpath.segments.last() {
                     acc.impls.push(ImplEdge {
                         trait_name: seg.ident.to_string(),
                         type_name: type_name.clone(),
@@ -716,7 +721,6 @@ fn walk_item(it: &syn::Item, ctx: &mut Ctx, acc: &mut Acc, sym_t: &Table) {
                         line: line_of(seg.ident.span()),
                     });
                 }
-            }
             let prev = std::mem::replace(&mut ctx.container, type_name);
             for ii in &i.items {
                 if let syn::ImplItem::Fn(m) = ii {
@@ -1034,6 +1038,28 @@ fn text_containers(lang: u32, src: &str) -> Vec<(u32, String)> {
 /// index のエントリ。table の eid 予約はファイル数から見積もるが、symbol 密度が高い
 /// プロジェクト (コンパイラ等) では過小になり枯渇し得る。その時は capacity を上げて自動リトライ
 /// (tight-by-default で open を速く保ちつつ、外れ値でも落ちない)。
+/// 書き終わりに enchudb の fault (容量満杯 / disk full で拒否された write) を検査する。
+/// enchudb 0.23+ は entity 枠以外 (vocab / content / disk) の満杯を **panic でなく「拒否 + 計数」** にした。
+/// 何もしないと欠けた index が黙って焼き上がるので、ここで panic して呼び側の capacity リトライ
+/// (run_index の ×4) / 自己修復 (update_with_heal → full 再 index) に落とす。
+fn assert_no_faults(db: &Database, phase: &str) {
+    let eng = db.engine();
+    let total = eng.fault_total();
+    if total == 0 {
+        return;
+    }
+    const KINDS: [FaultKind; 5] =
+        [FaultKind::EntitySpace, FaultKind::ContentSpace, FaultKind::VocabSpace, FaultKind::ValueOutOfRange, FaultKind::DiskSpace];
+    let detail: Vec<String> = KINDS
+        .iter()
+        .filter_map(|k| {
+            let n = eng.fault_count(*k);
+            (n > 0).then(|| format!("{}={n}", k.as_str()))
+        })
+        .collect();
+    panic!("{phase}: enchudb が {total} 件の write を拒否 ({}) → 容量不足", detail.join(", "));
+}
+
 pub fn run_index(dir: &str, path: &str, scip_path: Option<&str>) {
     let dir = &abs_dir(dir);
     let mut cap_mult = 1u32;
@@ -1385,15 +1411,14 @@ fn run_index_inner(dir: &str, path: &str, scip_path: Option<&str>, cap_mult: u32
         .set("ver", INDEX_VER);
     // SCIP を食ったならこの index は baked。時刻は .scip の mtime (= RA が facts を生成した時) —
     // heal/移行の再 index で bake スタンプが消えないように (bake コマンド自身は後で now に上書き)。
-    if let Some(sp) = scip_path {
-        if let Some(t) = std::fs::metadata(sp)
+    if let Some(sp) = scip_path
+        && let Some(t) = std::fs::metadata(sp)
             .ok()
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         {
             ins = ins.set("baked_at", t.as_secs() as u32).set("upd_since_bake", 0u32);
         }
-    }
     ins.commit().unwrap();
 
     drop(file_t);
@@ -1401,6 +1426,7 @@ fn run_index_inner(dir: &str, path: &str, scip_path: Option<&str>, cap_mult: u32
     drop(call_t);
     drop(ref_t);
     drop(meta_t);
+    assert_no_faults(&db, "index"); // 拒否された write があれば capacity ×4 で焼き直し
     let db = db.finish_with_oplog(OPLOG_CAPACITY).unwrap();
     drop(db);
 
@@ -1448,22 +1474,34 @@ fn update_with_heal(db: Database, dir: &str, path: &str) {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| update_inner(db, dir)));
     std::panic::set_hook(prev);
     if r.is_err() {
-        let scip = format!("{}.scip", path.trim_end_matches(".db"));
-        let scip = if std::path::Path::new(&scip).exists() { Some(scip) } else { None };
-        eprintln!(
-            "# 増分 update 失敗 (旧 schema の index?) → full 再 index で自己修復{}",
-            if scip.is_some() { " (.scip 再利用で精度維持)" } else { "" }
-        );
-        run_index(dir, path, scip.as_deref());
+        heal_full_reindex(dir, path, "増分 update 失敗 (旧 schema の index?)");
     }
+}
+
+/// db に対応する bake 済み .scip の sidecar (`<stem>.scip`)。存在する時だけ Some。
+fn scip_sidecar_of(db_path: &str) -> Option<String> {
+    let scip = format!("{}.scip", db_path.trim_end_matches(".db"));
+    Path::new(&scip).exists().then_some(scip)
+}
+
+/// full 再 index で自己修復。bake 済みの .scip が残っていれば再利用して精度も維持する。
+/// index は派生物なので、鮮度を確認できない db は (root が分かる限り) 焼き直すのが正解 —
+/// 警告だけ出して「定義が無い」と返すと、stdout を読む側には嘘になる。
+fn heal_full_reindex(dir: &str, path: &str, why: &str) {
+    let scip = scip_sidecar_of(path);
+    eprintln!(
+        "# {why} → full 再 index で自己修復{}",
+        if scip.is_some() { " (.scip 再利用で精度維持)" } else { "" }
+    );
+    run_index(dir, path, scip.as_deref());
 }
 
 /// update の本体 (open 済み db を受け取る)。auto-update (maybe_auto_update) と run_update が共用。
 fn update_inner(db: Database, dir: &str) {
     // index 意味論の版が違えば増分は不整合 (旧値と新値が混ざる) → panic して
     // update_with_heal の full 再 index (.scip 再利用) に落とす。
-    if let Some(meta_t) = db.get_table("meta") {
-        if let Some(e) = meta_t.all().find().unwrap().into_iter().next() {
+    if let Some(meta_t) = db.get_table("meta")
+        && let Some(e) = meta_t.all().find().unwrap().into_iter().next() {
             let v = match meta_t.entity(e).get("ver") {
                 Some(Value::Number(n)) => n as u32,
                 _ => 0,
@@ -1472,7 +1510,6 @@ fn update_inner(db: Database, dir: &str) {
                 panic!("index ver {v} != {INDEX_VER} (意味論変更) → full 再 index が必要");
             }
         }
-    }
     let file_t = db.get_table("file").unwrap();
     let sym_t = db.get_table("sym").unwrap();
     let call_t = db.get_table("call").unwrap();
@@ -1538,8 +1575,8 @@ fn update_inner(db: Database, dir: &str) {
         eprintln!("変更なし ({} files 走査、{:?})。", cur.len(), t.elapsed());
         // built_at だけ再スタンプして返る。これをしないと mtime だけ変わったファイル (touch 等) が
         // 毎クエリ「古い」判定 → 空 update が永遠に走り続ける (実測で踏んだバグ)。
-        if let Some(meta_t) = db.get_table("meta") {
-            if let Some(e) = meta_t.all().find().unwrap().into_iter().next() {
+        if let Some(meta_t) = db.get_table("meta")
+            && let Some(e) = meta_t.all().find().unwrap().into_iter().next() {
                 let er = meta_t.entity(e);
                 let (root_s, nfiles) = (txt(er.get("root")), num(er.get("nfiles")));
                 let (baked, peak, upd) = (er.get("baked_at"), er.get("bake_peak_mb"), er.get("upd_since_bake"));
@@ -1552,7 +1589,6 @@ fn update_inner(db: Database, dir: &str) {
                 }
                 ins.commit().unwrap();
             }
-        }
         return;
     }
 
@@ -1679,6 +1715,7 @@ fn update_inner(db: Database, dir: &str) {
     drop(sym_t);
     drop(call_t);
     drop(impl_t);
+    assert_no_faults(&db, "update"); // 拒否された write があれば heal (full 再 index) へ
     drop(db); // standalone: drop で schema + data を永続化。
     eprintln!("\n次: `kenning def <name>` / `callers <name>` / `search kind:fn vis:pub`");
 }
@@ -1772,13 +1809,12 @@ fn find_ra() -> Option<String> {
         cands.push(p);
     }
     cands.push("rust-analyzer".to_string());
-    if let Ok(home) = std::env::var("HOME") {
-        if let Ok(rd) = std::fs::read_dir(format!("{home}/.rustup/toolchains")) {
+    if let Ok(home) = std::env::var("HOME")
+        && let Ok(rd) = std::fs::read_dir(format!("{home}/.rustup/toolchains")) {
             for e in rd.flatten() {
                 cands.push(e.path().join("bin/rust-analyzer").to_string_lossy().to_string());
             }
         }
-    }
     cands.into_iter().find(|c| {
         std::process::Command::new(c)
             .arg("--version")
@@ -1969,8 +2005,8 @@ pub fn run_bake(dir: &str) {
 
     // ── SCIP 込みで full 再 index → meta に bake 情報を焼く ──
     run_index(&root_s, &db, Some(&scip_path));
-    if let Ok(dbw) = Database::open(&db) {
-        if let Some(mt) = dbw.get_table("meta") {
+    if let Ok(dbw) = Database::open(&db)
+        && let Some(mt) = dbw.get_table("meta") {
             let old = mt.all().find().unwrap().into_iter().next().map(|e| {
                 let er = mt.entity(e);
                 (txt(er.get("root")), num(er.get("built_at")), num(er.get("nfiles")))
@@ -1991,7 +2027,6 @@ pub fn run_bake(dir: &str) {
                     .unwrap();
             }
         }
-    }
     eprintln!("# 精密 facts 有効: refs / callers が RA 同等精度に (`kenning refs <name>`)");
 }
 
@@ -2011,6 +2046,28 @@ fn read_meta(db: &Database) -> Option<(String, u32)> {
     let e = meta_t.all().find().ok()?.into_iter().next()?;
     let er = meta_t.entity(e);
     Some((txt(er.get("root")), num(er.get("built_at"))))
+}
+
+/// meta を「鮮度判定に使える形」で読む → Ok((root, built_at, ver)) / Err(確認できない理由)。
+/// 理由は人間向けの一文 (警告にも heal のログにもそのまま使う)。
+fn probe_meta(db: &Database) -> Result<(String, u32, u32), String> {
+    let Some((root, built_at)) = read_meta(db) else {
+        return Err("index に meta が無い (旧版)".into());
+    };
+    if root.is_empty() || built_at == 0 {
+        return Err("index の root/built_at が空".into());
+    }
+    if !Path::new(&root).is_dir() {
+        return Err(format!("index の root が無い ({root}、repo を移動/削除?)"));
+    }
+    let ver = db
+        .get_table("meta")
+        .and_then(|t| t.all().find().unwrap().into_iter().next().map(|e| match t.entity(e).get("ver") {
+            Some(Value::Number(n)) => n as u32,
+            _ => 0,
+        }))
+        .unwrap_or(0);
+    Ok((root, built_at, ver))
 }
 
 /// root 以下の walk を stat だけで見る → (index 時刻より新しいファイル数, 走査できたファイル数)。
@@ -2236,7 +2293,7 @@ fn parse_opts(args: &[String]) -> Opts {
                 STALE_CHECKED.store(true, Ordering::Relaxed); // 今作ったばかり = 最新
             }
         } else {
-            maybe_auto_update(&db); // auto-update: 古ければ増分してから答える
+            maybe_auto_update(&db, auto_root.as_deref()); // auto-update: 古ければ増分してから答える
         }
     }
     Opts { db, limit, pos }
@@ -2244,14 +2301,19 @@ fn parse_opts(args: &[String]) -> Opts {
 
 /// index が古ければ増分 update してから返る。lock が取れなければ古いまま警告 (安全側)。
 /// stat-walk のみなので通常コストは数 ms。KENNING_NO_STALE=1 でスキップ。
-fn maybe_auto_update(db_path: &str) {
+///
+/// `auto_root` = db を cwd の repo root から導出した時のその root。これが分かっていれば
+/// 鮮度を確認できない db (meta 無しの旧版 / root 不明) は警告でなく **full 再 index で自己修復**
+/// する — db は root から一意に導出した派生物なので焼き直して困るものが無い。明示 db
+/// (`--db` / env) は他 repo の db を誤って潰しかねないので従来通り警告のみ。
+fn maybe_auto_update(db_path: &str, auto_root: Option<&Path>) {
     if std::env::var_os("KENNING_NO_STALE").is_some() {
         return;
     }
     // ここで鮮度は確認 (必要なら更新) される。lock 失敗時も警告は自前で出すので、
     // どの経路でも open_ro 側 warn_if_stale の再 walk は不要。
     STALE_CHECKED.store(true, Ordering::Relaxed);
-    let (root, built_at, ver) = {
+    let probed = {
         let db = match Database::open_readonly(db_path) {
             Ok(db) => db,
             Err(e) => {
@@ -2260,30 +2322,26 @@ fn maybe_auto_update(db_path: &str) {
                 return;
             }
         };
-        let Some((r, b)) = read_meta(&db) else {
-            eprintln!("# ⚠ index に meta が無い (旧版) → 鮮度を確認できない。`kenning index <repo>` で焼き直しを。");
-            return;
-        };
-        let v = db
-            .get_table("meta")
-            .and_then(|t| t.all().find().unwrap().into_iter().next().map(|e| match t.entity(e).get("ver") {
-                Some(Value::Number(n)) => n as u32,
-                _ => 0,
-            }))
-            .unwrap_or(0);
-        (r, b, v)
+        probe_meta(&db)
     }; // ← readonly を閉じてから書込 open する
-    let ver_old = ver != INDEX_VER; // 版違い: ファイル無変更でも full 再 index へ (update_inner が panic → heal)
-    if root.is_empty() || built_at == 0 {
-        eprintln!("# ⚠ index の root/built_at が空 → 鮮度を確認できない。`kenning index <repo>` で焼き直しを。");
-        return;
-    }
-    if !std::path::Path::new(&root).is_dir() {
-        eprintln!("# ⚠ index の root が無い ({root}) → 鮮度を確認できない (repo を移動/削除?)。`kenning index <repo>` で焼き直しを。");
+    let (root, built_at, ver) = match probed {
+        Ok(v) => v,
+        Err(why) => {
+            match auto_root {
+                Some(r) => heal_full_reindex(&r.to_string_lossy(), db_path, &why),
+                None => eprintln!("# ⚠ {why} → 鮮度を確認できない。`kenning index <repo>` で焼き直しを。"),
+            }
+            return;
+        }
+    };
+    if ver != INDEX_VER {
+        // 版違い: ファイル無変更でも full 再 index (増分は旧値と新値が混ざる)。open せず直接 heal —
+        // update 経路に流すと「増分 update 失敗 (旧 schema?)」の紛らわしい 2 行目が出る。
+        heal_full_reindex(&root, db_path, &format!("index の版が古い (v{ver} → v{INDEX_VER})"));
         return;
     }
     let mut why_old = "index が古い";
-    if !ver_old {
+    {
         let (stale, seen) = walk_stats(&root, built_at);
         if seen == 0 {
             eprintln!("# ⚠ {root} で index 対象ファイルが 0 件 → 鮮度を確認できない (全て ignore されている?)。");
@@ -2300,12 +2358,8 @@ fn maybe_auto_update(db_path: &str) {
     }
     match Database::open(db_path) {
         Ok(db) => {
-            if ver_old {
-                eprintln!("# index の版が古い (v{ver} → v{INDEX_VER}) → full 再 index ({root})");
-            } else {
-                eprintln!("# {why_old} → 自動増分 update ({root})");
-            }
-            update_with_heal(db, &root, db_path); // 旧 schema/旧版なら full 再 index で自己修復
+            eprintln!("# {why_old} → 自動増分 update ({root})");
+            update_with_heal(db, &root, db_path); // 旧 schema なら full 再 index で自己修復
         }
         Err(e) => {
             eprintln!("# ⚠ index が {} 日前だが lock を取れない ({e}) → 古い結果で回答。後で `kenning update` を。", age_days(built_at));
@@ -2852,8 +2906,7 @@ pub fn cmd_across(args: &[String]) {
         eprintln!("usage: kenning across <name> [--limit N]");
         return;
     };
-    let Ok(home) = std::env::var("HOME") else { return };
-    let cache = std::path::Path::new(&home).join(".cache/kenning");
+    let Some(cache) = cache_dir() else { return };
     let mut dbs: Vec<String> = std::fs::read_dir(&cache)
         .map(|rd| {
             rd.flatten()
@@ -3024,18 +3077,33 @@ pub fn cmd_refs(args: &[String]) {
 /// 名前が index に無い時の発見導線: 近い定義名を数件提案する。
 /// `foo_bar` を `_` 分割し、長さ 4+ の token を含む定義名を拾う (typo/部分名を救う)。
 /// 例: `finish_oplog` → token [finish, oplog] → `finish_with_oplog` が引っかかる。
+/// 近い名前の提案に使う token / 定義名の最小長。これ未満 (`_` / `Op` / `id`) は
+/// 何にでも含まれるので「近い」の根拠にならない。
+const SUGGEST_MIN_TOKEN: usize = 4;
+
+/// `name` を提案用 token に分解 (小文字化済み、`_`/記号区切り、短い断片は捨てる)。
+fn suggest_tokens(lname: &str) -> Vec<&str> {
+    lname.split(|c: char| c == '_' || !c.is_alphanumeric()).filter(|t| t.len() >= SUGGEST_MIN_TOKEN).collect()
+}
+
+/// 定義名 `ldn` (小文字) が問い合わせ `lname` にどれだけ近いか。一致 token 数 + substring 全体一致 1 点。
+/// 逆包含 (`lname` が `ldn` を含む) は `ldn` が十分長い時だけ — 短い定義名は何にでも含まれる
+/// (`copy_sparse` の候補に `_` や `Op` が出ていた)。
+fn suggest_score(tokens: &[&str], lname: &str, ldn: &str) -> u32 {
+    let mut score = tokens.iter().filter(|t| ldn.contains(**t)).count() as u32;
+    if ldn.contains(lname) || (ldn.len() >= SUGGEST_MIN_TOKEN && lname.contains(ldn)) {
+        score += 1;
+    }
+    score
+}
+
 fn suggest_similar(sym_t: &Table, paths: &HashMap<EntityId, String>, name: &str) {
     let lname = name.to_lowercase();
-    let tokens: Vec<&str> = lname.split(|c: char| c == '_' || !c.is_alphanumeric()).filter(|t| t.len() >= 4).collect();
-    // 各定義を「一致 token 数」でスコア。substring 全体一致も 1 点上乗せ。
+    let tokens = suggest_tokens(&lname);
     let mut best: HashMap<String, (u32, EntityId)> = HashMap::new(); // name → (score, 代表 eid)
     for e in sym_t.all().find().unwrap() {
         let dn = txt(sym_t.entity(e).get("name"));
-        let ldn = dn.to_lowercase();
-        let mut score = tokens.iter().filter(|t| ldn.contains(**t)).count() as u32;
-        if ldn.contains(&lname) || lname.contains(&ldn) {
-            score += 1;
-        }
+        let score = suggest_score(&tokens, &lname, &dn.to_lowercase());
         if score > 0 {
             let slot = best.entry(dn).or_insert((0, e));
             if score > slot.0 { *slot = (score, e); }
@@ -3344,6 +3412,12 @@ pub fn cmd_stats(args: &[String]) {
         sym_t.all().count().unwrap(),
         n_call
     );
+    // 枠使用率: with_capacity は create 時固定なので、満杯に近い table を可視化 (満杯は拒否 → 再 index)。
+    let usage: Vec<String> = ["file", "sym", "call", "ref", "impl", "extref"]
+        .iter()
+        .filter_map(|t| db.table_eid_usage(t).map(|u| format!("{t} {}%", u.allocated as u64 * 100 / u.capacity.max(1) as u64)))
+        .collect();
+    println!("capacity: {} (残 eid {})", usage.join(" "), db.remaining_eid_capacity());
     print!("resolve:");
     let mut resolved = 0usize;
     for (r, nm) in RES_NAMES.iter().enumerate() {
@@ -4027,9 +4101,332 @@ pub fn cmd_bench(args: &[String]) {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// cache — 自動導出 db の棚卸しと掃除 (~/.cache/kenning)
+// ---------------------------------------------------------------------------
+// db は repo ごとに勝手に増える派生物で、消えた repo / 旧版の index が居座る (実測 20 db で
+// 実 1.2GB、sparse の apparent は 39GB)。「消していい物」だけ機械的に選べるようにする。
+
+/// 1 index 分の観測 (`cache ls|prune` 用)。
+struct CacheEntry {
+    db: PathBuf,
+    root: String, // meta.root。旧版 (meta 無し) は空
+    built_at: u32,
+    bytes: u64, // sidecar 込みの実消費 (sparse の穴は数えない)
+    status: CacheStatus,
+}
+
+#[derive(PartialEq)]
+enum CacheStatus {
+    Ok,
+    RootMissing, // repo を移動/削除 → 二度と使われない
+    NoMeta,      // 旧版 (次のクエリで自動 heal されるが、その repo を触らなければ残る)
+    Unreadable,  // open 失敗 (壊れている or 書込み中)。安全側で自動削除の対象外
+}
+
+impl CacheStatus {
+    fn label(&self) -> &'static str {
+        match self {
+            CacheStatus::Ok => "ok",
+            CacheStatus::RootMissing => "root missing",
+            CacheStatus::NoMeta => "旧版 (meta 無し)",
+            CacheStatus::Unreadable => "開けない (要手動確認)",
+        }
+    }
+}
+
+/// db に付随するファイル群 (`X.db` / `X.db.oplog` / `X.db.lock` / `X.db.schema` / `X.db.tables` /
+/// bake 済み `X.scip`)。prefix で拾うので enchudb が sidecar を増やしても漏れない。
+fn cache_sidecars(db: &Path) -> Vec<PathBuf> {
+    let (Some(dir), Some(name)) = (db.parent(), db.file_name().map(|n| n.to_string_lossy().to_string())) else {
+        return vec![db.to_path_buf()];
+    };
+    let scip = format!("{}.scip", name.trim_end_matches(".db"));
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    let n = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    n == name || n.starts_with(&format!("{name}.")) || n == scip
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// 実消費バイト数 (sparse の穴を数えない)。apparent size は enchudb の疎 stride で数十倍に見える。
+fn real_bytes(p: &Path) -> u64 {
+    let Ok(m) = std::fs::metadata(p) else { return 0 };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return m.blocks() * 512;
+    }
+    #[allow(unreachable_code)]
+    m.len()
+}
+
+/// cache dir 内の全 index を観測 (db パス順 = 決定的)。
+fn cache_entries(cache: &Path) -> Vec<CacheEntry> {
+    let mut dbs: Vec<PathBuf> = std::fs::read_dir(cache)
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "db")).collect())
+        .unwrap_or_default();
+    dbs.sort();
+    dbs.into_iter()
+        .map(|db| {
+            let bytes = cache_sidecars(&db).iter().map(|p| real_bytes(p)).sum();
+            let (root, built_at, status) = match Database::open_readonly(&db.to_string_lossy()) {
+                Err(_) => (String::new(), 0, CacheStatus::Unreadable),
+                Ok(d) => match read_meta(&d) {
+                    None => (String::new(), 0, CacheStatus::NoMeta),
+                    Some((r, b)) if r.is_empty() || b == 0 => (r, b, CacheStatus::NoMeta),
+                    Some((r, b)) => {
+                        let st = if Path::new(&r).is_dir() { CacheStatus::Ok } else { CacheStatus::RootMissing };
+                        (r, b, st)
+                    }
+                },
+            };
+            CacheEntry { db, root, built_at, bytes, status }
+        })
+        .collect()
+}
+
+/// prune 対象か: root 消失 / 旧版は無条件、`older_than` 日以上前の index も (指定時)。
+/// 開けない db は壊れているのか書込み中なのか区別できないので自動では消さない。
+fn cache_prunable(e: &CacheEntry, older_than: Option<u32>) -> Option<String> {
+    match e.status {
+        CacheStatus::RootMissing | CacheStatus::NoMeta => Some(e.status.label().to_string()),
+        CacheStatus::Unreadable => None,
+        CacheStatus::Ok => older_than
+            .filter(|d| age_days(e.built_at) >= *d)
+            .map(|d| format!("{} 日前 (>= {d})", age_days(e.built_at))),
+    }
+}
+
+fn mb(bytes: u64) -> String {
+    format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// `cache ls` — 棚卸し。`path TAB 実サイズ TAB 経過日 TAB root TAB 状態`。
+fn cache_ls(cache: &Path) {
+    let entries = cache_entries(cache);
+    if entries.is_empty() {
+        println!("# cache に index が無い ({})。各 repo で一度 kenning を叩くと増える。", cache.display());
+        return;
+    }
+    let total: u64 = entries.iter().map(|e| e.bytes).sum();
+    let prunable = entries.iter().filter(|e| cache_prunable(e, None).is_some()).count();
+    for e in &entries {
+        let age = if e.built_at == 0 { "?".to_string() } else { format!("{}d", age_days(e.built_at)) };
+        let root = if e.root.is_empty() { "?" } else { e.root.as_str() };
+        println!("{}\t{}\t{}\t{}\t{}", e.db.display(), mb(e.bytes), age, root, e.status.label());
+    }
+    println!(
+        "# {} index / {} (実消費)。掃除できる: {prunable} (root 消失 / 旧版)。`kenning cache prune [--older-than 日数] [--dry-run]`",
+        entries.len(),
+        mb(total)
+    );
+}
+
+/// `cache prune` — 掃除。消したものを stdout に 1 行ずつ (dry-run は「予定」)。
+/// 戻り値 = 消した (または消す予定の) index 数。
+fn cache_prune(cache: &Path, older_than: Option<u32>, dry_run: bool) -> usize {
+    let entries = cache_entries(cache);
+    let mut n = 0;
+    let mut freed = 0u64;
+    for e in &entries {
+        let Some(why) = cache_prunable(e, older_than) else { continue };
+        n += 1;
+        freed += e.bytes;
+        let verb = if dry_run { "削除予定" } else { "削除" };
+        println!("{}\t{verb} ({why}, {})", e.db.display(), mb(e.bytes));
+        if !dry_run {
+            for p in cache_sidecars(&e.db) {
+                if let Err(err) = std::fs::remove_file(&p) {
+                    eprintln!("# ⚠ 消せない {}: {err}", p.display());
+                }
+            }
+        }
+    }
+    let kept = entries.len() - n;
+    if dry_run {
+        println!("# {n} index / {} を回収予定 (残 {kept})。実行は --dry-run を外す。", mb(freed));
+    } else {
+        println!("# {n} index / {} を回収 (残 {kept})。", mb(freed));
+    }
+    n
+}
+
+/// `cache [ls|prune] [--older-than <日数>] [--dry-run]` — 自動導出 db の棚卸し/掃除。
+/// db を使わない (cache 全走査) ので parse_opts の auto 魔法は通さない。
+pub fn cmd_cache(args: &[String]) {
+    let mut sub = "ls";
+    let mut older_than: Option<u32> = None;
+    let mut dry_run = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "ls" | "prune" => sub = if args[i] == "ls" { "ls" } else { "prune" },
+            "--older-than" => {
+                i += 1;
+                older_than = args.get(i).and_then(|v| v.parse().ok());
+                if older_than.is_none() {
+                    eprintln!("usage: --older-than <日数>");
+                    std::process::exit(2);
+                }
+            }
+            "--dry-run" => dry_run = true,
+            other => {
+                eprintln!("usage: kenning cache [ls|prune] [--older-than <日数>] [--dry-run] (不明: {other})");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(cache) = cache_dir() else {
+        eprintln!("# HOME が無いので ~/.cache/kenning を特定できない。");
+        std::process::exit(2);
+    };
+    match sub {
+        "prune" => {
+            cache_prune(&cache, older_than, dry_run);
+        }
+        _ => cache_ls(&cache),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// enchudb 0.23+ の「満杯は拒否 + 計数」を黙って通さない: vocab を極小にして拒否を起こし、
+    /// assert_no_faults が panic (= 呼び側の capacity リトライ / heal に落ちる) することを固定。
+    #[test]
+    fn assert_no_faults_panics_when_enchudb_rejected_writes() {
+        let d = tmp_tree("faults");
+        let path = d.join("f.db").to_string_lossy().to_string();
+        let opts = enchudb::GrowableOptions { max_entities: 4096, vocab_max_entries: Some(8), ..Default::default() };
+        let mut db = Database::create_growable_with(&path, opts).unwrap();
+        db.table("t").tag("v").build().unwrap();
+        let t = db.get_table("t").unwrap();
+        for i in 0..64 {
+            t.insert().set("v", format!("value-{i}").as_str()).commit().unwrap(); // Err にならず黙って拒否される
+        }
+        assert!(db.engine().fault_total() > 0, "vocab_max_entries=8 に 64 種を入れて fault が出ない");
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assert_no_faults(&db, "index")));
+        std::panic::set_hook(prev);
+        let msg = r.unwrap_err().downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("vocabulary full"), "拒否の内訳が出ない: {msg}");
+        drop(t);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 提案は「近い」の根拠が要る: 短すぎる定義名 (`_` / `Op`) は何にでも含まれるので 0 点。
+    #[test]
+    fn suggest_score_ignores_tiny_definition_names() {
+        let lname = "copy_sparse";
+        let tokens = suggest_tokens(lname);
+        assert_eq!(tokens, vec!["copy", "sparse"]);
+        assert_eq!(suggest_score(&tokens, lname, "_"), 0, "`_` が候補に出ていた");
+        assert_eq!(suggest_score(&tokens, lname, "op"), 0, "`Op` が候補に出ていた");
+        assert_eq!(suggest_score(&tokens, lname, "copy_db"), 1);
+        assert_eq!(suggest_score(&tokens, lname, "decode_sparse_stream"), 1);
+        assert_eq!(suggest_score(&tokens, lname, "copy_sparse_file"), 3, "両 token + substring 全体一致");
+        assert_eq!(suggest_score(&tokens, lname, "sparse"), 2, "十分長い定義名の逆包含は生きる");
+    }
+
+    /// heal 用の最小 repo (Cargo.toml + src/a.rs) を作って index。(root, db) を返す。
+    fn indexed_fixture(name: &str) -> (PathBuf, String) {
+        let d = tmp_tree(name);
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("Cargo.toml"), "[package]\nname = \"fx\"\nversion = \"0.0.0\"\n").unwrap();
+        std::fs::write(d.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
+        let db = d.join("k.db").to_string_lossy().to_string();
+        run_index(&d.to_string_lossy(), &db, None);
+        (std::fs::canonicalize(&d).unwrap(), db)
+    }
+
+    /// meta を消す/差し替える (旧版 index や repo 移動の再現)。
+    fn rewrite_meta(db: &str, root: Option<&str>) {
+        let d = Database::open(db).unwrap();
+        let t = d.get_table("meta").unwrap();
+        for e in t.all().find().unwrap() {
+            t.entity(e).delete().unwrap();
+        }
+        if let Some(r) = root {
+            t.insert().set("root", r).set("built_at", now_secs()).set("nfiles", 1u32).set("ver", INDEX_VER).commit().unwrap();
+        }
+    }
+
+    fn meta_root(db: &str) -> Option<String> {
+        read_meta(&Database::open_readonly(db).unwrap()).map(|(r, _)| r)
+    }
+
+    /// 鮮度を確認できない index (meta 無し / root 消失) は、root が分かる (自動導出 db) なら
+    /// 警告でなく full 再 index で自己修復する。明示 db (root 不明) は従来通り触らない。
+    #[test]
+    fn auto_update_heals_unverifiable_index_only_when_root_is_known() {
+        let (root, db) = indexed_fixture("heal");
+        let root_s = root.to_string_lossy().to_string();
+        assert_eq!(meta_root(&db).as_deref(), Some(root_s.as_str()));
+
+        // 旧版 (meta 無し): 明示 db は警告のみ → meta は無いまま
+        rewrite_meta(&db, None);
+        maybe_auto_update(&db, None);
+        assert_eq!(meta_root(&db), None, "明示 db を勝手に焼き直してはいけない");
+        // 自動導出 db (root 既知) は heal → meta 復活 + 定義も引ける
+        maybe_auto_update(&db, Some(&root));
+        assert_eq!(meta_root(&db).as_deref(), Some(root_s.as_str()), "meta 無しの旧版が heal されていない");
+        let d = Database::open_readonly(&db).unwrap();
+        assert_eq!(d.get_table("sym").unwrap().where_eq("name", "alpha").find().unwrap().len(), 1);
+        drop(d);
+
+        // root 消失 (repo を移動): 同じく root 既知なら焼き直して root が正しくなる
+        rewrite_meta(&db, Some("/nonexistent/kenning-moved-away"));
+        maybe_auto_update(&db, Some(&root));
+        assert_eq!(meta_root(&db).as_deref(), Some(root_s.as_str()), "root 消失の index が heal されていない");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// cache の棚卸し: root が消えた index だけが prune 対象。sidecar (.oplog 等) ごと消える。
+    #[test]
+    fn cache_prune_removes_only_index_whose_root_is_gone() {
+        let cache = tmp_tree("cache");
+        let (root_a, _) = indexed_fixture("cache-a");
+        let (root_b, _) = indexed_fixture("cache-b");
+        let db_a = cache.join("a-00000001.db").to_string_lossy().to_string();
+        let db_b = cache.join("b-00000002.db").to_string_lossy().to_string();
+        run_index(&root_a.to_string_lossy(), &db_a, None);
+        run_index(&root_b.to_string_lossy(), &db_b, None);
+        std::fs::write(cache.join("b-00000002.scip"), b"stub").unwrap(); // bake 済み sidecar も道連れ
+        std::fs::write(cache.join("bake.lock"), b"1").unwrap(); // 無関係ファイルは触らない
+        std::fs::remove_dir_all(&root_b).unwrap();
+
+        let es = cache_entries(&cache);
+        assert_eq!(es.len(), 2);
+        assert!(es[0].status == CacheStatus::Ok && es[0].db.to_string_lossy() == db_a);
+        assert!(es[1].status == CacheStatus::RootMissing && es[1].db.to_string_lossy() == db_b);
+        assert!(es[1].bytes > 0, "実消費を数えている");
+
+        assert_eq!(cache_prune(&cache, None, true), 1, "dry-run でも対象は数える");
+        assert!(Path::new(&db_b).exists(), "dry-run は消さない");
+        assert_eq!(cache_prune(&cache, None, false), 1);
+        assert!(!Path::new(&db_b).exists());
+        assert!(!cache.join("b-00000002.db.oplog").exists() && !cache.join("b-00000002.scip").exists());
+        assert!(Path::new(&db_a).exists() && cache.join("bake.lock").exists());
+        // 生きている index も --older-than 0 (= 今日以前すべて) なら対象
+        assert_eq!(cache_prune(&cache, Some(0), true), 1);
+        for d in [&cache, &root_a] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
 
     #[test]
     fn text_containers_md_tracks_heading_hierarchy() {

@@ -281,3 +281,72 @@ fn incremental_update_matches_full_reindex() {
     assert_eq!(a, b, "incremental update diverged from a full reindex");
     assert!(a.contains("in extra"), "update did not pick up the new caller:\n{a}");
 }
+
+/// `index`/`update` は探索系と同じ `--db P` を受ける。以前は位置引数扱いで `--db` という名の
+/// db (+ 256MB の .oplog) を cwd に作っていた。知らない flag は db 名に化ける前に拒否。
+#[test]
+fn index_and_update_accept_db_flag_and_never_create_literal_db_file() {
+    let dir = tmp();
+    write_fixture(&dir, OTHER_RS);
+    let db = dir.join("flag.db");
+    let out = kenning()
+        .args(["index", ".", "--db", db.to_str().unwrap()])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "index --db failed: {out:?}");
+    assert!(db.exists(), "--db の値に index されていない");
+    assert!(!dir.join("--db").exists() && !dir.join("--db.oplog").exists(), "`--db` という名の db を作った");
+    assert!(query(&["def", "target"], &db).contains("src/lib.rs:3\t"));
+
+    let out = kenning()
+        .args(["update", ".", "--db", db.to_str().unwrap()])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "update --db failed: {out:?}");
+    assert!(!dir.join("--db").exists(), "update が `--db` db を作った");
+
+    let out = kenning().args(["index", ".", "--bogus"]).current_dir(&dir).output().unwrap();
+    assert!(!out.status.success(), "不明な flag を db 名として受理した");
+    assert!(!dir.join("--bogus").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `cache ls|prune`: 自動導出 db の棚卸し。repo が消えた index だけ (sidecar ごと) 掃除する。
+/// HOME を差し替えて本物の ~/.cache/kenning には触らない。
+#[test]
+fn cache_ls_and_prune_drop_index_whose_repo_is_gone() {
+    let home = tmp();
+    let cache = home.join(".cache/kenning");
+    let repo = tmp();
+    write_fixture(&repo, OTHER_RS);
+    let run = |args: &[&str], cwd: &Path| {
+        let out = kenning()
+            .args(args)
+            .current_dir(cwd)
+            .env("HOME", &home)
+            .env_remove("KENNING_DB")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?} failed: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    // 儀式ゼロ: repo 内で聞くだけで $HOME/.cache/kenning に auto-index される
+    assert!(run(&["def", "target"], &repo).contains("src/lib.rs:3\t"));
+    let ls = run(&["cache", "ls"], &home);
+    assert!(ls.contains("\tok"), "auto-index された db が ok で載る: {ls}");
+    assert!(ls.contains(&*std::fs::canonicalize(&repo).unwrap().to_string_lossy()), "root 列: {ls}");
+    assert!(ls.contains("# 1 index"), "{ls}");
+
+    std::fs::remove_dir_all(&repo).unwrap();
+    let dry = run(&["cache", "prune", "--dry-run"], &home);
+    assert!(dry.contains("削除予定 (root missing"), "{dry}");
+    assert_eq!(std::fs::read_dir(&cache).unwrap().filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x == "db")).count(), 1, "dry-run で消えた");
+    let pr = run(&["cache", "prune"], &home);
+    assert!(pr.contains("# 1 index") && pr.contains("を回収 (残 0)"), "{pr}");
+    let left: Vec<String> = std::fs::read_dir(&cache).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(left.is_empty(), "sidecar が残った: {left:?}");
+    assert!(run(&["cache"], &home).contains("# cache に index が無い"));
+    let _ = std::fs::remove_dir_all(&home);
+}
