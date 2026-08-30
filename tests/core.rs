@@ -350,3 +350,41 @@ fn cache_ls_and_prune_drop_index_whose_repo_is_gone() {
     assert!(run(&["cache"], &home).contains("# cache に index が無い"));
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// `across` は cache 内の db を **thread で撒いて** 開くが、出力は入力順 (db パス順) に
+/// 戻す。2 repo を auto-index して、両方が載ること・順序が db パス順で決定的なことを見る。
+/// (並列化前と同じ出力であることの回帰テスト — 逐次に戻しても通る。)
+#[test]
+fn across_lists_every_repo_in_deterministic_order() {
+    let home = tmp();
+    // db 名は `<repo 名>-<hash>.db` なので、repo 名で db パス順が決まる。
+    let (a, b) = (home.join("aaa_repo"), home.join("zzz_repo"));
+    for r in [&a, &b] {
+        std::fs::create_dir_all(r.join("src")).unwrap();
+        write_fixture(r, OTHER_RS);
+    }
+    let run = |args: &[&str], cwd: &Path| {
+        let out = kenning()
+            .args(args)
+            .current_dir(cwd)
+            .env("HOME", &home)
+            .env_remove("KENNING_DB")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?} failed: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    // 儀式ゼロ: 各 repo で一度聞くと $HOME/.cache/kenning に db が増える
+    for r in [&a, &b] {
+        assert!(run(&["def", "target"], r).contains("src/lib.rs:3\t"));
+    }
+
+    let out = run(&["across", "target"], &home);
+    assert!(out.contains("# across \"target\" — 2 repo index を走査:"), "{out}");
+    let (ia, ib) = (out.find("aaa_repo:"), out.find("zzz_repo:"));
+    assert!(ia.is_some() && ib.is_some(), "両 repo が載る: {out}");
+    assert!(ia < ib, "db パス順で決定的 (並列でも入力順に戻す): {out}");
+    // 同じ入力なら何度回しても同じ出力 (thread の完走順に依存しない)
+    assert_eq!(out, run(&["across", "target"], &home), "出力が非決定的");
+    let _ = std::fs::remove_dir_all(&home);
+}
