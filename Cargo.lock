@@ -193,8 +193,8 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "enchudb"
-version = "0.14.4"
-source = "git+https://github.com/Mutafika/enchudb?tag=v0.14.4#a36503aea842ded8f29e60be953294877cfdd664"
+version = "0.25.1"
+source = "git+https://github.com/Mutafika/enchudb?tag=v0.25.1#5d83e037e31cb5a5924fd74f5eaf215c15080aaf"
 dependencies = [
  "enchudb-engine",
  "enchudb-oplog",
@@ -204,8 +204,8 @@ dependencies = [
 
 [[package]]
 name = "enchudb-engine"
-version = "0.14.4"
-source = "git+https://github.com/Mutafika/enchudb?tag=v0.14.4#a36503aea842ded8f29e60be953294877cfdd664"
+version = "0.25.1"
+source = "git+https://github.com/Mutafika/enchudb?tag=v0.25.1#5d83e037e31cb5a5924fd74f5eaf215c15080aaf"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-queue",
@@ -222,8 +222,8 @@ dependencies = [
 
 [[package]]
 name = "enchudb-oplog"
-version = "0.14.4"
-source = "git+https://github.com/Mutafika/enchudb?tag=v0.14.4#a36503aea842ded8f29e60be953294877cfdd664"
+version = "0.25.1"
+source = "git+https://github.com/Mutafika/enchudb?tag=v0.25.1#5d83e037e31cb5a5924fd74f5eaf215c15080aaf"
 dependencies = [
  "ed25519-dalek",
  "libc",
@@ -234,8 +234,8 @@ dependencies = [
 
 [[package]]
 name = "enchudb-schema"
-version = "0.14.4"
-source = "git+https://github.com/Mutafika/enchudb?tag=v0.14.4#a36503aea842ded8f29e60be953294877cfdd664"
+version = "0.25.1"
+source = "git+https://github.com/Mutafika/enchudb?tag=v0.25.1#5d83e037e31cb5a5924fd74f5eaf215c15080aaf"
 dependencies = [
  "enchudb-engine",
  "enchudb-oplog",
@@ -243,8 +243,8 @@ dependencies = [
 
 [[package]]
 name = "enchudb-sync"
-version = "0.14.4"
-source = "git+https://github.com/Mutafika/enchudb?tag=v0.14.4#a36503aea842ded8f29e60be953294877cfdd664"
+version = "0.25.1"
+source = "git+https://github.com/Mutafika/enchudb?tag=v0.25.1#5d83e037e31cb5a5924fd74f5eaf215c15080aaf"
 dependencies = [
  "enchudb-engine",
  "enchudb-oplog",

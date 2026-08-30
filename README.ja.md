@@ -95,6 +95,7 @@ kenning search  kind:method vis:pub container:Engine   faceted 等値 AND
 kenning outline <path>              ファイルを読まずに構造把握
 kenning bake                        rust-analyzer を 1 回走らせ SCIP 取込 → RA 級精度
 kenning stats                       index 規模 + 解決率
+kenning cache   [ls|prune]          自動 db の棚卸し / 掃除 (repo 消失・旧版、--older-than D)
 ```
 
 出力は stdout の決定的な `path:line<TAB>詳細` 行（進捗は stderr）— 各行はそのまま

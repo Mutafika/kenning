@@ -94,6 +94,7 @@ kenning search  kind:method vis:pub container:Engine   faceted equality-AND
 kenning outline <path>              file structure without reading the file
 kenning bake                        run rust-analyzer once, ingest SCIP → RA-grade precision
 kenning stats                       index size + resolution rate
+kenning cache   [ls|prune]          list / prune auto-derived indexes (missing repo, old format, --older-than D)
 ```
 
 Output is deterministic `path:line<TAB>detail` rows on stdout (progress goes to stderr) —

@@ -34,6 +34,7 @@ kenning path    <from> <to>         # from→to の呼び出し経路
 kenning search  kind:method vis:pub container:Engine calls:unwrap  # faceted AND
 kenning outline <path>              # ファイル構造 (Read せず)
 kenning stats                       # 規模と名前解決率
+kenning cache [ls|prune] [--older-than D] [--dry-run]  # 自動 db の棚卸し / 掃除 (repo 消失・旧版を回収)
 ```
 
 索引対象は **rg と同じ規約** (.gitignore / .ignore / 隠し dir を尊重、`target/` は常に除外)。

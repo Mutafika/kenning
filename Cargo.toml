@@ -2,7 +2,7 @@
 name = "kenning"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"        # edition 2024 の下限 (必須条件)。厳密な最小版は未網羅検証
+rust-version = "1.89"        # enchudb 0.16+ の MSRV (std::fs::File::lock)。edition 2024 の下限 1.85 より上
 description = "Semantic code search for Rust, built for AI coding agents — rust-analyzer facts baked into an embedded faceted DB, served in microseconds"
 license = "MIT"
 repository = "https://github.com/Mutafika/kenning"
@@ -13,8 +13,12 @@ repository = "https://github.com/Mutafika/kenning"
 # tag object の hash を返す (commit ではない)。生 hash を書くとそこで事故るため tag 指定にする。
 # ローカル開発で兄弟 dir の enchudb を使う時は .cargo/config.toml の [patch] で差し替え
 # (gitignore 済み。patch 有効中は Cargo.lock が書き換わるので commit に混ぜない)。
-enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.14.4" }
-enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.14.4" }
+# 0.14.4 → 0.25.1 (2026-08): API 互換 (コード変更なし)。standalone に効くのは torn read (#119/#128/#132)、
+# readonly open の RSS リーク (#127)、WAL tail 消失 (0.21)、満杯で process 死 / disk full SIGBUS (#59/#167)、
+# growable の lazy commit (0.25、実 disk 半減)。代償は single-writer 書込 -35% (HLC lock、実測 index 0.48→0.58s)。
+# 0.23+ は容量満杯を panic でなく「拒否 + 計数」にしたので、書き終わりに fault_total を検査する (assert_no_faults)。
+enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.25.1" }
+enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.25.1" }
 # indexer = syn で Rust ソースをパースして symbol/call fact を抽出。
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"

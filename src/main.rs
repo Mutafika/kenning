@@ -6,35 +6,50 @@
 
 mod kenning;
 
+/// index/update の引数を「flag (`--db P` / `--scip F`) と位置引数」に分ける。
+/// 探索系 (parse_opts) と同じ `--db` をここでも受ける — 以前は位置引数扱いで、
+/// `kenning index . --db x` が **`--db` という名の db を cwd に作っていた** (256MB の残骸が実在)。
+/// 知らない `--flag` は db 名に化ける前に拒否する。
+fn split_index_args(args: &[String]) -> (Vec<String>, Option<String>, Option<String>) {
+    let mut pos = Vec::new();
+    let mut db = None;
+    let mut scip = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--db" => db = it.next().cloned(),
+            "--scip" => scip = it.next().cloned(),
+            f if f.starts_with("--") => {
+                eprintln!("# 不明な flag {f} (index/update は --db <path> / --scip <file> のみ)");
+                std::process::exit(2);
+            }
+            _ => pos.push(a.clone()),
+        }
+    }
+    (pos, db, scip)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("index") => {
-            // index <dir> [db_path] [--scip <file.scip>]
-            let mut pos: Vec<String> = Vec::new();
-            let mut scip: Option<String> = None;
-            let mut it = args[2..].iter();
-            while let Some(a) = it.next() {
-                if a == "--scip" {
-                    scip = it.next().cloned();
-                } else {
-                    pos.push(a.clone());
-                }
-            }
+            // index [dir] [db_path] [--db P] [--scip <file.scip>]
+            let (pos, db_flag, scip) = split_index_args(&args[2..]);
             // dir 省略は "." (repo 内で `kenning index` 一発)。db 省略は repo root から自動導出。
             let dir = pos.first().cloned().unwrap_or_else(|| ".".to_string());
-            let db = pos.get(1).cloned().or_else(|| kenning::default_db_for(&dir)).unwrap_or_else(|| {
+            let db = db_flag.or_else(|| pos.get(1).cloned()).or_else(|| kenning::default_db_for(&dir)).unwrap_or_else(|| {
                 eprintln!("# db パスを導出できない ({dir} は repo 外)。index <dir> <db> で明示を。");
                 std::process::exit(2);
             });
             kenning::run_index(&dir, &db, scip.as_deref());
         }
         Some("update") => {
-            // update [dir] [db] | update <db> | update (引数なし = cwd の repo を自動導出)。
+            // update [dir] [db] [--db P] | update <db> | update (引数なし = cwd の repo を自動導出)。
             // 位置引数を「ディレクトリ = dir」「それ以外 = db」に振り分ける。
+            let (pos, db_flag, _) = split_index_args(&args[2..]);
             let mut dir: Option<String> = None;
-            let mut db: Option<String> = None;
-            for a in &args[2..] {
+            let mut db: Option<String> = db_flag;
+            for a in &pos {
                 if std::path::Path::new(a).is_dir() {
                     dir = Some(a.clone());
                 } else {
@@ -82,6 +97,7 @@ fn main() {
         Some("path") => kenning::cmd_path(&args[2..]),
         Some("outline") => kenning::cmd_outline(&args[2..]),
         Some("stats") => kenning::cmd_stats(&args[2..]),
+        Some("cache") => kenning::cmd_cache(&args[2..]),
         Some("bench") => kenning::cmd_bench(&args[2..]),
         _ => {
             eprintln!(
@@ -89,7 +105,7 @@ fn main() {
                  探索コマンドの出力は `path:line<TAB>詳細` = そのまま Read に渡せる。\n\
                  db は末尾 [db_path] / `--db P` / env KENNING_DB (default /tmp/kenning.db)。\n\n\
                  index:\n  \
-                 index  <dir> [db] [--scip F]     Rust ソースを full index (--scip で正確名前解決)\n  \
+                 index  [dir] [db] [--db P] [--scip F]  Rust ソースを full index (--scip で正確名前解決)\n  \
                  update <dir> [db] | update <db>  変更分だけ増分 re-index (dir 省略で index の root)\n  \
                  bake   [dir]                     rust-analyzer scip を焚いて精密 facts を焼き込む\n  \
                  \u{0020}                              (空きメモリゲート + 直列 lock、常駐なし)\n\n\
@@ -111,6 +127,7 @@ fn main() {
                  \u{0020}                              facet= name: kind: vis: async: test: crate: container: module:\n  \
                  outline <path>                   ファイルの symbol 一覧 (Read せず構造把握、末尾一致可)\n  \
                  stats                            規模と名前解決率\n  \
+                 cache  [ls|prune] [--older-than D] [--dry-run]  自動 db の棚卸し / 掃除 (root 消失・旧版)\n  \
                  bench  [quality|agent|micro|all] 再現可能ベンチ (--n/--nq/--seed、markdown 出力)"
             );
             std::process::exit(1);
