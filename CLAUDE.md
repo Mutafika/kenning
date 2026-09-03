@@ -66,7 +66,8 @@ syn 層の索引は repo 全体のままなので、workspace 外は精度控え
 ## 効いてくる正直な限界
 
 - **鮮度は自動 (query 時に古ければ増分 update してから回答、ms オーダー)。** lock が取れない時だけ
-  古い結果+stderr 警告に落ちる。
+  古い結果+stderr 警告に落ちる。full 再 index (heal / 初回) は db ごとの flock で直列化 — 並列に叩いても
+  待って成果を再利用するだけで、壊れも二重焼きもしない (作りかけは `<db>.tmp-<pid>` に焼いて rename で差し替え)。
 - **精度は食わせた SCIP の feature 網羅に依存 (GIGO)。** 確定 facts は rust-analyzer のもの。
 - **hover / 補完 / 診断 / 式の型推論は無い** (人間のエディタ用機能。Claude は Read + `cargo check` で足りる)。
 - index は派生物 → **VCS に混ぜない** (gitignore、local に持つ)。

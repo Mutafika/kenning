@@ -1074,15 +1074,45 @@ fn assert_no_faults(db: &Database, phase: &str) {
     panic!("{phase}: enchudb が {total} 件の write を拒否 ({}) → 容量不足", detail.join(", "));
 }
 
+/// full index (明示 `kenning index` / bake 用: 常に焼く)。自動経路は [`ensure_index`]。
 pub fn run_index(dir: &str, path: &str, scip_path: Option<&str>) {
+    index_locked(dir, path, scip_path, false);
+}
+
+/// 自動経路 (heal / 「index が無い」) 用の full index。別 process が同じ db を焼いている最中なら
+/// 完了を待ち、その成果がこの repo の現行版ならそれを再利用して戻る (戻り値 false)。
+/// Claude は kenning を並列に叩くので、v10 移行直後などに同じ db の heal が 3 本同時に走る —
+/// 直列化しないと互いの作りかけ directory を消し合い、1 本しか答えを返さなかった (再現済み)。
+/// 直列化するだけだと 3 回 full index するので、待った側は焼き直さない。
+fn ensure_index(dir: &str, path: &str, scip_path: Option<&str>) -> bool {
+    index_locked(dir, path, scip_path, true)
+}
+
+/// 戻り値 = 実際に焼いたか (false: 他 process の成果を再利用 / 失敗)。
+fn index_locked(dir: &str, path: &str, scip_path: Option<&str>, reuse_if_waited: bool) -> bool {
     let dir = &abs_dir(dir);
+    let lock = match IndexLock::acquire(path) {
+        Ok(l) => Some(l),
+        // lock file を置けない (cache dir が read-only 等) なら db も置けないので実害は無いが、
+        // 直列化なしで進む理由は言っておく。
+        Err(e) => {
+            eprintln!("# ⚠ index lock を取れない ({e}) → 直列化なしで続行");
+            None
+        }
+    };
+    if reuse_if_waited && lock.as_ref().is_some_and(|(_, waited)| *waited) && index_is_current(path, dir) {
+        eprintln!("# 待った index がこの repo の現行版 → 再利用 (焼き直し省略)");
+        return false;
+    }
+    sweep_leftovers(path); // lock を握っている = 他に作成中の process は居ない = 残骸と断定できる
+    let tmp = tmp_db_path(path);
     let mut cap_mult = 1u32;
     loop {
         // 予約枯渇 (enchudb の unwrap 失敗) を捕まえるため panic を握りつぶして試行。
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_index_inner(dir, path, scip_path, cap_mult)
+            run_index_inner(dir, path, &tmp, scip_path, cap_mult)
         }));
         std::panic::set_hook(prev);
         // panic payload を人間可読に (握りつぶすと真因が消えるので必ず表示する)。
@@ -1093,27 +1123,122 @@ pub fn run_index(dir: &str, path: &str, scip_path: Option<&str>) {
                 .unwrap_or_else(|| "<non-string panic>".into())
         };
         match r {
-            Ok(()) => return,
+            Ok(placed) => return placed,
             Err(e) if cap_mult < 64 => {
                 cap_mult *= 4;
                 eprintln!("# index 失敗 ({}) → capacity {cap_mult}x で再試行", msg_of(e));
             }
             Err(e) => {
                 eprintln!("# index 失敗: capacity 64x でも解消せず ({dir}): {}", msg_of(e));
-                return;
+                wipe_db(&tmp); // 作りかけを残さない (本番 path は無傷のまま)
+                return false;
             }
         }
     }
 }
 
-/// 再 index の前処理として index 本体を消す。enchudb v10 の db は **directory** だが、
-/// 旧 binary が残した v9 は「単一ファイル + 隣置き sidecar」なので両方剥がす
-/// (v9 の sidecar を残すと新 db の隣にゴミとして永久に居座る)。
-/// kenning 自身の sidecar (`.scip` / `.racfg.json` / `.time`) は消さない — bake 済み facts は
-/// 焼き直しで再利用する (heal_full_reindex の「.scip 再利用で精度維持」)。
+/// 同じ db への full index を process 間で直列化する flock (`<db>.index.lock`)。
+/// kernel が process 終了で解放するので、BakeLock と違って pid 残骸の回収は要らない。
+/// Drop で解放 (panic / exit いずれでも外れる)。
+struct IndexLock {
+    _held: std::fs::File, // 生きている間 flock を保持する (読まない)
+}
+
+impl IndexLock {
+    /// 取れるまで待つ。`.1` = 他 process が同じ db を焼いていて完了を待ったか。
+    fn acquire(db_path: &str) -> std::io::Result<(IndexLock, bool)> {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(index_lock_path(db_path))?;
+        match f.try_lock() {
+            Ok(()) => Ok((IndexLock { _held: f }, false)),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                eprintln!("# 別 process が同じ index を作成中 → 完了を待つ ({db_path})");
+                f.lock()?;
+                Ok((IndexLock { _held: f }, true))
+            }
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+}
+
+fn index_lock_path(db_path: &str) -> String {
+    format!("{db_path}.index.lock")
+}
+
+/// index を焼く作業場 (`<db>.tmp-<pid>`)。完成してから [`swap_in`] で本番 path に rename する。
+/// 本番 path に直接焼かないのは、(1) reader が作りかけの db を開いて `get_table().unwrap()` で
+/// panic しない、(2) 途中で crash しても旧 index が残る、ため。
+fn tmp_db_path(path: &str) -> String {
+    format!("{path}.tmp-{}", std::process::id())
+}
+
+/// 差し替えで退避した旧 index (`<db>.old-<pid>`)。差し替え直後に消す。
+fn old_db_path(path: &str) -> String {
+    format!("{path}.old-{}", std::process::id())
+}
+
+/// `path` の index が `dir` の現行版か (meta の root と INDEX_VER が一致)。mtime 鮮度は見ない —
+/// 直前まで他 process が焼いていた物なので、以後の通常の stale 判定に任せる。
+fn index_is_current(path: &str, dir: &str) -> bool {
+    Database::open_readonly(path)
+        .ok()
+        .and_then(|db| probe_meta(&db).ok())
+        .is_some_and(|(root, _, ver)| root == dir && ver == INDEX_VER)
+}
+
+/// crash した process が残した `<db>.tmp-<pid>` / `<db>.old-<pid>` を回収する。
+/// IndexLock 下で呼ぶこと (他に作成中の process が居ないと言えるのは lock を握っている時だけ)。
+fn sweep_leftovers(path: &str) {
+    let p = Path::new(path);
+    let (Some(parent), Some(name)) = (p.parent(), p.file_name().and_then(|n| n.to_str())) else { return };
+    let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+    let Ok(rd) = std::fs::read_dir(parent) else { return };
+    let (tmp_prefix, old_prefix) = (format!("{name}.tmp-"), format!("{name}.old-"));
+    for e in rd.flatten() {
+        let n = e.file_name();
+        let n = n.to_string_lossy();
+        if n.starts_with(&tmp_prefix) || n.starts_with(&old_prefix) {
+            eprintln!("# 前回の作りかけを回収: {}", e.path().display());
+            wipe_db(&e.path().to_string_lossy());
+        }
+    }
+}
+
+/// 作り終えた `tmp` を本番 `path` に差し替える。旧 index を退避 → tmp を本番へ、の rename 2 段で
+/// 本番 path に作りかけが存在する瞬間を作らない。旧 index (v10 directory / v9 単一ファイル +
+/// 隣置き sidecar) は差し替え後に回収する。戻り値 = 配置できたか。
+///
+/// 残る窓: reader が query の最中 (enchudb の遅延 open が segment を path で開く前) に差し替わると
+/// その 1 query は失敗し得る。open 時に fd を確保する enchudb 側の変更でしか閉じない。
+fn swap_in(tmp: &str, path: &str) -> bool {
+    let old = old_db_path(path);
+    let _ = std::fs::rename(path, &old); // 初回は無いので Err (無視)
+    if let Err(e) = std::fs::rename(tmp, path) {
+        eprintln!("# ⚠ index を配置できない ({tmp} → {path}): {e} → 旧 index を戻す");
+        let _ = std::fs::rename(&old, path);
+        wipe_db(tmp);
+        return false;
+    }
+    wipe_db(&old);
+    remove_v9_sidecars(path);
+    true
+}
+
+/// index 本体を消す。enchudb v10 の db は **directory** だが、旧 binary が残した v9 は
+/// 「単一ファイル + 隣置き sidecar」なので両方剥がす (v9 の sidecar を残すと新 db の隣に
+/// ゴミとして永久に居座る)。kenning 自身の sidecar (`.scip` / `.racfg.json` / `.time`) は消さない —
+/// bake 済み facts は焼き直しで再利用する (heal_full_reindex の「.scip 再利用で精度維持」)。
 fn wipe_db(path: &str) {
     let _ = std::fs::remove_dir_all(path); // v10: db は directory (中に sidecar も入る)
     let _ = std::fs::remove_file(path); // v9 以前: 単一ファイル
+    remove_v9_sidecars(path);
+}
+
+fn remove_v9_sidecars(path: &str) {
     for ext in V9_SIDECAR_EXTS {
         let _ = std::fs::remove_file(format!("{path}.{ext}"));
     }
@@ -1123,8 +1248,9 @@ fn wipe_db(path: &str) {
 /// 中に入るので、v9 → v10 の焼き直し時に一度だけ回収する対象。
 const V9_SIDECAR_EXTS: [&str; 7] = ["oplog", "lock", "schema", "tables", "eidmap", "vocabmap", "crc"];
 
-fn run_index_inner(dir: &str, path: &str, scip_path: Option<&str>, cap_mult: u32) {
-    wipe_db(path);
+/// `tmp` に焼いて最後に `path` へ差し替える。戻り値 = 配置できたか。
+fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Option<&str>, cap_mult: u32) -> bool {
+    wipe_db(tmp); // 前 loop (capacity 不足で panic) の作りかけ
 
     eprintln!("=== kenning index: {} → {} ===", dir, path);
     if let Some(sp) = scip_path {
@@ -1150,7 +1276,7 @@ fn run_index_inner(dir: &str, path: &str, scip_path: Option<&str>, cap_mult: u32
     let impl_cap = (n_files_est * 16).max(1_024) * cap_mult; // impl Trait for Type edge
     let extref_cap = if scip_path.is_some() { (n_files_est * 100).max(8_192) * cap_mult } else { 1_024 };
     let max_entities = (file_cap + sym_cap + call_cap + ref_cap + impl_cap + extref_cap) * 11 / 10; // +10% 余白
-    let mut db = Database::create_growable_with_capacity(path, max_entities).unwrap();
+    let mut db = Database::create_growable_with_capacity(tmp, max_entities).unwrap();
     db.table("file")
         .tag("path")
         .tag("crate_")
@@ -1459,8 +1585,12 @@ fn run_index_inner(dir: &str, path: &str, scip_path: Option<&str>, cap_mult: u32
     let db = db.finish_with_oplog(OPLOG_CAPACITY).unwrap();
     drop(db);
 
+    if !swap_in(tmp, path) {
+        return false;
+    }
     eprintln!("db real disk: {:.1} MB", real_bytes(Path::new(path)) as f64 / 1_048_576.0);
     eprintln!("\n次: `kenning def <name>` / `callers <name>` / `search kind:fn vis:pub`");
+    true
 }
 
 // ─────────────────────────── update (増分 index) ───────────────────────────
@@ -1481,7 +1611,7 @@ pub fn run_update(dir: &str, path: &str) {
                 eprintln!("# index を開けない ({e})。他プロセス使用中かも → 後で再試行を。");
             } else {
                 eprintln!("(index が無いので full index します)");
-                run_index(dir, path, None);
+                ensure_index(dir, path, scip_sidecar_of(path).as_deref());
             }
             return;
         }
@@ -1521,7 +1651,7 @@ fn heal_full_reindex(dir: &str, path: &str, why: &str) {
         "# {why} → full 再 index で自己修復{}",
         if scip.is_some() { " (.scip 再利用で精度維持)" } else { "" }
     );
-    run_index(dir, path, scip.as_deref());
+    ensure_index(dir, path, scip.as_deref());
 }
 
 /// update の本体 (open 済み db を受け取る)。auto-update (maybe_auto_update) と run_update が共用。
@@ -2317,7 +2447,8 @@ fn parse_opts(args: &[String]) -> Opts {
         if !std::path::Path::new(&db).exists() {
             if let Some(root) = &auto_root {
                 eprintln!("# index が無い → 自動 full index: {} → {}", root.display(), db);
-                run_index(&root.to_string_lossy(), &db, None);
+                // bake 済み .scip が隣に残っていれば (cache prune は意図的に残す) 精度を引き継ぐ。
+                ensure_index(&root.to_string_lossy(), &db, scip_sidecar_of(&db).as_deref());
                 STALE_CHECKED.store(true, Ordering::Relaxed); // 今作ったばかり = 最新
             }
         } else {
@@ -4565,6 +4696,87 @@ mod tests {
         let v9 = root.join("legacy-v9-shaped.db");
         std::fs::write(&v9, b"x").unwrap();
         assert!(is_db_path(&v9.to_string_lossy()), "v9 の単一ファイル db を db と判別できていない");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 同じ db への full index は process 間で直列化され、待った側は勝った側の成果を再利用する。
+    /// 直列化が無いと並列 heal が互いの作りかけ directory を消し合う (v10 で顕在化、3 本中 1 本しか
+    /// 答えず 1 本は panic、を再現済み)。「他 process が焼いている最中」は IndexLock を手で握って
+    /// 再現する (flock は open file description 単位なので、同一 process 内の別 open でも衝突する)。
+    #[test]
+    fn ensure_index_waits_for_concurrent_indexer_and_reuses_its_result() {
+        let (root, db) = indexed_fixture("waitreuse");
+        let root_s = root.to_string_lossy().to_string();
+        let spawn = |explicit: bool| {
+            let (r, d) = (root_s.clone(), db.clone());
+            std::thread::spawn(move || index_locked(&r, &d, None, !explicit))
+        };
+        let settle = || std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // 勝った側が現行版を残した → 待った側は焼き直さない
+        let held = IndexLock::acquire(&db).unwrap();
+        assert!(!held.1, "誰も握っていないのに待ち扱い");
+        let t = spawn(false);
+        settle();
+        assert!(Path::new(&db).is_dir(), "lock 待ち中に db が触られている");
+        drop(held);
+        assert!(!t.join().unwrap(), "待った側が現行版を再利用せず焼き直している");
+
+        // 勝った側が失敗して db が無い → 待った側が自分で焼く
+        let held = IndexLock::acquire(&db).unwrap();
+        let t = spawn(false);
+        settle();
+        wipe_db(&db);
+        drop(held);
+        assert!(t.join().unwrap(), "db が無いのに焼いていない");
+        assert_eq!(meta_root(&db).as_deref(), Some(root_s.as_str()));
+
+        // 明示 run_index (bake / `kenning index`) は待っても必ず焼く
+        let held = IndexLock::acquire(&db).unwrap();
+        let t = spawn(true);
+        settle();
+        drop(held);
+        assert!(t.join().unwrap(), "明示 index が再利用で済まされている");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 作りかけは本番 path に置かない: `<db>.tmp-<pid>` に焼いて rename で差し替える。
+    /// crash した process の残骸 (`.tmp-` / `.old-`) は次の index が lock 下で回収する。
+    /// v9 の単一ファイル db に 3 本同時に heal が走っても、全員が生還し db は 1 つ・残骸ゼロ。
+    #[test]
+    fn index_builds_aside_sweeps_leftovers_and_survives_parallel_heal() {
+        let (root, db) = indexed_fixture("aside");
+        let root_s = root.to_string_lossy().to_string();
+        // crash 残骸を仕込む
+        let (tmp_leftover, old_leftover) = (format!("{db}.tmp-99999"), format!("{db}.old-99999"));
+        std::fs::create_dir_all(&tmp_leftover).unwrap();
+        std::fs::write(&old_leftover, b"x").unwrap();
+        // v9 相当 (単一ファイル) に戻して 3 本並列で heal
+        std::fs::remove_dir_all(&db).unwrap();
+        std::fs::write(&db, b"not-a-v10-directory").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let hs: Vec<_> = (0..3)
+            .map(|_| {
+                let (r, d, b) = (root.clone(), db.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    maybe_auto_update(&d, Some(&r));
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().expect("並列 heal で panic");
+        }
+        assert!(Path::new(&db).is_dir(), "v9 → v10 に焼き直されていない");
+        assert_eq!(meta_root(&db).as_deref(), Some(root_s.as_str()));
+        assert!(!Path::new(&tmp_leftover).exists() && !Path::new(&old_leftover).exists(), "crash 残骸が回収されていない");
+        let leftovers: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp-") || n.contains(".old-"))
+            .collect();
+        assert!(leftovers.is_empty(), "作りかけ / 退避が残っている: {leftovers:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
