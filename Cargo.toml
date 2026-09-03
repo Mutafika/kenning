@@ -17,8 +17,17 @@ repository = "https://github.com/Mutafika/kenning"
 # readonly open の RSS リーク (#127)、WAL tail 消失 (0.21)、満杯で process 死 / disk full SIGBUS (#59/#167)、
 # growable の lazy commit (0.25、実 disk 半減)。代償は single-writer 書込 -35% (HLC lock、実測 index 0.48→0.58s)。
 # 0.23+ は容量満杯を panic でなく「拒否 + 計数」にしたので、書き終わりに fault_total を検査する (assert_no_faults)。
-enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.25.1" }
-enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.25.1" }
+# 0.25.1 → 0.26.1 (2026-09): API 互換だが **on-disk format v10 = db が単一ファイルから directory へ (breaking)**。
+# 得: kenning 自身の index で apparent 1610→272MB / 実 34→16MB (cache 全体 21 db で実 1.2GB→約半分)。
+# 損: open が 218→567µs (v10 は 1 region = 1 file で file 数に比例。0.26.1 の遅延 open で 1853µs から回収済み。
+# .crc 封緘 / sync 有効だと遅延が効かないが kenning はどちらも未使用)。across 20db 並列 21.8→27.9ms。
+# 旧 v9 の db は open で弾かれる (src は 1 byte も触られない) → maybe_auto_update が full 再 index で自己修復。
+# ⚠ v10 の db は directory なので「is_dir なら repo」判別が壊れる。振り分けは is_db_path を使うこと。
+# v0.26.2 が出ているが **意図的に 0.26.1 据え置き** — docs only で振る舞いは不変 (上の罠と
+# DbState::Incomplete の rustdoc 修正が中身で、どちらも既に is_db_path に反映済み)。
+# 次に実装上の理由で版を動かす時に 0.26.2 以降を取れば足りる。
+enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.1" }
+enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.1" }
 # indexer = syn で Rust ソースをパースして symbol/call fact を抽出。
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"

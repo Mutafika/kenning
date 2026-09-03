@@ -45,12 +45,13 @@ fn main() {
         }
         Some("update") => {
             // update [dir] [db] [--db P] | update <db> | update (引数なし = cwd の repo を自動導出)。
-            // 位置引数を「ディレクトリ = dir」「それ以外 = db」に振り分ける。
+            // 位置引数を「ディレクトリ = dir」「それ以外 = db」に振り分ける。enchudb v10 の db は
+            // directory なので、db 自身を dir と誤認しないよう is_db_path で除外する。
             let (pos, db_flag, _) = split_index_args(&args[2..]);
             let mut dir: Option<String> = None;
             let mut db: Option<String> = db_flag;
             for a in &pos {
-                if std::path::Path::new(a).is_dir() {
+                if std::path::Path::new(a).is_dir() && !kenning::is_db_path(a) {
                     dir = Some(a.clone());
                 } else {
                     db = Some(a.clone());

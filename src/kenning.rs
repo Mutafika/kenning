@@ -16,7 +16,7 @@
 //! で解決、曖昧・外部は推測しない)。indexer は `syn` 2.x (per-file / macro 非展開)。
 
 use enchudb::schema::{Database, Table, Value};
-use enchudb::FaultKind;
+use enchudb::{DbState, Engine, FaultKind};
 use enchudb_oplog::EntityId;
 use quote::ToTokens;
 use std::collections::{HashMap, HashSet};
@@ -286,6 +286,20 @@ fn abs_dir(dir: &str) -> String {
 fn cache_dir() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(Path::new(&home).join(".cache/kenning"))
+}
+
+/// path が enchudb の db か。**v10 で db が単一ファイルから directory になった**ので、
+/// 「directory なら repo」という素朴な判別が成立しなくなった — `update <dir> <db>` の位置引数を
+/// is_dir だけで振り分けると db を repo と誤認し、**指定した db は古いまま cache に別 index が
+/// 生える**(静かな取りこぼし。tests/core.rs の incremental_update_matches_full_reindex が gate)。
+///
+/// 判定は `Engine::probe` (mmap も lock も取らず stat のみ) で行う。内部の file 名に依存しない
+/// ため。**`Incomplete` を db 側に入れてはいけない** — 素の repo directory は `header.seg` が
+/// 無いので `Incomplete` を返す。「db になりきっていない directory」と「そもそも db でない
+/// directory」は probe では区別できないので、repo 側に倒すのが安全 (index 対象として扱われる
+/// だけで、db として開こうとして壊すことはない)。
+pub fn is_db_path(p: &str) -> bool {
+    matches!(Engine::probe(p), DbState::Ready | DbState::Damaged(_) | DbState::SingleFileLegacy)
 }
 
 /// repo root → 自動 db パス (`~/.cache/kenning/<name>-<hash8>.db`)。db 管理を意識させない。
@@ -1092,10 +1106,25 @@ pub fn run_index(dir: &str, path: &str, scip_path: Option<&str>) {
     }
 }
 
+/// 再 index の前処理として index 本体を消す。enchudb v10 の db は **directory** だが、
+/// 旧 binary が残した v9 は「単一ファイル + 隣置き sidecar」なので両方剥がす
+/// (v9 の sidecar を残すと新 db の隣にゴミとして永久に居座る)。
+/// kenning 自身の sidecar (`.scip` / `.racfg.json` / `.time`) は消さない — bake 済み facts は
+/// 焼き直しで再利用する (heal_full_reindex の「.scip 再利用で精度維持」)。
+fn wipe_db(path: &str) {
+    let _ = std::fs::remove_dir_all(path); // v10: db は directory (中に sidecar も入る)
+    let _ = std::fs::remove_file(path); // v9 以前: 単一ファイル
+    for ext in V9_SIDECAR_EXTS {
+        let _ = std::fs::remove_file(format!("{path}.{ext}"));
+    }
+}
+
+/// v9 以前が db の**隣**に置いていた enchudb sidecar の拡張子。v10 では db directory の
+/// 中に入るので、v9 → v10 の焼き直し時に一度だけ回収する対象。
+const V9_SIDECAR_EXTS: [&str; 7] = ["oplog", "lock", "schema", "tables", "eidmap", "vocabmap", "crc"];
+
 fn run_index_inner(dir: &str, path: &str, scip_path: Option<&str>, cap_mult: u32) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.oplog", path));
-    let _ = std::fs::remove_file(format!("{}.lock", path));
+    wipe_db(path);
 
     eprintln!("=== kenning index: {} → {} ===", dir, path);
     if let Some(sp) = scip_path {
@@ -1430,13 +1459,7 @@ fn run_index_inner(dir: &str, path: &str, scip_path: Option<&str>, cap_mult: u32
     let db = db.finish_with_oplog(OPLOG_CAPACITY).unwrap();
     drop(db);
 
-    let real = std::fs::metadata(path)
-        .map(|m| {
-            use std::os::unix::fs::MetadataExt;
-            (m.blocks() * 512) as f64 / 1_048_576.0
-        })
-        .unwrap_or(0.0);
-    eprintln!("db real disk: {:.1} MB", real);
+    eprintln!("db real disk: {:.1} MB", real_bytes(Path::new(path)) as f64 / 1_048_576.0);
     eprintln!("\n次: `kenning def <name>` / `callers <name>` / `search kind:fn vis:pub`");
 }
 
@@ -1478,9 +1501,14 @@ fn update_with_heal(db: Database, dir: &str, path: &str) {
     }
 }
 
-/// db に対応する bake 済み .scip の sidecar (`<stem>.scip`)。存在する時だけ Some。
+/// db に対応する bake 済み SCIP の path (`<stem>.scip`)。存在は問わない。
+fn scip_path_of(db_path: &str) -> String {
+    format!("{}.scip", db_path.trim_end_matches(".db"))
+}
+
+/// db に対応する bake 済み .scip の sidecar。存在する時だけ Some。
 fn scip_sidecar_of(db_path: &str) -> Option<String> {
-    let scip = format!("{}.scip", db_path.trim_end_matches(".db"));
+    let scip = scip_path_of(db_path);
     Path::new(&scip).exists().then_some(scip)
 }
 
@@ -2316,9 +2344,18 @@ fn maybe_auto_update(db_path: &str, auto_root: Option<&Path>) {
     let probed = {
         let db = match Database::open_readonly(db_path) {
             Ok(db) => db,
+            // 開けない db も (root が分かるなら) 焼き直す。probe_meta の Err と同じ理屈で、
+            // db は root から一意に導出した派生物なので焼き直して困るものが無い。
+            // ここに来る主役は **enchudb v10 で on-disk format が directory になったこと**:
+            // 旧 binary が残した v9 の 1 ファイル db は open 段階で弾かれる (書込み lock を
+            // 取る前に弾かれるので旧 db は 1 byte も変更されない = 旧 binary で開き直せる)。
+            // 破損・書きかけも同じ扱いで良い。明示 db は他 repo のものを潰しかねないので警告のみ。
             Err(e) => {
-                // 黙って返ると「鮮度を確認した上で最新」と区別が付かない (#13)。
-                eprintln!("# ⚠ index を開けないので鮮度を確認できない ({db_path}: {e}) → 古い結果の可能性。");
+                match auto_root {
+                    Some(r) => heal_full_reindex(&r.to_string_lossy(), db_path, &format!("index を開けない ({e})")),
+                    // 黙って返ると「鮮度を確認した上で最新」と区別が付かない (#13)。
+                    None => eprintln!("# ⚠ index を開けないので鮮度を確認できない ({db_path}: {e}) → 古い結果の可能性。"),
+                }
                 return;
             }
         };
@@ -4152,8 +4189,9 @@ pub fn cmd_bench(args: &[String]) {
 // ---------------------------------------------------------------------------
 // cache — 自動導出 db の棚卸しと掃除 (~/.cache/kenning)
 // ---------------------------------------------------------------------------
-// db は repo ごとに勝手に増える派生物で、消えた repo / 旧版の index が居座る (実測 20 db で
-// 実 1.2GB、sparse の apparent は 39GB)。「消していい物」だけ機械的に選べるようにする。
+// db は repo ごとに勝手に増える派生物で、消えた repo / 旧版 / 旧 format の index が居座る
+// (v9 実測 21 db で実 1.2GB・apparent 41GB。v10 で apparent は ~6 分の 1)。
+// 「消していい物」だけ機械的に選べるようにする。
 
 /// 1 index 分の観測 (`cache ls|prune` 用)。
 struct CacheEntry {
@@ -4169,6 +4207,7 @@ enum CacheStatus {
     Ok,
     RootMissing, // repo を移動/削除 → 二度と使われない
     NoMeta,      // 旧版 (次のクエリで自動 heal されるが、その repo を触らなければ残る)
+    LegacyFile,  // enchudb v9 以前の 1 ファイル db。v10 は必ず directory なので構造だけで判る
     Unreadable,  // open 失敗 (壊れている or 書込み中)。安全側で自動削除の対象外
 }
 
@@ -4178,18 +4217,19 @@ impl CacheStatus {
             CacheStatus::Ok => "ok",
             CacheStatus::RootMissing => "root missing",
             CacheStatus::NoMeta => "旧版 (meta 無し)",
+            CacheStatus::LegacyFile => "旧 format (v9 単一ファイル)",
             CacheStatus::Unreadable => "開けない (要手動確認)",
         }
     }
 }
 
-/// db に付随するファイル群 (`X.db` / `X.db.oplog` / `X.db.lock` / `X.db.schema` / `X.db.tables` /
-/// bake 済み `X.scip`)。prefix で拾うので enchudb が sidecar を増やしても漏れない。
+/// db に付随するもの (v10 では `X.db` が directory で enchudb の sidecar はその中。v9 以前が
+/// 隣に残した `X.db.oplog` 等と、bake 済み `X.scip`)。prefix で拾うので取りこぼさない。
 fn cache_sidecars(db: &Path) -> Vec<PathBuf> {
     let (Some(dir), Some(name)) = (db.parent(), db.file_name().map(|n| n.to_string_lossy().to_string())) else {
         return vec![db.to_path_buf()];
     };
-    let scip = format!("{}.scip", name.trim_end_matches(".db"));
+    let scip = scip_path_of(&name);
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.flatten()
@@ -4206,15 +4246,20 @@ fn cache_sidecars(db: &Path) -> Vec<PathBuf> {
 }
 
 /// 実消費バイト数 (sparse の穴を数えない)。apparent size は enchudb の疎 stride で数十倍に見える。
+/// v10 の db は directory (`himo/NNNN.seg` と入れ子) なので再帰して合算する。
 fn real_bytes(p: &Path) -> u64 {
-    let Ok(m) = std::fs::metadata(p) else { return 0 };
+    let Ok(m) = std::fs::symlink_metadata(p) else { return 0 };
     #[cfg(unix)]
-    {
+    let own = {
         use std::os::unix::fs::MetadataExt;
-        return m.blocks() * 512;
+        m.blocks() * 512
+    };
+    #[cfg(not(unix))]
+    let own = m.len();
+    if !m.is_dir() {
+        return own;
     }
-    #[allow(unreachable_code)]
-    m.len()
+    own + std::fs::read_dir(p).map(|rd| rd.flatten().map(|e| real_bytes(&e.path())).sum()).unwrap_or(0)
 }
 
 /// cache dir 内の全 index を観測 (db パス順 = 決定的)。
@@ -4226,7 +4271,10 @@ fn cache_entries(cache: &Path) -> Vec<CacheEntry> {
     dbs.into_iter()
         .map(|db| {
             let bytes = cache_sidecars(&db).iter().map(|p| real_bytes(p)).sum();
+            // v10 の db は必ず directory。単一ファイルなら open するまでもなく v9 以前と確定する
+            // (エラー文字列の照合より構造で判る方が壊れにくい)。
             let (root, built_at, status) = match Database::open_readonly(&db.to_string_lossy()) {
+                Err(_) if db.is_file() => (String::new(), 0, CacheStatus::LegacyFile),
                 Err(_) => (String::new(), 0, CacheStatus::Unreadable),
                 Ok(d) => match read_meta(&d) {
                     None => (String::new(), 0, CacheStatus::NoMeta),
@@ -4242,11 +4290,11 @@ fn cache_entries(cache: &Path) -> Vec<CacheEntry> {
         .collect()
 }
 
-/// prune 対象か: root 消失 / 旧版は無条件、`older_than` 日以上前の index も (指定時)。
+/// prune 対象か: root 消失 / 旧版 / 旧 format は無条件、`older_than` 日以上前の index も (指定時)。
 /// 開けない db は壊れているのか書込み中なのか区別できないので自動では消さない。
 fn cache_prunable(e: &CacheEntry, older_than: Option<u32>) -> Option<String> {
     match e.status {
-        CacheStatus::RootMissing | CacheStatus::NoMeta => Some(e.status.label().to_string()),
+        CacheStatus::RootMissing | CacheStatus::NoMeta | CacheStatus::LegacyFile => Some(e.status.label().to_string()),
         CacheStatus::Unreadable => None,
         CacheStatus::Ok => older_than
             .filter(|d| age_days(e.built_at) >= *d)
@@ -4273,7 +4321,7 @@ fn cache_ls(cache: &Path) {
         println!("{}\t{}\t{}\t{}\t{}", e.db.display(), mb(e.bytes), age, root, e.status.label());
     }
     println!(
-        "# {} index / {} (実消費)。掃除できる: {prunable} (root 消失 / 旧版)。`kenning cache prune [--older-than 日数] [--dry-run]`",
+        "# {} index / {} (実消費)。掃除できる: {prunable} (root 消失 / 旧版 / 旧 format)。`kenning cache prune [--older-than 日数] [--dry-run]`",
         entries.len(),
         mb(total)
     );
@@ -4292,8 +4340,16 @@ fn cache_prune(cache: &Path, older_than: Option<u32>, dry_run: bool) -> usize {
         let verb = if dry_run { "削除予定" } else { "削除" };
         println!("{}\t{verb} ({why}, {})", e.db.display(), mb(e.bytes));
         if !dry_run {
+            // 旧 format は repo が生きている = 次に触った時に heal で焼き直される。bake 済みの
+            // `.scip` は高価 (RA を数十秒 / peak ~5GB) なので、その焼き直しで再利用できるよう残す。
+            // root 消失 / 旧版は repo ごと無いので .scip も道連れでいい。
+            let keep = (e.status == CacheStatus::LegacyFile).then(|| PathBuf::from(scip_path_of(&e.db.to_string_lossy())));
             for p in cache_sidecars(&e.db) {
-                if let Err(err) = std::fs::remove_file(&p) {
+                if Some(&p) == keep.as_ref() {
+                    continue;
+                }
+                let r = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+                if let Err(err) = r {
                     eprintln!("# ⚠ 消せない {}: {err}", p.display());
                 }
             }
@@ -4442,7 +4498,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// cache の棚卸し: root が消えた index だけが prune 対象。sidecar (.oplog 等) ごと消える。
+    /// enchudb v10 で db が **directory** になったので、旧 binary が残した v9 の 1 ファイル db は
+    /// open 段階で弾かれる。root が分かる自動導出 db なら黙って焼き直して復帰すること、隣に
+    /// 残った v9 sidecar を回収すること、棚卸しで「壊れている」でなく「旧 format」に見えることを固定。
+    #[test]
+    fn legacy_v9_single_file_db_is_reindexed_not_reported_as_broken() {
+        let (root, db) = indexed_fixture("legacy-v9");
+        let root_s = root.to_string_lossy().to_string();
+        assert!(Path::new(&db).is_dir(), "v10 の db は directory のはず");
+
+        // v9 相当を再現: db を単一ファイルに戻し、sidecar を隣に置く
+        let stage = || {
+            let _ = std::fs::remove_dir_all(&db);
+            std::fs::write(&db, b"not-a-v10-directory").unwrap();
+            for ext in V9_SIDECAR_EXTS {
+                std::fs::write(format!("{db}.{ext}"), b"stale").unwrap();
+            }
+        };
+        stage();
+
+        // 明示 db (root 不明) は従来通り触らない
+        maybe_auto_update(&db, None);
+        assert!(Path::new(&db).is_file(), "明示 db を勝手に焼き直してはいけない");
+
+        // 自動導出 db (root 既知) は焼き直して復帰 — 定義も引ける
+        maybe_auto_update(&db, Some(&root));
+        assert!(Path::new(&db).is_dir(), "v9 の db が v10 に焼き直されていない");
+        assert_eq!(meta_root(&db).as_deref(), Some(root_s.as_str()));
+        let d = Database::open_readonly(&db).unwrap();
+        assert_eq!(d.get_table("sym").unwrap().where_eq("name", "alpha").find().unwrap().len(), 1);
+        drop(d);
+        for ext in V9_SIDECAR_EXTS {
+            assert!(!Path::new(&format!("{db}.{ext}")).exists(), "v9 の隣置き sidecar .{ext} が残っている");
+        }
+
+        // 棚卸し: 開けないからと放置せず、回収対象として数える
+        stage();
+        let scip = scip_path_of(&db);
+        std::fs::write(&scip, b"baked").unwrap();
+        let cache = Path::new(&db).parent().unwrap().to_path_buf();
+        let e = cache_entries(&cache).into_iter().find(|e| e.db.to_string_lossy() == db).unwrap();
+        assert!(e.status == CacheStatus::LegacyFile, "v9 が旧 format と判定されていない");
+        assert!(cache_prunable(&e, None).is_some(), "旧 format が prune 対象になっていない");
+        // 回収しても bake 成果物は残す (repo は生きていて、次の heal で再利用する)
+        cache_prune(&cache, None, false);
+        assert!(!Path::new(&db).exists(), "旧 format の db が回収されていない");
+        assert!(Path::new(&scip).exists(), "bake 済み .scip まで道連れにしている");
+        for ext in V9_SIDECAR_EXTS {
+            assert!(!Path::new(&format!("{db}.{ext}")).exists(), "v9 の隣置き sidecar .{ext} が残っている");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// v10 の db は directory なので、`update <dir> <db>` の振り分けを is_dir だけで決めると
+    /// db を repo と誤認する (指定 db が更新されず cache に別 index が生える)。構造で見分けること。
+    #[test]
+    fn v10_db_directory_is_not_mistaken_for_a_repo() {
+        let (root, db) = indexed_fixture("dbdir");
+        assert!(Path::new(&db).is_dir(), "v10 の db は directory のはず");
+        assert!(is_db_path(&db), "db を db と判別できていない");
+        assert!(!is_db_path(&root.to_string_lossy()), "repo root を db と誤認している");
+        // repo root は probe 上 Incomplete (header.seg が無い)。db 側に倒すと全 repo が db になる。
+        assert!(Engine::probe(&root) == DbState::Incomplete, "前提が変わった: repo root の probe 結果");
+        // v9 の単一ファイルも db 側 (repo と誤認して索引しにいかない)
+        let v9 = root.join("legacy-v9-shaped.db");
+        std::fs::write(&v9, b"x").unwrap();
+        assert!(is_db_path(&v9.to_string_lossy()), "v9 の単一ファイル db を db と判別できていない");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// cache の棚卸し: root が消えた index だけが prune 対象。sidecar (v10 は db directory の
+    /// 中、bake 済み `.scip` は隣) ごと消える。
     #[test]
     fn cache_prune_removes_only_index_whose_root_is_gone() {
         let cache = tmp_tree("cache");
@@ -4466,7 +4593,7 @@ mod tests {
         assert!(Path::new(&db_b).exists(), "dry-run は消さない");
         assert_eq!(cache_prune(&cache, None, false), 1);
         assert!(!Path::new(&db_b).exists());
-        assert!(!cache.join("b-00000002.db.oplog").exists() && !cache.join("b-00000002.scip").exists());
+        assert!(!cache.join("b-00000002.scip").exists(), "bake 済み sidecar が道連れになっていない");
         assert!(Path::new(&db_a).exists() && cache.join("bake.lock").exists());
         // 生きている index も --older-than 0 (= 今日以前すべて) なら対象
         assert_eq!(cache_prune(&cache, Some(0), true), 1);
