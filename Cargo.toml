@@ -42,6 +42,8 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 # 索引対象を決める walk (.rs / それ以外の共通土台)。.gitignore/.ignore を尊重する
 # (= ripgrep と同じ規約) ので、生成物・vendor 複製・巨大データが index に紛れ込まない。
 ignore = "0.4"
+# text -e (正規表現)。regex-automata / regex-syntax は ignore 経由で既に依存木にある。
+regex = "1"
 # 正確な名前解決 = rust-analyzer の SCIP 出力を食う (occurrence を位置で syn と join)。
 scip = "0.5"
 protobuf = "3"

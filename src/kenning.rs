@@ -2771,55 +2771,251 @@ pub fn cmd_def(args: &[String]) {
     run_search(&o.db, &[format!("name:{name}")], o.limit, true); // def = hover 相当で sig も
 }
 
-/// `read <name> [container]` — 定義本体をそのまま出す (`def` → Read の 2 手を 1 手に)。
+/// `read` — 定義本体をそのまま出す (`def` → Read の 2 手を 1 手に)。3 つの形:
+/// - `read <name> [container] [crate:X] [path:S] [--all]` — 同名が複数なら container / crate / path で絞る
+///   か `--all` で全部出す (同名 symbol で grep に戻る最大の原因だったので、絞り方を増やした)
+/// - `read <path>:<line>` — その行を囲む item の本体 (`grep -n "fn X"` → `sed -n` の代わり)。
+///   非 Rust ならその行を含む見出し / [table] 配下
+/// - `read <file.md>#<見出し>` — 見出し配下 (toml は `[table]`、yaml はキー)。CHANGELOG を awk で切る代わり
+///
 /// Read tool と違い「その item の範囲だけ」なので token も節約。範囲は index 済みの
 /// line..end_line + 直上の doc/attr 行 (query 時に上へ拡張)。
 pub fn cmd_read(args: &[String]) {
-    let o = parse_opts(args);
-    let Some(name) = o.pos.first() else {
-        eprintln!("usage: kenning read <name> [container] [--db P]");
+    let all = args.iter().any(|a| a == "--all");
+    let rest: Vec<String> = args.iter().filter(|a| *a != "--all").cloned().collect();
+    let o = parse_opts(&rest);
+    let Some(first) = o.pos.first() else {
+        eprintln!("usage: kenning read <name> [container] [crate:X] [path:S] [--all] | read <path>:<line> | read <file>#<見出し>  [--db P]");
         return;
     };
-    run_read(&o.db, name, o.pos.get(1).map(String::as_str), o.limit);
+    if let Some((p, l)) = split_path_line(first) {
+        run_read_at(&o.db, p, l);
+        return;
+    }
+    if let Some((p, h)) = first.split_once('#')
+        && looks_like_path(p)
+    {
+        run_read_section(&o.db, p, h);
+        return;
+    }
+    let (mut container, mut crate_f, mut path_f) = (None, None, None);
+    for a in &o.pos[1..] {
+        match a.split_once(':') {
+            Some(("crate", v)) => crate_f = Some(v),
+            Some(("path", v)) => path_f = Some(v),
+            Some(("container", v)) => container = Some(v),
+            _ if container.is_none() => container = Some(a.as_str()),
+            _ => eprintln!("# 無視: {a} (container は 1 つ、絞るなら crate: / path:)"),
+        }
+    }
+    run_read(&o.db, first, container, crate_f, path_f, all, o.limit);
 }
 
-/// 一度に出す本体の上限行数。超える item は頭からここまで + 続きの Read 案内 (暴発防止)。
-const READ_MAX_LINES: usize = 400;
+/// `<path>:<line>` 形か (末尾が数字で、前半が path らしい)。symbol 名に `:` は無いので衝突しない。
+fn split_path_line(s: &str) -> Option<(&str, usize)> {
+    let (p, l) = s.rsplit_once(':')?;
+    let line = l.parse::<usize>().ok().filter(|&n| n > 0)?;
+    looks_like_path(p).then_some((p, line))
+}
 
-fn run_read(db_path: &str, name: &str, container: Option<&str>, limit: usize) {
-    let Some(db) = open_ro(db_path) else { return };
-    let file_t = db.get_table("file").unwrap();
-    let sym_t = db.get_table("sym").unwrap();
-    let paths = file_paths(&file_t);
+fn looks_like_path(s: &str) -> bool {
+    !s.is_empty() && (s.contains('/') || s.contains('.'))
+}
 
-    let defs = defs_of(&sym_t, name, container);
-    if defs.is_empty() {
-        println!("# \"{name}\" の定義が index に無い{}。", container.map(|c| format!(" (container={c})")).unwrap_or_default());
-        suggest_similar(&sym_t, &paths, name);
-        return;
+/// file の解決 (outline / read 共通): 完全一致 → 末尾一致 (`src/lib.rs` で index の絶対 path に当たる)。
+fn find_file(file_t: &Table, paths: &HashMap<EntityId, String>, arg: &str) -> Option<EntityId> {
+    match file_t.where_eq("path", arg).find_one().unwrap() {
+        Some(e) => Some(e),
+        None => {
+            let mut hits: Vec<(&String, EntityId)> = paths.iter().filter(|(_, p)| p.ends_with(arg)).map(|(e, p)| (p, *e)).collect();
+            hits.sort();
+            hits.first().map(|(_, e)| *e)
+        }
     }
-    if defs.len() > 1 {
-        println!("# \"{name}\" は {} 定義 (同名)。`read {name} <container>` で絞る:", defs.len());
-        print_syms(&sym_t, &paths, &defs, limit, true);
-        return;
-    }
-    let er = sym_t.entity(defs[0]);
+}
+
+/// sym の本体を `path:line<TAB>詳細` の見出し + 行番号付きで出す (read の中核)。
+fn print_sym_body(sym_t: &Table, paths: &HashMap<EntityId, String>, eid: EntityId) {
+    let er = sym_t.entity(eid);
     let path = paths.get(&ref_of(er.get("file"))).cloned().unwrap_or_default();
     let start = num(er.get("line")) as usize;
     let end = (num(er.get("end_line")) as usize).max(start);
-    println!("{}", fmt_sym(&sym_t, &paths, defs[0]));
+    println!("{}", fmt_sym(sym_t, paths, eid));
     let Ok(src) = std::fs::read_to_string(&path) else {
         println!("# source を読めない: {path} (index 時と cwd が違う? full path で index を)");
         return;
     };
     let lines: Vec<&str> = src.lines().collect();
     let s = extend_up(&lines, start);
-    let shown_end = end.min(s + READ_MAX_LINES - 1);
-    for (i, l) in lines.iter().enumerate().take(shown_end).skip(s - 1) {
+    print_lines(&path, &lines, s, end);
+}
+
+/// lines[s..=e] (1-indexed) を行番号付きで出す。長大なら READ_MAX_LINES で打ち切って続きの Read を案内。
+fn print_lines(path: &str, lines: &[&str], s: usize, e: usize) {
+    let e = e.min(lines.len());
+    let shown_end = e.min(s + READ_MAX_LINES - 1);
+    for (i, l) in lines.iter().enumerate().take(shown_end).skip(s.saturating_sub(1)) {
         println!("{:>5}\t{l}", i + 1);
     }
-    if shown_end < end {
-        println!("# … 長大なので {READ_MAX_LINES} 行で打ち切り (+{} 行)。続き: Read {path} offset={}", end - shown_end, shown_end + 1);
+    if shown_end < e {
+        println!("# … 長大なので {READ_MAX_LINES} 行で打ち切り (+{} 行)。続き: Read {path} offset={}", e - shown_end, shown_end + 1);
+    }
+}
+
+/// `read <path>:<line>` — その行を囲む item (Rust) / 見出し配下 (非 Rust)。囲む物が無ければ前後 20 行。
+fn run_read_at(db_path: &str, path_arg: &str, line: usize) {
+    let Some(db) = open_ro(db_path) else { return };
+    let file_t = db.get_table("file").unwrap();
+    let sym_t = db.get_table("sym").unwrap();
+    let paths = file_paths(&file_t);
+    let Some(fe) = find_file(&file_t, &paths, path_arg) else {
+        println!("# file not found: {path_arg}");
+        return;
+    };
+    let path = paths[&fe].clone();
+    let lang = num(file_t.entity(fe).get("lang"));
+    if lang == LANG_RUST {
+        // 囲む item = line <= L <= end_line を満たす中で開始行が最大のもの (impl 内 method なら method)
+        let best = sym_t
+            .all()
+            .where_ref("file", fe)
+            .find()
+            .unwrap()
+            .into_iter()
+            .filter(|&e| {
+                let er = sym_t.entity(e);
+                let (s, en) = (num(er.get("line")) as usize, num(er.get("end_line")) as usize);
+                s <= line && line <= en.max(s)
+            })
+            .max_by_key(|&e| num(sym_t.entity(e).get("line")));
+        if let Some(e) = best {
+            print_sym_body(&sym_t, &paths, e);
+            return;
+        }
+    }
+    let Ok(src) = std::fs::read_to_string(&path) else {
+        println!("# source を読めない: {path}");
+        return;
+    };
+    let lines: Vec<&str> = src.lines().collect();
+    if lang != LANG_RUST {
+        let containers = text_containers(lang, &src);
+        let idx = containers.partition_point(|(l, _)| (*l as usize) <= line);
+        if idx > 0 {
+            let (s, e) = section_range(&containers, idx - 1, lang, lines.len());
+            println!("{path}:{s}\t(in {})", containers[idx - 1].1);
+            print_lines(&path, &lines, s, e);
+            return;
+        }
+    }
+    println!("# {path}:{line} を囲む定義が無い → 前後 20 行");
+    print_lines(&path, &lines, line.saturating_sub(20).max(1), line + 20);
+}
+
+/// `read <file>#<見出し>` — 見出し (toml は [table]、yaml はキー) 配下を出す。部分一致・大小無視。複数なら一覧。
+fn run_read_section(db_path: &str, path_arg: &str, heading: &str) {
+    let Some(db) = open_ro(db_path) else { return };
+    let file_t = db.get_table("file").unwrap();
+    let paths = file_paths(&file_t);
+    let Some(fe) = find_file(&file_t, &paths, path_arg) else {
+        println!("# file not found: {path_arg}");
+        return;
+    };
+    let path = paths[&fe].clone();
+    let lang = num(file_t.entity(fe).get("lang"));
+    let Ok(src) = std::fs::read_to_string(&path) else {
+        println!("# source を読めない: {path}");
+        return;
+    };
+    let containers = text_containers(lang, &src);
+    if containers.is_empty() {
+        println!("# {path} には見出し構造が無い (md の #, toml の [table], yaml のキーのみ対応)。`read {path_arg}:<line>` で位置指定を。");
+        return;
+    }
+    // 一致は「その見出し自身の題」で見る (階層全体だと親の題が子にも含まれて全部当たる)。
+    let h = heading.to_lowercase();
+    let hits: Vec<usize> = (0..containers.len()).filter(|&i| section_title(&containers[i].1, lang).to_lowercase().contains(&h)).collect();
+    match hits.as_slice() {
+        [] => {
+            println!("# \"{heading}\" に一致する見出しが {path} に無い。ある見出し:");
+            for (l, c) in containers.iter().take(50) {
+                println!("{path}:{l}\t{c}");
+            }
+        }
+        [i] => {
+            let lines: Vec<&str> = src.lines().collect();
+            let (s, e) = section_range(&containers, *i, lang, lines.len());
+            println!("{path}:{s}\t{}", containers[*i].1);
+            print_lines(&path, &lines, s, e);
+        }
+        many => {
+            println!("# \"{heading}\" は {} 箇所。絞るか `read {path_arg}:<line>` で:", many.len());
+            for &i in many {
+                println!("{path}:{}\t{}", containers[i].0, containers[i].1);
+            }
+        }
+    }
+}
+
+/// 階層文字列から見出し自身の題を取り出す (md: `A > B > C` の C、yaml: `a.b.c` の c、toml: そのまま)。
+fn section_title(c: &str, lang: u32) -> &str {
+    match lang {
+        LANG_MD => c.rsplit(" > ").next().unwrap_or(c),
+        LANG_YAML => c.rsplit('.').next().unwrap_or(c),
+        _ => c,
+    }
+}
+
+/// containers[i] の配下の行範囲 (1-indexed, 両端含む): 次の「同じか浅い深さ」の見出しの直前まで。
+fn section_range(containers: &[(u32, String)], i: usize, lang: u32, n_lines: usize) -> (usize, usize) {
+    let depth = |c: &str| match lang {
+        LANG_MD => c.matches(" > ").count(),
+        LANG_YAML => c.matches('.').count(),
+        _ => 0,
+    };
+    let d = depth(&containers[i].1);
+    let end = containers[i + 1..].iter().find(|(_, c)| depth(c) <= d).map(|(l, _)| *l as usize - 1).unwrap_or(n_lines);
+    (containers[i].0 as usize, end.max(containers[i].0 as usize))
+}
+
+/// 一度に出す本体の上限行数。超える item は頭からここまで + 続きの Read 案内 (暴発防止)。
+const READ_MAX_LINES: usize = 400;
+
+fn run_read(db_path: &str, name: &str, container: Option<&str>, crate_f: Option<&str>, path_f: Option<&str>, all: bool, limit: usize) {
+    let Some(db) = open_ro(db_path) else { return };
+    let file_t = db.get_table("file").unwrap();
+    let sym_t = db.get_table("sym").unwrap();
+    let paths = file_paths(&file_t);
+
+    let mut defs = defs_of(&sym_t, name, container);
+    if let Some(c) = crate_f {
+        defs.retain(|&e| txt(sym_t.entity(e).get("crate_")) == c);
+    }
+    if let Some(p) = path_f {
+        defs.retain(|&e| paths.get(&ref_of(sym_t.entity(e).get("file"))).is_some_and(|f| f.contains(p)));
+    }
+    if defs.is_empty() {
+        let filt: Vec<String> = [container.map(|c| format!("container={c}")), crate_f.map(|c| format!("crate={c}")), path_f.map(|p| format!("path~{p}"))]
+            .into_iter()
+            .flatten()
+            .collect();
+        println!("# \"{name}\" の定義が index に無い{}。", if filt.is_empty() { String::new() } else { format!(" ({})", filt.join(", ")) });
+        suggest_similar(&sym_t, &paths, name);
+        return;
+    }
+    if defs.len() > 1 && !all {
+        println!(
+            "# \"{name}\" は {} 定義 (同名)。絞る: `read {name} <container>` / `crate:<crate>` / `path:<path の一部>`、全部出すなら `--all`:",
+            defs.len()
+        );
+        print_syms(&sym_t, &paths, &defs, limit, true);
+        return;
+    }
+    for (i, &e) in defs.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        print_sym_body(&sym_t, &paths, e);
     }
 }
 
@@ -3186,16 +3382,21 @@ fn run_impls(db_path: &str, name: &str, limit: usize) {
     }
 }
 
-/// `text <term>` — 全文検索 (コメント/文字列も) + **enclosing symbol 注釈**。
+/// `text <term>... [-e]` — 全文検索 (コメント/文字列も) + **enclosing symbol 注釈**。
 /// grep superset with structure: どの関数の中のヒットかが 1 行で分かる = 追い Read を 1 個消す。
 /// 検索対象は index 済みファイル (live に読む = 常に最新)。大小無視。
+/// 複数語は OR (`grep -E "a|b"` の代わり)、`-e` で各語を正規表現として扱う (`grep -E` 相当。
+/// これが無いと Claude が grep に戻る)。
 pub fn cmd_text(args: &[String]) {
-    let o = parse_opts(args);
-    let Some(needle) = o.pos.first() else {
-        eprintln!("usage: kenning text <term> [--db P] [--limit N]");
+    let regex = args.iter().any(|a| a == "-e" || a == "--regex");
+    let rest: Vec<String> = args.iter().filter(|a| *a != "-e" && *a != "--regex").cloned().collect();
+    let o = parse_opts(&rest);
+    if o.pos.is_empty() {
+        eprintln!("usage: kenning text <term>... [-e] [--db P] [--limit N]   (複数語は OR、-e で正規表現)");
         return;
-    };
-    let needle_l = needle.to_lowercase();
+    }
+    let needle = o.pos.join(" | ");
+    let Some(m) = TextMatcher::new(&o.pos, regex) else { return };
     let Some(db) = open_ro(&o.db) else { return };
     let file_t = db.get_table("file").unwrap();
     let sym_t = db.get_table("sym").unwrap();
@@ -3225,14 +3426,14 @@ pub fn cmd_text(args: &[String]) {
     let mut total = 0usize;
     for (path, fe, lang) in &files {
         let Ok(src) = std::fs::read_to_string(path) else { continue };
-        if !src.to_lowercase().contains(&needle_l) {
+        if !m.hit(&src) {
             continue; // ファイル単位の早期スキップ
         }
         let syms = syms_by_file.get(fe);
         // 非 Rust は sym を持たないので、本文から container を作る (見出し階層 / [table] / キーパス)。
         let containers = if *lang == LANG_RUST { Vec::new() } else { text_containers(*lang, &src) };
         for (i, line) in src.lines().enumerate() {
-            if !line.to_lowercase().contains(&needle_l) {
+            if !m.hit(line) {
                 continue;
             }
             total += 1;
@@ -3278,6 +3479,41 @@ pub fn cmd_text(args: &[String]) {
     }
     if total == 0 {
         println!("# \"{needle}\" は index 済みファイルに無い (.rs + テキスト全般。binary と >1MiB と gitignore 済みは対象外)");
+    }
+}
+
+/// `text` の一致判定。語の OR (大小無視の部分一致) か、`-e` の正規表現 (各語を `(?i)` で compile、OR)。
+enum TextMatcher {
+    Terms(Vec<String>),
+    Regex(Vec<regex::Regex>),
+}
+
+impl TextMatcher {
+    fn new(terms: &[String], regex: bool) -> Option<TextMatcher> {
+        if !regex {
+            return Some(TextMatcher::Terms(terms.iter().map(|t| t.to_lowercase()).collect()));
+        }
+        let mut res = Vec::new();
+        for t in terms {
+            match regex::RegexBuilder::new(t).case_insensitive(true).build() {
+                Ok(re) => res.push(re),
+                Err(e) => {
+                    println!("# 正規表現が不正: {t}: {e}");
+                    return None;
+                }
+            }
+        }
+        Some(TextMatcher::Regex(res))
+    }
+    /// 文字列 (行でもファイル全体でも) に 1 語でも当たるか。
+    fn hit(&self, s: &str) -> bool {
+        match self {
+            TextMatcher::Terms(ts) => {
+                let l = s.to_lowercase();
+                ts.iter().any(|t| l.contains(t))
+            }
+            TextMatcher::Regex(rs) => rs.iter().any(|re| re.is_match(s)),
+        }
     }
 }
 
@@ -3821,16 +4057,29 @@ pub fn cmd_outline(args: &[String]) {
     let sym_t = db.get_table("sym").unwrap();
     let paths = file_paths(&file_t);
 
-    let fe = match file_t.where_eq("path", path_arg.as_str()).find_one().unwrap() {
-        Some(e) => Some(e),
-        None => paths.iter().find(|(_, p)| p.ends_with(path_arg.as_str())).map(|(e, _)| *e),
-    };
-    let Some(fe) = fe else {
+    let Some(fe) = find_file(&file_t, &paths, path_arg) else {
         eprintln!("# file not found: {path_arg}");
         return;
     };
+    let path = paths.get(&fe).map(String::as_str).unwrap_or("?");
+    // 非 Rust は見出し構造 (md の # 階層 / toml の [table] / yaml のキーパス) を出す。`read <file>#<見出し>` の目次。
+    if num(file_t.entity(fe).get("lang")) != LANG_RUST {
+        let Ok(src) = std::fs::read_to_string(path) else {
+            eprintln!("# source を読めない: {path}");
+            return;
+        };
+        let containers = text_containers(num(file_t.entity(fe).get("lang")), &src);
+        println!("# {path} : {} sections", containers.len());
+        for (l, c) in containers.iter().take(o.limit) {
+            println!("{path}:{l}\t{c}");
+        }
+        if containers.len() > o.limit {
+            println!("… (+{} 件省略、--limit で全部)", containers.len() - o.limit);
+        }
+        return;
+    }
     let syms = sym_t.all().where_ref("file", fe).find().unwrap();
-    println!("# {} : {} symbols", paths.get(&fe).map(String::as_str).unwrap_or("?"), syms.len());
+    println!("# {path} : {} symbols", syms.len());
     print_syms(&sym_t, &paths, &syms, o.limit, true);
 }
 

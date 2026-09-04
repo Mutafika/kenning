@@ -8,7 +8,8 @@ grep+Read の代わりに、精密な少数行 (`path:line<TAB>詳細` = その�
 **Rust repo 内の検索は kenning。** シンボル軸の問い (定義 / 呼び元 / 呼び先 / 実装 / 影響範囲 /
 faceted) は `kenning <cmd>`、全文検索は `kenning text` — **`.rs` も `.md`/`.toml`/`.yml` も同じ 1 本**で、
 文脈注釈が付く分 grep の上位互換。db 管理は考えなくていい (自動)。
-grep に落ちるのは対象外だけ: binary / 1MiB 超 / gitignore 済み / 生成 lock ファイル、あとは正規表現。
+grep に落ちるのは対象外だけ: binary / 1MiB 超 / gitignore 済み / 生成 lock ファイル。正規表現は `text -e`、
+同名 symbol は `read` の `crate:` / `path:` / `--all`、行の周辺は `read <path>:<line>`、md の見出し配下は `read <file>#<見出し>`。
 
 ## 使い方 (儀式ゼロ: cd して聞くだけ)
 
@@ -19,9 +20,11 @@ kenning callers <name>          # 変更があれば自動増分 update (進捗�
 
 ```bash
 kenning def     <name>              # 定義位置 + シグネチャ + doc 1 行目 (hover 相当)
-kenning read    <name> [container]  # 定義本体をそのまま出す (def + Read の 1 手化。まずこれ)
+kenning read    <name> [container] [crate:X] [path:S] [--all]  # 定義本体 (def + Read の 1 手化。まずこれ)。同名は絞るか --all
+kenning read    <path>:<line>       # その行を囲む item の本体 (grep -n → sed の代わり)。非 Rust は見出し配下
+kenning read    <file>#<見出し>      # md の見出し / toml の [table] / yaml のキー配下 (CHANGELOG を awk で切る代わり)
 kenning find    <substr>            # 名前の部分一致 (発見用)
-kenning text    <term>              # 全文検索 + 文脈注釈 (.rs=関数 / .md=見出し階層 / .toml=[table])
+kenning text    <term>... [-e]      # 全文検索 + 文脈注釈 (.rs=関数 / .md=見出し階層 / .toml=[table])。複数語は OR、-e で正規表現
 kenning callers <name> [container]  # who-calls: 確実 ∪ 未確定候補を位置付き
 kenning callees <name> [container]  # X が呼ぶ先 (outgoing)
 kenning edges                       # 全 cross-file call edge の集計 TSV (from TAB to TAB count)。依存グラフの素材
@@ -32,7 +35,7 @@ kenning impact  <name> [container]  # 変えると壊れる推移的 callers
 kenning tests   <name> [container]  # これに届くテスト = impact ∩ is_test (変更後に何を回すか)
 kenning path    <from> <to>         # from→to の呼び出し経路
 kenning search  kind:method vis:pub container:Engine calls:unwrap  # faceted AND
-kenning outline <path>              # ファイル構造 (Read せず)
+kenning outline <path>              # ファイル構造 (Read せず)。.md/.toml/.yml は見出し構造 = read <file>#… の目次
 kenning stats                       # 規模と名前解決率
 kenning cache [ls|prune] [--older-than D] [--dry-run]  # 自動 db の棚卸し / 掃除 (repo 消失・旧版を回収)
 ```

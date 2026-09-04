@@ -388,3 +388,76 @@ fn across_lists_every_repo_in_deterministic_order() {
     assert_eq!(out, run(&["across", "target"], &home), "出力が非決定的");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// 同名 symbol (free fn `dup` / `C::dup`) の絞り込み: container / `path:` / `crate:` / `--all`。
+/// これが無いと Claude は同名に当たるたび grep + sed に戻っていた。
+#[test]
+fn read_disambiguates_same_named_symbols() {
+    let dir = tmp();
+    write_fixture(&dir, OTHER_RS);
+    let db = dir.join("k.db");
+    index(&dir, &db);
+    let out = query(&["read", "dup"], &db);
+    assert!(out.contains("2 定義") && out.contains("--all"), "曖昧時の案内:\n{out}");
+    let out = query(&["read", "dup", "C"], &db);
+    assert!(out.contains("pub fn dup(&self) {}") && !out.contains("pub fn dup() {}"), "container 絞り:\n{out}");
+    let out = query(&["read", "dup", "--all"], &db);
+    assert!(out.contains("pub fn dup(&self) {}") && out.contains("pub fn dup() {}"), "--all で両方:\n{out}");
+    let out = query(&["read", "dup", "crate:fix"], &db);
+    assert!(out.contains("2 定義"), "crate は両方に当たるので曖昧のまま:\n{out}");
+    let out = query(&["read", "dup", "crate:nope"], &db);
+    assert!(out.contains("定義が index に無い"), "crate 不一致:\n{out}");
+    let out = query(&["read", "dup", "path:lib.rs", "--all"], &db);
+    assert!(out.contains("pub fn dup() {}"), "path 絞り:\n{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `read <path>:<line>` はその行を囲む item の本体 (`grep -n "fn X"` → `sed -n` の代わり)。非 Rust は見出し配下。
+#[test]
+fn read_at_path_line_prints_enclosing_item_or_section() {
+    let dir = tmp();
+    write_fixture(&dir, OTHER_RS);
+    std::fs::write(dir.join("DESIGN.md"), "# Design\nintro\n## Storage\nuses zzmarker here\nmore\n## Next\nother section\n").unwrap();
+    let db = dir.join("k.db");
+    index(&dir, &db);
+    let out = query(&["read", "src/lib.rs:6"], &db); // 6 行目は mid の本体 (fixture は item 間に空行あり)
+    assert!(out.contains("fn mid") && out.contains("target();") && !out.contains("fn top"), "囲む item:\n{out}");
+    let out = query(&["read", "DESIGN.md:5"], &db);
+    assert!(out.contains("uses zzmarker here") && out.contains("more") && !out.contains("## Next") && !out.contains("intro"), "見出し配下:\n{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `read <file>#<見出し>` と `outline <file.md>` (CHANGELOG を awk で切る代わり)。
+#[test]
+fn read_markdown_section_by_heading_and_outline_lists_headings() {
+    let dir = tmp();
+    write_fixture(&dir, OTHER_RS);
+    std::fs::write(dir.join("DESIGN.md"), "# Design\nintro\n## Storage\nuses zzmarker here\nmore\n## Next\nother section\n").unwrap();
+    let db = dir.join("k.db");
+    index(&dir, &db);
+    let out = query(&["read", "DESIGN.md#storage"], &db);
+    assert!(out.contains("Design > Storage") && out.contains("uses zzmarker here") && !out.contains("## Next"), "見出し配下:\n{out}");
+    let out = query(&["read", "DESIGN.md#nope"], &db);
+    assert!(out.contains("一致する見出しが") && out.contains("Design > Storage"), "無い時は目次:\n{out}");
+    let out = query(&["outline", "DESIGN.md"], &db);
+    assert!(out.contains("3 sections") && out.contains("DESIGN.md:3\tDesign > Storage"), "outline md:\n{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `text` の複数語 OR と `-e` 正規表現 (`grep -E "a|b"` の代わり)。
+#[test]
+fn text_supports_or_terms_and_regex() {
+    let dir = tmp();
+    write_fixture(&dir, OTHER_RS);
+    std::fs::write(dir.join("DESIGN.md"), "# Design\nuses zzmarker here\n").unwrap();
+    std::fs::write(dir.join("conf.toml"), "[server]\nendpoint = \"qqother\"\n").unwrap();
+    let db = dir.join("k.db");
+    index(&dir, &db);
+    let out = query(&["text", "zzmarker", "qqother"], &db);
+    assert!(out.contains("DESIGN.md:2") && out.contains("conf.toml:2"), "OR:\n{out}");
+    let out = query(&["text", "-e", "zz(marker|nothing)", "qq[a-z]+er"], &db);
+    assert!(out.contains("DESIGN.md:2") && out.contains("conf.toml:2"), "regex:\n{out}");
+    let out = query(&["text", "-e", "zz("], &db);
+    assert!(out.contains("正規表現が不正"), "不正 regex の案内:\n{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
