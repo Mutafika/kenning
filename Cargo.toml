@@ -23,17 +23,18 @@ repository = "https://github.com/Mutafika/kenning"
 # .crc 封緘 / sync 有効だと遅延が効かないが kenning はどちらも未使用)。across 20db 並列 21.8→27.9ms。
 # 旧 v9 の db は open で弾かれる (src は 1 byte も触られない) → maybe_auto_update が full 再 index で自己修復。
 # ⚠ v10 の db は directory なので「is_dir なら repo」判別が壊れる。振り分けは is_db_path を使うこと。
-# 0.26.1 → 0.26.6 (2026-09-04): format 不変・breaking なし、追従のみ。0.26.5 (#255, writer open の eager
-# cylinder build 撤去) は kenning の db 形状には効かなかった — tokio 725 files で update 無変更 100→91ms
-# (誤差内)。実測の内訳 (`kenning update` が stderr に出す): rw open 42〜69ms は enchudb-schema の
-# load_schema が ref relation (kenning は 8 本) ごとに define_ref_in → 無条件 try_persist_tables で
-# `tables` sidecar を fsync していたもの (enchudb 側で「新規 entry の時だけ persist」に修正、0.26.6 には
-# 未収録 → 取り込むと 1ms、tokio の update 91→53ms / 編集直後の query 123→80ms)。残りは drop の
-# persist_schema ~18ms (無変更でも sidecar を fsync)。update_inner の全ファイル hash 照合 25〜30ms は
-# kenning 側で mtime 絞り込みに変えて walk + stat の 9ms に (読むのは mtime が新しい既知 file と新規 file だけ)。
-# 0.26.2〜0.26.4 / 0.26.6 は docs・migrate・Windows・sync transport の修正で kenning の経路には無関係。
-enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.6" }
-enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.6" }
+# 0.26.1 → 0.26.7 (2026-09-04): format 不変・breaking なし。効くのは 0.26.7 (#259) だけ — enchudb-schema の
+# load_schema が ref relation (kenning は 8 本) ごとに define_ref_in → 無条件 try_persist_tables で `tables`
+# sidecar を fsync していて、rw open (増分 update の入口) が 42〜69ms の定数コストだった。kenning 側から
+# issue #259 / PR #260 で修正、rw open は ~1ms に (`kenning update` が内訳を stderr に出す)。
+# 0.26.5 (#255, writer open の eager cylinder build 撤去) は kenning の db 形状には効かず (update 無変更
+# 100→91ms、誤差内)、0.26.2〜0.26.4 / 0.26.6 は docs・migrate・Windows・sync transport で無関係。
+# 残る固定費は drop の persist_schema ~18ms (無変更でも sidecar を fsync、enchudb 側の別件) と
+# 鮮度判定 + 増分 update の walk × 2 (~9ms ずつ)。update_inner の全ファイル hash 照合 25〜30ms は kenning 側で
+# mtime 絞り込みに変えて walk + stat の 9ms に (読むのは mtime が新しい既知 file と新規 file だけ)。
+# 実測 (tokio 725 files, med): 編集直後の query 123ms (0.26.6 + 全件 hash) → 48ms、update 無変更 91 → 55ms。
+enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.7" }
+enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.7" }
 # indexer = syn で Rust ソースをパースして symbol/call fact を抽出。
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
