@@ -39,14 +39,14 @@ for repo in ../enchudb "$D/tokio"; do
     ra_wall=$1; ra_peak=$2
     echo "== $name: kenning index (syn) ==" >&2
     tmpdb="$D/vsra-$name.db"
-    rm -f "$tmpdb"*
+    rm -rf "$tmpdb"*  # db は v10 以降 directory
     set -- $(measure kenning index "$repo" "$tmpdb")
     cs_wall=$1; cs_peak=$2
     # 構築後の 1 クエリ (warm CLI)
     t0=$(python3 -c 'import time; print(time.time())')
     KENNING_NO_STALE=1 kenning callers new --db "$tmpdb" >/dev/null 2>&1 || true
     q_ms=$(python3 -c "import time; print(f'{(time.time()-$t0)*1000:.0f}')")
-    rm -f "$tmpdb"*
+    rm -rf "$tmpdb"*  # db は v10 以降 directory
     {
         echo "| $name | rust-analyzer (resident 相当) | ${ra_wall}s | ${ra_peak} MB | LSP 常駐が続く限り ms |"
         echo "| $name | kenning (syn 層) | ${cs_wall}s | ${cs_peak} MB | ${q_ms} ms (CLI 起動込み)、常駐 0 |"

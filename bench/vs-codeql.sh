@@ -41,14 +41,14 @@ n_rows=$(grep -c '^|' /tmp/vsql-q2.txt 2>/dev/null || echo "?")
 
 echo "== kenning 側 (同条件) ==" >&2
 tmpdb="$D/vsql-cs.db"
-rm -f "$tmpdb"*
+rm -rf "$tmpdb"*  # db は v10 以降 directory
 set -- $(measure /tmp/vsql-cs.txt kenning index "$REPO" "$tmpdb")
 cs_wall=$1; cs_peak=$2
 cs_disk=$(du -sh "$tmpdb" 2>/dev/null | awk '{print $1}')
 t0=$(python3 -c 'import time; print(time.time())')
 KENNING_NO_STALE=1 kenning callers flush_writes --db "$tmpdb" >/dev/null 2>&1 || true
 cs_q_ms=$(python3 -c "import time; print(f'{(time.time()-$t0)*1000:.0f}')")
-rm -f "$tmpdb"*
+rm -rf "$tmpdb"*  # db は v10 以降 directory
 
 {
     echo "# vs CodeQL — 「code as data」本家との頭対頭 (corpus: enchudb)"
