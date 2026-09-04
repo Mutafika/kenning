@@ -97,12 +97,17 @@ fn index(dir: &Path, db: &Path) {
 }
 
 fn query(cmd: &[&str], db: &Path) -> String {
-    let out = kenning()
-        .args(cmd)
-        .args(["--db", db.to_str().unwrap()])
-        .env("KENNING_NO_STALE", "1")
-        .output()
-        .expect("spawn kenning query");
+    query_in(cmd, db, None)
+}
+
+/// `query` の cwd 指定版 — `outline .` のように cwd 基準で解決する引数を試すため。
+fn query_in(cmd: &[&str], db: &Path, cwd: Option<&Path>) -> String {
+    let mut c = kenning();
+    c.args(cmd).args(["--db", db.to_str().unwrap()]).env("KENNING_NO_STALE", "1");
+    if let Some(d) = cwd {
+        c.current_dir(d);
+    }
+    let out = c.output().expect("spawn kenning query");
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -529,4 +534,39 @@ fn auto_paths_keep_stderr_terse_and_version_prints() {
     assert!(e.contains("→ 自動 update: 1 再 index"), "{e}");
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// ls / find に落ちていた 3 場面と、command ごとにバラついていた typo 救済。
+/// (`outline .` は "file not found: ." だった / `find` は symbol 名しか見なかった /
+///  近い名前の提案は `callers` にしか無かった)
+#[test]
+fn outline_dot_finds_by_file_name_and_typo_rescue_is_uniform() {
+    let dir = tmp();
+    write_fixture(&dir, OTHER_RS);
+    let db = dir.join("k.db");
+    index(&dir, &db);
+
+    // `outline .` = cwd の地図。表示名は解決後の絶対 dir (どこを数えたか曖昧にしない)
+    let out = query_in(&["outline", "."], &db, Some(&dir));
+    assert!(out.contains(" files (詳細は outline <path>)"), "outline .:\n{out}");
+    assert!(out.contains("src/lib.rs\t") && out.contains("src/other.rs\t"), "outline . の中身:\n{out}");
+    assert!(!out.contains("# . :"), "表示名は解決後の絶対 dir:\n{out}");
+
+    // find はファイル名 (basename) でも引ける = `find . -name '*other*'` 相当
+    let out = query(&["find", "other"], &db);
+    assert!(out.contains("# 1 files  [file name ~ \"other\"]"), "find のファイル名一致:\n{out}");
+    assert!(out.contains("src/other.rs\t") && out.contains(" loc"), "file 行:\n{out}");
+    // symbol 側の結果は消えていない (両方出す)
+    assert!(query(&["find", "targ"], &db).contains("pub fn target"), "symbol 一致は従来通り");
+
+    // def / path も callers と同じ近い名前を出す
+    let out = query(&["def", "targe"], &db);
+    assert!(out.contains("# 0 symbols") && out.contains("\"targe\" は無い。近い名前:") && out.contains("target"), "def の救済:\n{out}");
+    let out = query(&["path", "top", "targe"], &db);
+    assert!(out.contains("# 定義が index に無い: targe"), "path は欠けた名前を名指し:\n{out}");
+    assert!(out.contains("近い名前:") && out.contains("target"), "path の救済:\n{out}");
+    // 在る名前が他 facet で 0 件になった時は「無い」と言わない
+    let out = query(&["search", "name:target", "kind:struct"], &db);
+    assert!(out.contains("# 0 symbols") && !out.contains("は無い。近い名前"), "facet 0 件で嘘を言わない:\n{out}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

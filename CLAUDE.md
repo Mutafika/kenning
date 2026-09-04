@@ -24,7 +24,7 @@ kenning def     <name>              # 定義位置 + シグネチャ + doc 1 行
 kenning read    <name> [container] [crate:X] [path:S] [--all]  # 定義本体 (def + Read の 1 手化。まずこれ)。同名は絞るか --all
 kenning read    <path>:<line>       # その行を囲む item の本体 (grep -n → sed の代わり)。非 Rust は見出し配下
 kenning read    <file>#<見出し>      # md の見出し / toml の [table] / yaml のキー配下 (CHANGELOG を awk で切る代わり)
-kenning find    <substr>            # 名前の部分一致 (発見用)
+kenning find    <substr>            # symbol 名 + ファイル名 (basename) の部分一致 (発見用。`find -name` 相当も兼ねる)
 kenning text    <term>... [-e] [path:S]  # 全文検索 + 文脈注釈 (.rs=関数 / .md=見出し階層 / .toml=[table])。複数語は OR、
                                     #   -e で正規表現 ((?-i) で大小区別)、path: で dir 絞り。末尾に `# N 件 / M files`
 kenning callers <name> [container]  # who-calls: 確実 ∪ 未確定候補を位置付き
@@ -37,7 +37,7 @@ kenning impact  <name> [container]  # 変えると壊れる推移的 callers
 kenning tests   <name> [container]  # これに届くテスト = impact ∩ is_test (変更後に何を回すか)
 kenning path    <from> <to>         # from→to の呼び出し経路
 kenning search  kind:method vis:pub container:Engine calls:unwrap  # faceted AND
-kenning outline <path|dir>          # ファイル構造 (Read せず)。.md/.toml/.yml は見出し構造 = read <file>#… の目次。
+kenning outline <path|dir>          # ファイル構造 (Read せず)。`.` で repo の地図。.md/.toml/.yml は見出し構造 = read <file>#… の目次。
                                     #   dir なら配下 file の地図 (symbol 数 / loc)。`read <path>` も同じ (file 全体は Read)
 kenning stats                       # 規模と名前解決率
 kenning cache [ls|prune] [--older-than D] [--dry-run]  # 自動 db の棚卸し / 掃除 (repo 消失・旧版を回収)

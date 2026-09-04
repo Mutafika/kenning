@@ -3128,7 +3128,9 @@ fn run_read(db_path: &str, name: &str, container: Option<&str>, crate_f: Option<
     }
 }
 
-/// `find <substr>` — 名前の部分一致 (大文字小文字無視)。exact な `def` の補完 = 名前の発見用。
+/// `find <substr>` — symbol 名の部分一致 (大文字小文字無視)。exact な `def` の補完 = 名前の発見用。
+/// ファイル名 (basename) の部分一致も併せて返す (`find . -name '*X*'` 相当。symbol 軸だけだと
+/// 「あのファイルどこ」に答えられず ls/find に落ちていた)。
 /// tag 等値では引けないので sym 全走査 (数千件なので µs–ms)。
 pub fn cmd_find(args: &[String]) {
     let o = parse_opts(args);
@@ -3150,6 +3152,27 @@ pub fn cmd_find(args: &[String]) {
         .collect();
     println!("# {} symbols  [name ~ \"{needle}\"]", hits.len());
     print_syms(&sym_t, &paths, &hits, o.limit, false);
+    print_file_hits(&file_t, &paths, &needle, o.limit);
+}
+
+/// `find` のファイル名一致部分 — basename 一致を `path<TAB>L loc` で (outline <dir> と同じ形)。
+fn print_file_hits(file_t: &Table, paths: &HashMap<EntityId, String>, needle: &str, limit: usize) {
+    let mut fhits: Vec<(&String, EntityId)> = paths
+        .iter()
+        .filter(|(_, p)| p.rsplit('/').next().unwrap_or(p).to_lowercase().contains(needle))
+        .map(|(e, p)| (p, *e))
+        .collect();
+    if fhits.is_empty() {
+        return;
+    }
+    fhits.sort();
+    println!("# {} files  [file name ~ \"{needle}\"]", fhits.len());
+    for (p, e) in fhits.iter().take(limit) {
+        println!("{p}\t{} loc", num(file_t.entity(*e).get("loc")));
+    }
+    if fhits.len() > limit {
+        println!("… (+{} 件省略、--limit で全部)", fhits.len() - limit);
+    }
 }
 
 /// `search kind:fn vis:pub crate:… container:… async:1 …` — faceted 等値 AND。
@@ -3212,6 +3235,14 @@ fn run_search(db_path: &str, facets: &[String], limit: usize, with_sig: bool) {
         hits.retain(|e| callers.contains(e));
     }
     println!("# {} symbols  [{}]", hits.len(), applied.join(" "));
+    // name 等値で 0 件 = typo の可能性 → callers と同じ救済 (`def` の主な失敗はこれ)。
+    // 他 facet で 0 になった場合は名前自体は在るので黙る (嘘の「無い」を出さない)。
+    if hits.is_empty()
+        && let Some(n) = facets.iter().find_map(|f| f.strip_prefix("name:"))
+        && sym_t.where_eq("name", n).count().unwrap() == 0
+    {
+        suggest_similar(&sym_t, &paths, n);
+    }
     print_syms(&sym_t, &paths, &hits, limit, with_sig);
 }
 
@@ -4101,7 +4132,12 @@ fn run_path(db_path: &str, from: &str, to: &str) {
     let srcs = defs_of(&sym_t, from, None);
     let tgts: HashSet<EntityId> = defs_of(&sym_t, to, None).into_iter().collect();
     if srcs.is_empty() || tgts.is_empty() {
-        println!("# 定義が index に無い ({} / {})", if srcs.is_empty() { from } else { "ok" }, if tgts.is_empty() { to } else { "ok" });
+        // どちらが無いのかを名指しし、callers と同じ typo 救済を出す (`(ok / X)` は読めなかった)。
+        let missing: Vec<&str> = [(srcs.is_empty(), from), (tgts.is_empty(), to)].iter().filter(|(e, _)| *e).map(|(_, n)| *n).collect();
+        println!("# 定義が index に無い: {}", missing.join(", "));
+        for m in &missing {
+            suggest_similar(&sym_t, &paths, m);
+        }
         return;
     }
     // 多始点前方 BFS。parent で経路復元。始点が既に target ならそれ自身が経路。
@@ -4196,16 +4232,33 @@ fn run_outline(db_path: &str, path_arg: &str, limit: usize) {
 }
 
 /// `outline <dir>` — 配下の index 済み file を `path<TAB>N symbols / L loc` で列挙。相対 (`src`、
-/// `crates/foo`) は path 中の `/<dir>/` 一致、絶対は前方一致。無ければ file not found。
+/// `crates/foo`) は path 中の `/<dir>/` 一致、絶対は前方一致。`.` / `..` / `./x` は cwd 基準で
+/// 解決してから絶対前方一致 (`outline .` = repo の地図)。無ければ file not found。
 fn outline_dir(file_t: &Table, sym_t: &Table, paths: &HashMap<EntityId, String>, dir_arg: &str, limit: usize) {
     let pref = dir_arg.trim_end_matches('/');
     let (abs, inner) = (format!("{pref}/"), format!("/{pref}/"));
-    let mut files: Vec<(&String, EntityId)> =
-        paths.iter().filter(|(_, p)| p.starts_with(&abs) || p.contains(&inner)).map(|(e, p)| (p, *e)).collect();
-    if pref.is_empty() || files.is_empty() {
+    // cwd 基準の実 dir (`.` を含む) は canonicalize して絶対 prefix にする。index の path は絶対なので
+    // これが無いと `.` は永久に当たらない。
+    let canon = std::fs::canonicalize(if pref.is_empty() { "." } else { pref })
+        .ok()
+        .filter(|c| c.is_dir())
+        .map(|c| format!("{}/", c.to_string_lossy()));
+    let mut files: Vec<(&String, EntityId)> = paths
+        .iter()
+        .filter(|(_, p)| {
+            canon.as_deref().is_some_and(|c| p.starts_with(c)) || (!pref.is_empty() && (p.starts_with(&abs) || p.contains(&inner)))
+        })
+        .map(|(e, p)| (p, *e))
+        .collect();
+    if files.is_empty() {
         eprintln!("# file not found: {dir_arg}");
         return;
     }
+    // 表示名: `.` のような cwd 相対は解決後の絶対 dir を出す (どこを数えたか曖昧にしない)。
+    let pref = match canon.as_deref() {
+        Some(c) if pref.is_empty() || pref.starts_with('.') => c.trim_end_matches('/').to_string(),
+        _ => pref.to_string(),
+    };
     files.sort();
     let mut n_syms: HashMap<EntityId, usize> = HashMap::new();
     for s in sym_t.all().find().unwrap() {
@@ -4838,6 +4891,96 @@ fn bench_agent(db_path: &str, root: &str, sym_t: &Table, call_t: &Table, files: 
 }
 
 /// ①マイクロ: コマンドの warm latency (generic — どの repo の db でも動く)。
+/// `text` の件数行 `# N 件 / M files …` から N を読む (bench 用)。
+/// 0 件の時の出力は「index 済みファイルに無い」行なので数字は取れず 0 になる。
+fn text_hit_count(stdout: &str) -> usize {
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("# ").and_then(|r| r.split(' ').next()).and_then(|n| n.parse::<usize>().ok()))
+        .unwrap_or(0)
+}
+
+/// ⑤全文検索: 同じ語を `rg -i -n` と `kenning text` に投げ、ヒット数の一致・wall・出力バイトを比較。
+/// 他スイートと違い「grep の置き換えになるか」だけを測る — 圧縮比ではなく **同じ答えを同じ速さで
+/// 返すか** が問い (kenning 側は文脈注釈の分バイトは増える。減らすのが目的ではない)。
+/// 質問 = corpus 内の高頻度 token (長さ 6 以上、決定的順序)。
+fn bench_text(db_path: &str, root: &str, files: &[(String, String)], nq: usize) {
+    let mut freq: HashMap<&str, usize> = HashMap::new();
+    for (_, src) in files {
+        for tok in src.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+            if tok.len() >= 6 && !tok.chars().all(|c| c.is_ascii_digit()) {
+                *freq.entry(tok).or_default() += 1;
+            }
+        }
+    }
+    let mut ranked: Vec<(usize, &str)> = freq.into_iter().map(|(t, c)| (c, t)).collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1))); // 頻度降順 → 語昇順 (決定的)
+    let terms: Vec<&str> = ranked.into_iter().take(nq).map(|(_, t)| t).collect();
+
+    println!("### text — 全文検索 vs rg (同じ語、同じ repo)\n");
+    println!("問い = 「この語はどこ?」。rg 経路 = `rg -i -n <term>` (kenning text は大小無視なので -i)。");
+    println!("kenning 経路 = `text <term> --limit 100000` の実出力。**ヒット数の一致**が主指標 —");
+    println!("バイトは kenning が増える (行ごとに関数名 / 見出し階層を付けるため)。それが payload。\n");
+    println!("| term | rg hits | rg ms | rg bytes | text hits | text ms | text bytes | 一致 |");
+    println!("|---|---|---|---|---|---|---|---|");
+
+    let exe = std::env::current_exe().unwrap();
+    let has_rg = std::process::Command::new("rg").arg("--version").output().is_ok();
+    // 差は 2 方向あり、原因が違う (実測: ripgrep corpus で両方出た)。
+    //   少ない = 生成 lock (`Cargo.lock`) / >1MiB / binary — kenning が索引しないと決めた分
+    //   多い   = NUL を含む file。rg は binary 判定で途中で打ち切るが kenning は最後まで読む
+    let (mut rg_ms, mut cs_ms, mut agree, mut fewer, mut more) = (Vec::new(), Vec::new(), 0usize, 0usize, 0usize);
+    for term in &terms {
+        let (mut rg_hits, mut rg_bytes, mut rgms) = (0usize, 0usize, 0.0);
+        if has_rg {
+            let t0 = Instant::now();
+            let out = std::process::Command::new("rg").args(["-i", "-n", term, root]).output();
+            rgms = t0.elapsed().as_secs_f64() * 1000.0;
+            if let Ok(o) = out {
+                rg_bytes = o.stdout.len();
+                rg_hits = o.stdout.split(|&b| b == b'\n').filter(|l| !l.is_empty()).count();
+            }
+            rg_ms.push(rgms);
+        }
+        let t0 = Instant::now();
+        let out = std::process::Command::new(&exe)
+            .args(["text", term, "--limit", "100000", "--db", db_path])
+            .env("KENNING_NO_STALE", "1")
+            .output();
+        let csms = t0.elapsed().as_secs_f64() * 1000.0;
+        cs_ms.push(csms);
+        let stdout = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        let cs_bytes = stdout.len();
+        let cs_hits = text_hit_count(&stdout);
+        let same = cs_hits == rg_hits;
+        match cs_hits.cmp(&rg_hits) {
+            std::cmp::Ordering::Equal => agree += 1,
+            std::cmp::Ordering::Less => fewer += 1,
+            std::cmp::Ordering::Greater => more += 1,
+        }
+        println!(
+            "| {term} | {rg_hits} | {rgms:.0} | {rg_bytes} | {cs_hits} | {csms:.0} | {cs_bytes} | {} |",
+            if same { "=" } else { "≠" }
+        );
+    }
+    let mut diff = String::new();
+    if fewer > 0 {
+        diff.push_str(&format!(" 少ない {fewer} 問 = 生成 lock (`Cargo.lock`) / >1MiB / binary の非索引分。"));
+    }
+    if more > 0 {
+        diff.push_str(&format!(" 多い {more} 問 = NUL を含む file (rg は binary 判定で打ち切り、kenning は最後まで読む)。"));
+    }
+    println!(
+        "\n**一致**: {}/{} 問でヒット数が同一。{}**wall 中央値**: rg {:.1}ms vs text {:.1}ms",
+        agree,
+        terms.len(),
+        if diff.is_empty() { String::new() } else { format!("差の内訳:{diff}") },
+        median_f(rg_ms),
+        median_f(cs_ms)
+    );
+    println!("(両者プロセス起動込み。text は `#` の件数行と文脈注釈を含んだ上でこの wall)\n");
+}
+
 fn bench_micro(db_path: &str, sym_t: &Table, call_t: &Table, files: &[(String, String)]) {
     println!("### micro — warm latency\n```");
     let t = Instant::now();
@@ -4875,7 +5018,7 @@ fn bench_micro(db_path: &str, sym_t: &Table, call_t: &Table, files: &[(String, S
     println!("```\n");
 }
 
-/// `bench [quality|agent|micro|all] [--db P] [--n N] [--seed S]` — markdown を stdout へ。
+/// `bench [quality|agent|beyond|text|micro|all] [--db P] [--n N] [--seed S]` — markdown を stdout へ。
 pub fn cmd_bench(args: &[String]) {
     let mut sub = "all".to_string();
     let mut n = 100usize;
@@ -4885,7 +5028,7 @@ pub fn cmd_bench(args: &[String]) {
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "quality" | "agent" | "beyond" | "micro" | "all" => sub = a.clone(),
+            "quality" | "agent" | "beyond" | "text" | "micro" | "all" => sub = a.clone(),
             "--n" => n = it.next().and_then(|v| v.parse().ok()).unwrap_or(n),
             "--nq" => nq = it.next().and_then(|v| v.parse().ok()).unwrap_or(nq),
             "--seed" => seed = it.next().and_then(|v| v.parse().ok()).unwrap_or(seed),
@@ -4927,6 +5070,9 @@ pub fn cmd_bench(args: &[String]) {
     }
     if sub == "beyond" || sub == "all" {
         bench_beyond(&o.db, &db, &sym_t, &call_t, &files);
+    }
+    if sub == "text" || sub == "all" {
+        bench_text(&o.db, &root, &files, nq);
     }
     if sub == "micro" || sub == "all" {
         bench_micro(&o.db, &sym_t, &call_t, &files);
@@ -5803,6 +5949,16 @@ note: run with `RUST_BACKTRACE=1` to display a backtrace
         assert_eq!(grep_call_hit_lines(src, "foo"), vec![1, 2, 5, 6]);
         // 前方が識別子文字なら不一致 (xfoo)、後続が '(' でなければ不一致 (foo_bar は別 ident、素の foo)
         assert_eq!(grep_call_hit_lines("foo", "foo"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn text_hit_count_reads_the_count_line_in_every_shape() {
+        // 通常 / path: 絞り / limit 省略あり / 0 件 — bench の一致判定はこの数字に乗る
+        assert_eq!(super::text_hit_count("a:1\tx\n# 4 件 / 3 files\n"), 4);
+        assert_eq!(super::text_hit_count("# 3 件 / 2 files (path: docs/ の 2 files)\n"), 3);
+        assert_eq!(super::text_hit_count("# 68 件 / 12 files — 表示 50、`--limit 68` で全部\n"), 68);
+        assert_eq!(super::text_hit_count("# \"zz\" は index 済みファイルに無い (.rs + テキスト全般)\n"), 0);
+        assert_eq!(super::text_hit_count(""), 0);
     }
 
     #[test]
