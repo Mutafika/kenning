@@ -57,7 +57,11 @@ kenning bake        # repo 内で。RA scip (features=all 注入) → 精密 ind
 ```
 who-calls/refs が **rust-analyzer と同じ正確さ**になる。焼くのは **cwd を含む cargo workspace**
 (repo root 全体ではない。RA は 1 project しか読めないため。曖昧なら焼かずに選択を促す)。
-syn 層の索引は repo 全体のままなので、workspace 外は精度控えめで動き続ける。peak ~5GB × 数十秒のバッチ (常駐なし)。
+syn 層の索引は repo 全体のままなので、workspace 外は精度控えめで動き続ける。常駐なしのバッチで、実測は
+kenning (3 rs) 10s / 1.0GB、enchudb (256 rs、12 crate) 初回 3 分 (依存の build script 込み) → 2 回目 26s / 2.3GB。
+features=all → default の順に試す。all は optional dep の build script (bundled C++ / binary DL) で数分かかり、
+RA が固まる事故もあるので上限 15 分 (`KENNING_BAKE_TIMEOUT=<秒>`) で group ごと止めて default に退避、
+以後その repo は marker (`<db>.bake-default`) で default から焼く。最初から default なら `KENNING_BAKE_DEFAULT_FEATURES=1`。
 空きメモリゲート + 直列 lock 付き — 刺さる状況では焚かない。bake しなくても syn 層で全 navigation は
 動く (精度控えめ・嘘なし)。bake 後 20 ファイル変更で stderr に再 bake 推奨が出る。
 

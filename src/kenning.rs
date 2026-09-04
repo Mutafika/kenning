@@ -2207,6 +2207,40 @@ fn ra_error_lines(errs: &str) -> String {
     }
 }
 
+/// rust-analyzer scip の上限秒。features=all は optional dep の build script (bundled C++ / binary DL)
+/// で数分かかることがある一方、RA が proc-macro server の応答待ちで永久に固まる事故もある
+/// (enchudb で実測: 6 分の build script の後 `load_dylib` の read で停止)。上限で group ごと落として
+/// default features に退避し、以後は marker で all を試さない。env KENNING_BAKE_TIMEOUT (秒) で変更可。
+const BAKE_TIMEOUT_SECS: u64 = 900;
+
+/// 子を新 process group で起動し、`timeout` で group ごと SIGKILL する (RA が起こした proc-macro
+/// server / cargo も道連れ)。stderr は file へ (pipe だと読まない間に詰まって、それ自体が hang になる)。
+/// Ok(Some(status)) = 完了、Ok(None) = timeout で kill 済み。
+fn run_with_timeout(mut cmd: std::process::Command, err_path: &str, timeout: Duration) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let err = std::fs::File::create(err_path)?;
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(err);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn()?;
+    let t = Instant::now();
+    loop {
+        if let Some(st) = child.try_wait()? {
+            return Ok(Some(st));
+        }
+        if t.elapsed() >= timeout {
+            #[cfg(unix)]
+            let _ = std::process::Command::new("kill").args(["-KILL", "--", &format!("-{}", child.id())]).status();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 pub fn run_bake(dir: &str) {
     let Some(root) = repo_root_of(dir) else {
         eprintln!("# repo root が見つからない ({dir})。repo 内で実行を。");
@@ -2277,8 +2311,16 @@ pub fn run_bake(dir: &str) {
     // time(1) の統計は -o で別ファイルへ逃がす。子の stderr を汚さない = 失敗時に
     // rust-analyzer の panic/error がそのまま読める (末尾 5 行が time のフッターに潰されない)。
     let stats_path = format!("{}.time", db.trim_end_matches(".db"));
+    let err_path = format!("{db}.ra-err"); // `<db>.` prefix = cache prune の道連れ対象
     let use_time = std::path::Path::new("/usr/bin/time").exists();
-    let use_all = std::env::var_os("KENNING_BAKE_DEFAULT_FEATURES").is_none();
+    // features=all が timeout / 失敗した repo は marker を残し、次回から default で焼く (毎回 15 分払わない)。
+    let default_marker = format!("{db}.bake-default");
+    let timeout = std::env::var("KENNING_BAKE_TIMEOUT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(BAKE_TIMEOUT_SECS);
+    let mut use_all = std::env::var_os("KENNING_BAKE_DEFAULT_FEATURES").is_none();
+    if use_all && std::path::Path::new(&default_marker).exists() {
+        eprintln!("# 前回 features=all が失敗 / timeout → default features で焼く (all を試し直すなら rm {default_marker})");
+        use_all = false;
+    }
     let n_src = rust_files(&bake_s).count(); // 「薄い SCIP」判定は bake 対象の規模と比べる
     let mut peak_mb = 0u64;
     let mut baked = false;
@@ -2288,7 +2330,7 @@ pub fn run_bake(dir: &str) {
             std::fs::write(&cfg_path, r#"{"cargo": {"features": "all"}}"#).unwrap();
         }
         eprintln!(
-            "# bake: rust-analyzer scip {} (features={}) — peak ~{:.1}GB / 数十秒〜数分、常駐なし",
+            "# bake: rust-analyzer scip {} (features={}) — peak ~{:.1}GB / 数十秒〜数分 (上限 {timeout}s)、常駐なし",
             bake_s, if all { "all" } else { "default" }, needed_mb as f64 / 1024.0
         );
         let _ = std::fs::remove_file(&stats_path);
@@ -2303,19 +2345,36 @@ pub fn run_bake(dir: &str) {
         if all {
             cmd.args(["--config-path", &cfg_path]);
         }
-        let out = match cmd.current_dir(&bake_s).output() {
-            Ok(o) => o,
+        cmd.current_dir(&bake_s);
+        let t_ra = Instant::now();
+        let status = match run_with_timeout(cmd, &err_path, Duration::from_secs(timeout)) {
+            Ok(st) => st,
             Err(e) => {
                 eprintln!("# bake 失敗: rust-analyzer を起動できない ({ra}): {e}");
                 std::process::exit(1);
             }
         };
-        let errs = String::from_utf8_lossy(&out.stderr);
+        let errs = std::fs::read_to_string(&err_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&err_path);
         peak_mb = std::fs::read_to_string(&stats_path).ok().and_then(|s| parse_peak_mb(&s)).unwrap_or(0);
-        if !out.status.success() || !std::path::Path::new(&scip_path).exists() {
-            eprintln!("# bake 失敗 (features={}):", if all { "all" } else { "default" });
+        let Some(status) = status else {
+            eprintln!(
+                "# ⚠ rust-analyzer が {timeout}s で終わらない (features={}) → 止めた。optional dep の build script が重いか、proc-macro server の応答待ちで固まった疑い",
+                if all { "all" } else { "default" }
+            );
+            if all {
+                let _ = std::fs::write(&default_marker, "");
+                eprintln!("# default features で焼き直す (次回からも default。KENNING_BAKE_TIMEOUT=<秒> で上限変更)");
+                continue;
+            }
+            eprintln!("# 真因を直に見るなら: (cd {bake_s} && {ra} scip .)");
+            std::process::exit(1);
+        };
+        if !status.success() || !std::path::Path::new(&scip_path).exists() {
+            eprintln!("# bake 失敗 (features={}, {:.0?}):", if all { "all" } else { "default" }, t_ra.elapsed());
             eprintln!("{}", ra_error_lines(&errs));
             if all {
+                let _ = std::fs::write(&default_marker, "");
                 continue;
             }
             eprintln!("# 真因を直に見るなら: (cd {bake_s} && {ra} scip .)");
@@ -2334,7 +2393,7 @@ pub fn run_bake(dir: &str) {
             eprintln!("# ⚠ features=all の SCIP が薄い (doc {n_docs} / src {n_src}) → default features で焼き直し");
             continue;
         }
-        eprintln!("# bake 完了: {} docs / peak {}MB", n_docs, peak_mb);
+        eprintln!("# bake 完了: {} docs / peak {}MB / {:.0?}", n_docs, peak_mb, t_ra.elapsed());
         baked = true;
         break;
     }
@@ -5742,5 +5801,27 @@ note: run with `RUST_BACKTRACE=1` to display a backtrace
         assert!((median_f(vec![2.0, 1.0, 4.0]) - 2.0).abs() < 1e-9);
         let (mut a, mut b) = (Lcg(42), Lcg(42));
         assert_eq!((a.next(), a.next()), (b.next(), b.next())); // 同 seed → 同列 (再現性)
+    }
+
+    /// bake の上限: 子 process を group ごと落として None、普通に終われば Some(成功)。
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_kills_process_group_and_reports_normal_exit() {
+        let d = std::env::temp_dir().join(format!("kenning-rwt-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let err = d.join("err").to_string_lossy().to_string();
+        let t = Instant::now();
+        // sh が sleep を子に持つ = group kill が要る形。timeout 後に孫まで消える。
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "sleep 30 & wait"]);
+        let r = run_with_timeout(c, &err, Duration::from_millis(300)).unwrap();
+        assert!(r.is_none(), "timeout なのに完了扱い: {r:?}");
+        assert!(t.elapsed() < Duration::from_secs(5), "kill が効いていない ({:?})", t.elapsed());
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "echo boom >&2; exit 3"]);
+        let r = run_with_timeout(c, &err, Duration::from_secs(10)).unwrap().expect("完了するはず");
+        assert_eq!(r.code(), Some(3));
+        assert_eq!(std::fs::read_to_string(&err).unwrap().trim(), "boom", "stderr が file に落ちていない");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
