@@ -75,7 +75,7 @@ const GENERATED_FILES: &[&str] = &[
 /// v5: file 表に非 Rust テキスト (md/toml/yml/…) も載せる — `text` の対象が .rs 限定でなくなった。
 // v6 (2026-08): enchudb 0.14.4 → 0.25.1。意味論は不変だが、旧 enchudb で作った db を一度焼き直して
 // growable lazy commit (実 disk 半減) と新 recovery に乗せるため bump (次クエリで自動 heal、repo あたり ~1s)。
-const INDEX_VER: u32 = 6;
+const INDEX_VER: u32 = 7; // 7: dir 表 (鮮度判定の dir ゲート用) を追加
 
 /// このプロセスで鮮度チェック済みか。parse_opts の auto 経路 (maybe_auto_update / auto-index) が
 /// 立てる。open_ro 側の warn_if_stale が同じ stat-walk を繰り返さないため — 非 Rust の大 dir を
@@ -922,18 +922,53 @@ fn index_walk(dir: &str) -> ignore::WalkBuilder {
         .git_global(respect)
         .git_exclude(respect)
         .parents(respect)
-        .filter_entry(|e| e.depth() == 0 || e.file_name() != "target");
+        .filter_entry(|e| e.depth() == 0 || (e.file_name() != "target" && !is_kenning_artifact(e.file_name())));
     b
+}
+
+/// kenning 自身が repo 内に置き得る成果物 (明示 `--db` で repo 内に index を作った時の db directory /
+/// index lock / 作りかけ)。index 対象に混ぜると sidecar の JSON が `text` に出てくるので枝刈りする。
+fn is_kenning_artifact(name: &std::ffi::OsStr) -> bool {
+    let n = name.to_string_lossy();
+    n.ends_with(".db") || n.ends_with(".index.lock") || n.contains(".db.tmp-") || n.contains(".db.old-")
 }
 
 /// dir 以下の index 対象 .rs を列挙 (walk 規約は index_walk)。
 fn rust_files(dir: &str) -> impl Iterator<Item = std::path::PathBuf> {
-    index_walk(dir)
-        .build()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
-        .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
-        .map(|e| e.path().to_path_buf())
+    walk_index_set(dir).rs.into_iter()
+}
+
+/// 1 回の walk で拾った index 対象。`.rs` / それ以外のテキスト / 通過した dir (root 含む)。
+#[derive(Default)]
+struct WalkSet {
+    rs: Vec<PathBuf>,
+    text: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
+}
+
+/// index 対象を **1 回の walk** で全部集める。walk は .gitignore 解釈込みで 770 files に ~4.5ms かかる
+/// ので、rust_files と text_files を別々に呼ぶと倍払う (鮮度判定 + 増分 update で 4 回、full index で
+/// 4 回、回していた)。dir は鮮度判定の dir ゲート (fs_gate) が「file の増減が無い」と言うための材料。
+fn walk_index_set(dir: &str) -> WalkSet {
+    let mut w = WalkSet::default();
+    for e in index_walk(dir).build().filter_map(Result::ok) {
+        let Some(ft) = e.file_type() else { continue };
+        if ft.is_dir() {
+            w.dirs.push(e.path().to_path_buf());
+            continue;
+        }
+        if !ft.is_file() {
+            continue;
+        }
+        if e.path().extension().is_some_and(|x| x == "rs") {
+            w.rs.push(e.path().to_path_buf());
+        } else if !GENERATED_FILES.contains(&e.file_name().to_string_lossy().as_ref())
+            && e.metadata().is_ok_and(|m| m.len() <= TEXT_MAX_BYTES)
+        {
+            w.text.push(e.path().to_path_buf());
+        }
+    }
+    w
 }
 
 /// 拡張子 → lang。抽出関数を持たない形式は LANG_TEXT (注釈なしで索引されるだけ)。
@@ -955,15 +990,9 @@ fn is_probably_binary(bytes: &[u8]) -> bool {
 /// dir 以下の **.rs 以外の索引対象テキスト**を列挙。形式は問わない (binary とサイズ超過だけ落とす)。
 /// walk 規約は rust_files と共通 (index_walk) — 片方だけ gitignore を尊重すると、同じ
 /// `kenning text` の中で vendor/*.md は落ちるのに vendor/*.rs は出る、という不整合になる (#12)。
+#[cfg(test)]
 fn text_files(dir: &str) -> impl Iterator<Item = std::path::PathBuf> {
-    index_walk(dir)
-        .build()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
-        .filter(|e| e.path().extension().is_none_or(|x| x != "rs"))
-        .filter(|e| !GENERATED_FILES.contains(&e.file_name().to_string_lossy().as_ref()))
-        .filter(|e| e.metadata().is_ok_and(|m| m.len() <= TEXT_MAX_BYTES))
-        .map(|e| e.path().to_path_buf())
+    walk_index_set(dir).text.into_iter()
 }
 
 /// text index 用の読み込み。binary / 非 UTF-8 / サイズ超過は None = 索引しない (嘘を出さない)。
@@ -1266,16 +1295,18 @@ fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Option<&str>, ca
     // eid 予約は実データ規模 (ファイル数) から見積もる。過剰予約はファイルを太らせ open を遅くする。
     // growable なので不足したら enchudb が伸ばす (build 時コストのみ)。ref は --scip 時のみ大きく。
     // cap_mult は枯渇リトライ時に上がる (1 → 4 → 16 → 64)。file 数は不変なので掛けない。
-    let n_files_est = rust_files(dir).count().max(1) as u32;
+    let ws = walk_index_set(dir); // 1 回だけ walk (見積りと本走査で共用)
+    let n_files_est = ws.rs.len().max(1) as u32;
     // file 表だけは非 Rust テキストも載る (sym/call 系の見積りは Rust ファイル数のまま)。
-    let n_text_est = text_files(dir).count() as u32;
+    let n_text_est = ws.text.len() as u32;
     let file_cap = ((n_files_est + n_text_est) * 2).max(1_024);
+    let dir_cap = (ws.dirs.len() as u32 * 2).max(256);
     let sym_cap = (n_files_est * 64).max(8_192) * cap_mult; // enchudb 実測 ~17 sym/file、余裕 64
     let call_cap = (n_files_est * 400).max(32_768) * cap_mult; // 実測 ~154 call/file、余裕 400
     let ref_cap = if scip_path.is_some() { (n_files_est * 400).max(32_768) * cap_mult } else { 1_024 };
     let impl_cap = (n_files_est * 16).max(1_024) * cap_mult; // impl Trait for Type edge
     let extref_cap = if scip_path.is_some() { (n_files_est * 100).max(8_192) * cap_mult } else { 1_024 };
-    let max_entities = (file_cap + sym_cap + call_cap + ref_cap + impl_cap + extref_cap) * 11 / 10; // +10% 余白
+    let max_entities = (file_cap + dir_cap + sym_cap + call_cap + ref_cap + impl_cap + extref_cap) * 11 / 10; // +10% 余白
     let mut db = Database::create_growable_with_capacity(tmp, max_entities).unwrap();
     db.table("file")
         .tag("path")
@@ -1359,8 +1390,12 @@ fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Option<&str>, ca
         .with_capacity(16)
         .build()
         .unwrap();
+    // walk で通過した dir (root 含む)。鮮度判定の dir ゲート用 — dir の mtime は直下 entry の増減 /
+    // rename で動くので、全既知 dir が index 時刻より古ければ file の集合は不変と言える (fs_gate)。
+    db.table("dir").tag("path").with_capacity(dir_cap).build().unwrap();
 
     let file_t = db.get_table("file").unwrap();
+    let dir_t = db.get_table("dir").unwrap();
     let sym_t = db.get_table("sym").unwrap();
     let call_t = db.get_table("call").unwrap();
     let ref_t = db.get_table("ref").unwrap();
@@ -1375,9 +1410,9 @@ fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Option<&str>, ca
     let t = Instant::now();
 
     // ── pass1: 全ファイルを歩いて sym を挿入 + call-site を deferred 収集 ──
-    for p in rust_files(dir) {
+    for p in &ws.rs {
         let ps = p.to_string_lossy();
-        let Ok(src) = std::fs::read_to_string(&p) else { continue };
+        let Ok(src) = std::fs::read_to_string(p) else { continue };
         if index_one_file(&file_t, &sym_t, &mut acc, dir, &ps, &src) {
             n_files += 1;
         } else {
@@ -1386,11 +1421,12 @@ fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Option<&str>, ca
     }
     // ── pass1b: 非 Rust テキストを file 表に載せる (sym 無し = `text` の対象が増えるだけ) ──
     let mut n_text = 0u64;
-    for p in text_files(dir) {
-        let Some(src) = read_text_file(&p) else { continue };
+    for p in &ws.text {
+        let Some(src) = read_text_file(p) else { continue };
         index_text_file(&file_t, &mut acc, &p.to_string_lossy(), &src);
         n_text += 1;
     }
+    store_dirs(&dir_t, &ws.dirs);
     let n_sym = sym_t.all().count().unwrap() as u64;
     let parse_el = t.elapsed();
 
@@ -1618,18 +1654,17 @@ pub fn run_update(dir: &str, path: &str) {
         }
     };
     let open = t.elapsed();
-    update_with_heal(db, dir, path, false); // 明示 update = 全件 hash 照合 (mtime 巻き戻しの答え合わせ)
+    update_with_heal(db, dir, path, UpdateScan::Walk { trust_mtime: false }); // 明示 update = 全件 hash 照合 (mtime 巻き戻しの答え合わせ)
     eprintln!("(update 内訳: rw open {open:?} / 走査+書込+drop {:?})", t.elapsed() - open);
 }
 
 /// update を試み、失敗 (旧 schema の index 等で panic) したら full 再 index で自己修復。
 /// bake 済みの .scip が残っていれば精度も維持して焼き直す。
-/// `trust_mtime`: index 時刻より mtime が古い既知ファイルを読まずに未変更と見なす (若い db の自動
-/// update 用)。明示 update / 古い db は false で全件 hash 照合。
-fn update_with_heal(db: Database, dir: &str, path: &str, trust_mtime: bool) {
+/// `scan`: 走査方式 (UpdateScan)。明示 update は `Walk { trust_mtime: false }` = 全件 hash 照合。
+fn update_with_heal(db: Database, dir: &str, path: &str, scan: UpdateScan) {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| update_inner(db, dir, trust_mtime)));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| update_inner(db, dir, scan)));
     std::panic::set_hook(prev);
     if r.is_err() {
         heal_full_reindex(dir, path, "増分 update 失敗 (旧 schema の index?)");
@@ -1660,7 +1695,7 @@ fn heal_full_reindex(dir: &str, path: &str, why: &str) {
 }
 
 /// update の本体 (open 済み db を受け取る)。auto-update (maybe_auto_update) と run_update が共用。
-fn update_inner(db: Database, dir: &str, trust_mtime: bool) {
+fn update_inner(db: Database, dir: &str, scan: UpdateScan) {
     // index 意味論の版が違えば増分は不整合 (旧値と新値が混ざる) → panic して
     // update_with_heal の full 再 index (.scip 再利用) に落とす。
     let mut built_at = 0u32; // 前回 index / update の開始時刻 (mtime 絞り込みの基準)
@@ -1699,20 +1734,49 @@ fn update_inner(db: Database, dir: &str, trust_mtime: bool) {
     //    TRUST_MTIME_MAX_AGE 超の db は trust_mtime=false で全件 hash 照合するので、そこで拾う
     //    (maybe_auto_update の「念のため hash 照合」がこれ)。
     //    非 Rust テキストも同じ hash 差分に載せる (rust_files と text_files は .rs で排他)。
-    let skip_old_known = trust_mtime && built_at > 0;
+    //    `Stale(files)` は dir ゲート (fs_gate) が「file の増減は無く、この既知 file だけ mtime が新しい」と
+    //    確定済みの経路 — walk すらせず、その file だけ読む (編集 → 最初の query の最短経路)。
     let mut cur: HashMap<String, Option<String>> = HashMap::new(); // None = 読まず「未変更」と判定
     let mut n_read = 0usize;
-    for (p, is_rs) in rust_files(dir).map(|p| (p, true)).chain(text_files(dir).map(|p| (p, false))) {
-        let key = p.to_string_lossy().into_owned();
-        if skip_old_known && prev.contains_key(&key) && mtime_secs(&p).is_some_and(|m| m < built_at) {
-            cur.insert(key, None);
-            continue;
+    let mut walked_dirs: Option<Vec<PathBuf>> = None;
+    let read_src = |p: &Path| if lang_of(p) == LANG_RUST { std::fs::read_to_string(p).ok() } else { read_text_file(p) };
+    match scan {
+        UpdateScan::Stale(files) => {
+            for p in prev.keys() {
+                cur.insert(p.clone(), None);
+            }
+            for p in &files {
+                // 読めなければ None のまま = 未変更扱い (dir 不変なので消えてはいないはず。安全側)
+                if let Some(src) = read_src(p) {
+                    n_read += 1;
+                    cur.insert(p.to_string_lossy().into_owned(), Some(src));
+                }
+            }
         }
-        let src = if is_rs { std::fs::read_to_string(&p).ok() } else { read_text_file(&p) };
-        if let Some(src) = src {
-            n_read += 1;
-            cur.insert(key, Some(src));
+        UpdateScan::Walk { trust_mtime } => {
+            let skip_old_known = trust_mtime && built_at > 0;
+            let ws = walk_index_set(dir);
+            for p in ws.rs.iter().chain(ws.text.iter()) {
+                let key = p.to_string_lossy().into_owned();
+                if skip_old_known && prev.contains_key(&key) && mtime_secs(p).is_some_and(|m| m < built_at) {
+                    cur.insert(key, None);
+                    continue;
+                }
+                if let Some(src) = read_src(p) {
+                    n_read += 1;
+                    cur.insert(key, Some(src));
+                }
+            }
+            walked_dirs = Some(ws.dirs);
         }
+    }
+    // walk したなら dir 表を取り直す (変更なしでも: 空 dir の追加は file 表に映らないが、以後その dir 内の
+    // 追加を dir ゲートで見張るには表に載っている必要がある)。
+    if let (Some(dirs), Some(dir_t)) = (&walked_dirs, db.get_table("dir")) {
+        for e in dir_t.all().find().unwrap() {
+            dir_t.entity(e).delete().unwrap();
+        }
+        store_dirs(&dir_t, dirs);
     }
 
     // 2.5 walk が 1 件も拾えないのに db には行がある = root がずれている / 権限で読めない、の類。
@@ -2248,6 +2312,74 @@ fn probe_meta(db: &Database) -> Result<(String, u32, u32), String> {
     Ok((root, built_at, ver))
 }
 
+/// 増分 update の走査方式。
+enum UpdateScan {
+    /// walk して全 file を突き合わせる。`trust_mtime` なら index 時刻より mtime が古い既知 file は読まない。
+    Walk { trust_mtime: bool },
+    /// dir ゲート (fs_gate) が「file の増減なし、この既知 file だけ mtime が新しい」と確定済み。walk しない。
+    Stale(Vec<PathBuf>),
+}
+
+/// db が知っている file と dir (dir ゲートの材料)。dir 表が無い旧 index は None (walk に落ちる)。
+struct Known {
+    files: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
+}
+
+fn load_known(db: &Database) -> Option<Known> {
+    let dir_t = db.get_table("dir")?;
+    let file_t = db.get_table("file")?;
+    let paths = |t: &Table| -> Option<Vec<PathBuf>> {
+        Some(t.all().find().ok()?.into_iter().map(|e| PathBuf::from(txt(t.entity(e).get("path")))).collect())
+    };
+    Some(Known { files: paths(&file_t)?, dirs: paths(&dir_t)? })
+}
+
+fn store_dirs(dir_t: &Table, dirs: &[PathBuf]) {
+    for d in dirs {
+        dir_t.insert().set("path", d.to_string_lossy().as_ref()).commit().unwrap();
+    }
+}
+
+/// dir ゲートの結果。
+enum Gate {
+    /// 既知 dir (か、その .gitignore / .ignore) が index 時刻以降に変わった = file の増減があり得る → walk
+    DirsChanged,
+    /// dir は不変で、mtime が新しい既知 file も無い
+    Fresh,
+    /// dir は不変で、この既知 file だけ mtime が新しい (増減が無いので walk 不要)
+    Stale(Vec<PathBuf>),
+}
+
+/// **walk せず** 既知の dir と file を stat するだけで鮮度を判定する。dir の mtime は直下 entry の
+/// 追加 / 削除 / rename で動くので、全既知 dir が index 時刻より古ければ file の集合は不変 — あとは
+/// 既知 file の mtime だけ見れば足りる (tokio: walk 2 回 18ms → stat ~830 件 2ms)。
+/// 規則は walk_stats と同じ `>=`。stat できない (消えた) 物は「変わった」側に倒す。
+/// `.gitignore` / `.ignore` の in-place 編集は dir の mtime を動かさないので個別に見る。
+fn fs_gate(known: &Known, built_at: u32) -> Gate {
+    const IGNORE_FILES: [&str; 2] = [".gitignore", ".ignore"];
+    if known.files.is_empty() {
+        return Gate::DirsChanged; // 0 件は walk 側の「root がずれている?」判定に任せる
+    }
+    for d in &known.dirs {
+        if mtime_secs(d).is_none_or(|m| m >= built_at) {
+            return Gate::DirsChanged;
+        }
+        if IGNORE_FILES.iter().any(|f| mtime_secs(&d.join(f)).is_some_and(|m| m >= built_at)) {
+            return Gate::DirsChanged;
+        }
+    }
+    let mut stale = Vec::new();
+    for f in &known.files {
+        match mtime_secs(f) {
+            Some(m) if m < built_at => {}
+            Some(_) => stale.push(f.clone()),
+            None => return Gate::DirsChanged,
+        }
+    }
+    if stale.is_empty() { Gate::Fresh } else { Gate::Stale(stale) }
+}
+
 /// root 以下の walk を stat だけで見る → (index 時刻より新しいファイル数, 走査できたファイル数)。
 /// .rs と index 対象テキストの両方を見る — 片方だけだと md 編集が黙って古いまま残る。
 /// **seen も返す**のが要点: stale 0 には「本当に最新」と「root がずれて 1 件も見えていない」の
@@ -2255,12 +2387,13 @@ fn probe_meta(db: &Database) -> Result<(String, u32, u32), String> {
 fn walk_stats(root: &str, built_at: u32) -> (usize, usize) {
     let mut stale = 0;
     let mut seen = 0;
-    for p in rust_files(root).chain(text_files(root)) {
+    let ws = walk_index_set(root); // 1 回の walk で両方
+    for p in ws.rs.iter().chain(ws.text.iter()) {
         seen += 1;
         // `>=` (`>` ではない): mtime も built_at も秒粒度なので、index 開始と同じ秒に入った編集は
         // `>` だと永久に見えない。等値も stale 側に倒す方が安全 — 空振りしても update 側が built_at
         // を「その update の開始時刻」で焼き直すので、余分な no-op update は 1 回で収束する。
-        if mtime_secs(&p).is_some_and(|m| m >= built_at) {
+        if mtime_secs(p).is_some_and(|m| m >= built_at) {
             stale += 1;
         }
     }
@@ -2515,9 +2648,9 @@ fn maybe_auto_update(db_path: &str, auto_root: Option<&Path>) {
                 return;
             }
         };
-        probe_meta(&db)
+        probe_meta(&db).map(|m| (m, load_known(&db)))
     }; // ← readonly を閉じてから書込 open する
-    let (root, built_at, ver) = match probed {
+    let ((root, built_at, ver), known) = match probed {
         Ok(v) => v,
         Err(why) => {
             match auto_root {
@@ -2533,28 +2666,22 @@ fn maybe_auto_update(db_path: &str, auto_root: Option<&Path>) {
         heal_full_reindex(&root, db_path, &format!("index の版が古い (v{ver} → v{INDEX_VER})"));
         return;
     }
-    let mut why_old = "index が古い";
-    {
-        let (stale, seen) = walk_stats(&root, built_at);
-        if seen == 0 {
-            eprintln!("# ⚠ {root} で index 対象ファイルが 0 件 → 鮮度を確認できない (全て ignore されている?)。");
-            return;
-        }
-        if stale == 0 {
-            // mtime 上は最新。ただし mtime は巻き戻る (git checkout / rsync / touch -t) ので、
-            // 古い db では一度だけ hash 差分で答え合わせする (update 側が全ファイル読んで比較する)。
-            if age_days(built_at) * 86_400 < TRUST_MTIME_MAX_AGE {
-                return;
-            }
-            why_old = "index が古い (mtime 上は最新だが念のため hash 照合)";
-        }
-    }
+    // mtime は巻き戻る (git checkout / rsync / touch -t) ので、若い db だけ mtime を信じ、古い db は
+    // 一度 hash 差分で答え合わせする (update 側が全ファイル読んで比較する)。
+    let young = age_days(built_at) * 86_400 < TRUST_MTIME_MAX_AGE;
+    // dir ゲート: 既知 dir / file の stat だけで判定し、walk は dir に増減があった時だけ (update 側で回す。
+    // 削除だけの変更も walk で拾う)。dir 表の無い旧 index は INDEX_VER 違いで上の heal に落ちている。
+    let (why_old, scan) = match known.as_ref().map(|k| fs_gate(k, built_at)) {
+        Some(Gate::Fresh) if young => return,
+        Some(Gate::Fresh) => ("index が古い (mtime 上は最新だが念のため hash 照合)".to_string(), UpdateScan::Walk { trust_mtime: false }),
+        Some(Gate::Stale(files)) if young => (format!("{} file が編集済み", files.len()), UpdateScan::Stale(files)),
+        Some(Gate::Stale(_)) => ("index が古い (念のため全件 hash 照合)".to_string(), UpdateScan::Walk { trust_mtime: false }),
+        Some(Gate::DirsChanged) | None => ("dir に増減あり".to_string(), UpdateScan::Walk { trust_mtime: young }),
+    };
     match Database::open(db_path) {
         Ok(db) => {
             eprintln!("# {why_old} → 自動増分 update ({root})");
-            // 若い db は mtime を信じて読む量を絞る。古い db (why_old の「念のため hash 照合」) は全件。
-            let trust = age_days(built_at) * 86_400 < TRUST_MTIME_MAX_AGE;
-            update_with_heal(db, &root, db_path, trust); // 旧 schema なら full 再 index で自己修復
+            update_with_heal(db, &root, db_path, scan); // 旧 schema なら full 再 index で自己修復
         }
         Err(e) => {
             eprintln!("# ⚠ index が {} 日前だが lock を取れない ({e}) → 古い結果で回答。後で `kenning update` を。", age_days(built_at));
@@ -4826,16 +4953,70 @@ mod tests {
         std::fs::write(&a, "pub fn alpha() {}\npub fn beta() {}\n").unwrap();
         let rolled = std::time::UNIX_EPOCH + std::time::Duration::from_secs(built_at as u64 - 100);
         std::fs::File::options().write(true).open(&a).unwrap().set_modified(rolled).unwrap();
-        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, true);
+        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, UpdateScan::Walk { trust_mtime: true });
         assert_eq!(count("beta"), 0, "mtime 信頼中に古い mtime のファイルを読んでいる (絞り込みが効いていない)");
-        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, false);
+        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, UpdateScan::Walk { trust_mtime: false });
         assert_eq!(count("beta"), 1, "全件 hash 照合が mtime 巻き戻しを拾えていない");
 
         // 普通の編集 (mtime = 今) は mtime 信頼中でも拾う。新規ファイルも同様
         std::fs::write(&a, "pub fn alpha() {}\npub fn beta() {}\npub fn gamma() {}\n").unwrap();
         std::fs::write(root.join("src/b.rs"), "pub fn delta() {}\n").unwrap();
-        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, true);
+        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, UpdateScan::Walk { trust_mtime: true });
         assert_eq!((count("gamma"), count("delta")), (1, 1), "mtime 信頼中に普通の編集 / 新規ファイルを取りこぼした");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// dir ゲート: 既知 dir と file の stat だけで「walk 不要」を判定する。編集 → Stale (その file だけ)、
+    /// 追加 / 削除 / .gitignore 編集 → DirsChanged (walk に落ちる)、何もなければ Fresh。
+    /// Stale 経路の update は walk せずその file だけ読んで反映する。
+    #[test]
+    fn dir_gate_skips_walk_unless_entries_changed() {
+        let (root, db) = indexed_fixture("gate");
+        let root_s = root.to_string_lossy().to_string();
+        let known = || load_known(&Database::open_readonly(&db).unwrap()).expect("dir 表が無い");
+        let k = known();
+        assert!(k.dirs.iter().any(|d| d == &root) && k.dirs.iter().any(|d| d.ends_with("src")), "dir 表に root / src が無い: {:?}", k.dirs);
+        assert_eq!(k.files.len(), 2, "Cargo.toml + src/a.rs のはず: {:?}", k.files);
+        // fixture は index と同じ秒に書かれている (= `>=` で Stale 扱い) ので、全部 100 秒前に巻き戻して
+        // 「何もしていない」状態を作る。
+        let now = now_secs();
+        let backdate = |p: &Path| {
+            let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(now as u64 - 100);
+            std::fs::File::open(p).unwrap().set_modified(t).unwrap();
+        };
+        let settle = |k: &Known| k.dirs.iter().chain(k.files.iter()).for_each(|p| backdate(p));
+        settle(&k);
+        assert!(matches!(fs_gate(&k, now), Gate::Fresh), "何もしていないのに Fresh でない");
+
+        // 既知 file の編集 → その file だけ Stale
+        let a = root.join("src/a.rs");
+        std::fs::write(&a, "pub fn alpha() {}\npub fn beta() {}\n").unwrap();
+        match fs_gate(&k, now) {
+            Gate::Stale(files) => assert_eq!(files, vec![a.clone()]),
+            _ => panic!("編集した file が Stale に出ていない"),
+        }
+        // Stale 経路の update: walk せずその file だけ読んで反映
+        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, UpdateScan::Stale(vec![a.clone()]));
+        let d = Database::open_readonly(&db).unwrap();
+        assert_eq!(d.get_table("sym").unwrap().where_eq("name", "beta").find().unwrap().len(), 1, "Stale 経路で編集が反映されていない");
+        drop(d);
+
+        // 追加 → dir の mtime が動く → DirsChanged
+        settle(&known());
+        std::fs::write(root.join("src/b.rs"), "pub fn delta() {}\n").unwrap();
+        assert!(matches!(fs_gate(&known(), now), Gate::DirsChanged), "file 追加が DirsChanged にならない");
+        // 削除も同様
+        settle(&known());
+        std::fs::remove_file(root.join("src/b.rs")).unwrap();
+        assert!(matches!(fs_gate(&known(), now), Gate::DirsChanged), "file 削除が DirsChanged にならない");
+        // .gitignore の in-place 編集は dir の mtime を動かさないが、個別に見て DirsChanged
+        let gi = root.join(".gitignore");
+        std::fs::write(&gi, "").unwrap();
+        settle(&known());
+        backdate(&gi);
+        assert!(matches!(fs_gate(&known(), now), Gate::Fresh), "巻き戻した .gitignore が引っかかっている");
+        std::fs::write(&gi, "target/\n").unwrap();
+        assert!(matches!(fs_gate(&known(), now), Gate::DirsChanged), ".gitignore 編集が DirsChanged にならない");
         let _ = std::fs::remove_dir_all(&root);
     }
 
