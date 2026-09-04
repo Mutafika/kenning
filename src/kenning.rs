@@ -1618,16 +1618,18 @@ pub fn run_update(dir: &str, path: &str) {
         }
     };
     let open = t.elapsed();
-    update_with_heal(db, dir, path);
+    update_with_heal(db, dir, path, false); // 明示 update = 全件 hash 照合 (mtime 巻き戻しの答え合わせ)
     eprintln!("(update 内訳: rw open {open:?} / 走査+書込+drop {:?})", t.elapsed() - open);
 }
 
 /// update を試み、失敗 (旧 schema の index 等で panic) したら full 再 index で自己修復。
 /// bake 済みの .scip が残っていれば精度も維持して焼き直す。
-fn update_with_heal(db: Database, dir: &str, path: &str) {
+/// `trust_mtime`: index 時刻より mtime が古い既知ファイルを読まずに未変更と見なす (若い db の自動
+/// update 用)。明示 update / 古い db は false で全件 hash 照合。
+fn update_with_heal(db: Database, dir: &str, path: &str, trust_mtime: bool) {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| update_inner(db, dir)));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| update_inner(db, dir, trust_mtime)));
     std::panic::set_hook(prev);
     if r.is_err() {
         heal_full_reindex(dir, path, "増分 update 失敗 (旧 schema の index?)");
@@ -1658,18 +1660,21 @@ fn heal_full_reindex(dir: &str, path: &str, why: &str) {
 }
 
 /// update の本体 (open 済み db を受け取る)。auto-update (maybe_auto_update) と run_update が共用。
-fn update_inner(db: Database, dir: &str) {
+fn update_inner(db: Database, dir: &str, trust_mtime: bool) {
     // index 意味論の版が違えば増分は不整合 (旧値と新値が混ざる) → panic して
     // update_with_heal の full 再 index (.scip 再利用) に落とす。
+    let mut built_at = 0u32; // 前回 index / update の開始時刻 (mtime 絞り込みの基準)
     if let Some(meta_t) = db.get_table("meta")
         && let Some(e) = meta_t.all().find().unwrap().into_iter().next() {
-            let v = match meta_t.entity(e).get("ver") {
+            let er = meta_t.entity(e);
+            let v = match er.get("ver") {
                 Some(Value::Number(n)) => n as u32,
                 _ => 0,
             };
             if v != INDEX_VER {
                 panic!("index ver {v} != {INDEX_VER} (意味論変更) → full 再 index が必要");
             }
+            built_at = num(er.get("built_at"));
         }
     let file_t = db.get_table("file").unwrap();
     let sym_t = db.get_table("sym").unwrap();
@@ -1687,17 +1692,26 @@ fn update_inner(db: Database, dir: &str) {
         prev.insert(txt(er.get("path")), (fe, num(er.get("hash"))));
     }
 
-    // 2. 現在の disk を走査 (path → src)。
-    let mut cur: HashMap<String, String> = HashMap::new();
-    for p in rust_files(dir) {
-        if let Ok(src) = std::fs::read_to_string(&p) {
-            cur.insert(p.to_string_lossy().into_owned(), src);
+    // 2. 現在の disk を走査 (path → src)。**mtime を信じられる時は、index 時刻より古い既知ファイルを
+    //    読まない** (tokio 725 files で全件読み + hash が 25〜30ms、絞ると数 ms)。規則は walk_stats と
+    //    同じ `>=` (秒粒度の等値は「変わったかも」側に倒す)。新規 path は必ず読む。
+    //    mtime の巻き戻し (rsync -a / touch -t) は mtime 信頼中は見えないが、明示 `kenning update` と
+    //    TRUST_MTIME_MAX_AGE 超の db は trust_mtime=false で全件 hash 照合するので、そこで拾う
+    //    (maybe_auto_update の「念のため hash 照合」がこれ)。
+    //    非 Rust テキストも同じ hash 差分に載せる (rust_files と text_files は .rs で排他)。
+    let skip_old_known = trust_mtime && built_at > 0;
+    let mut cur: HashMap<String, Option<String>> = HashMap::new(); // None = 読まず「未変更」と判定
+    let mut n_read = 0usize;
+    for (p, is_rs) in rust_files(dir).map(|p| (p, true)).chain(text_files(dir).map(|p| (p, false))) {
+        let key = p.to_string_lossy().into_owned();
+        if skip_old_known && prev.contains_key(&key) && mtime_secs(&p).is_some_and(|m| m < built_at) {
+            cur.insert(key, None);
+            continue;
         }
-    }
-    // 非 Rust テキストも同じ hash 差分に載せる (rust_files と text_files は .rs で排他)。
-    for p in text_files(dir) {
-        if let Some(src) = read_text_file(&p) {
-            cur.insert(p.to_string_lossy().into_owned(), src);
+        let src = if is_rs { std::fs::read_to_string(&p).ok() } else { read_text_file(&p) };
+        if let Some(src) = src {
+            n_read += 1;
+            cur.insert(key, Some(src));
         }
     }
 
@@ -1714,14 +1728,16 @@ fn update_inner(db: Database, dir: &str) {
     let mut to_add: Vec<(String, String)> = Vec::new();
     let mut to_remove: Vec<EntityId> = Vec::new();
     for (p, src) in &cur {
-        match prev.get(p) {
-            Some((eid, h)) => {
+        match (prev.get(p), src) {
+            (Some(_), None) => {} // mtime が index 時刻より古い既知ファイル = 読まずに未変更
+            (Some((eid, h)), Some(src)) => {
                 if *h != hash_u32(src) {
                     to_remove.push(*eid);
                     to_add.push((p.clone(), src.clone()));
                 }
             }
-            None => to_add.push((p.clone(), src.clone())),
+            (None, Some(src)) => to_add.push((p.clone(), src.clone())),
+            (None, None) => unreachable!("新規 path は必ず読む"),
         }
     }
     let mut n_deleted = 0u64;
@@ -1750,7 +1766,7 @@ fn update_inner(db: Database, dir: &str) {
                 }
                 ins.commit().unwrap();
             }
-        eprintln!("変更なし ({} files 走査 {scan:?}、meta 再スタンプ {:?})。", cur.len(), t.elapsed() - scan);
+        eprintln!("変更なし ({} files 走査 / {n_read} 読込 {scan:?}、meta 再スタンプ {:?})。", cur.len(), t.elapsed() - scan);
         return;
     }
 
@@ -2244,16 +2260,21 @@ fn walk_stats(root: &str, built_at: u32) -> (usize, usize) {
         // `>=` (`>` ではない): mtime も built_at も秒粒度なので、index 開始と同じ秒に入った編集は
         // `>` だと永久に見えない。等値も stale 側に倒す方が安全 — 空振りしても update 側が built_at
         // を「その update の開始時刻」で焼き直すので、余分な no-op update は 1 回で収束する。
-        let newer = std::fs::metadata(&p)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .is_some_and(|d| d.as_secs() as u32 >= built_at);
-        if newer {
+        if mtime_secs(&p).is_some_and(|m| m >= built_at) {
             stale += 1;
         }
     }
     (stale, seen)
+}
+
+/// ファイルの mtime (秒)。取れなければ None — 鮮度判定 (walk_stats) では「古くない」、増分 update の
+/// 読み飛ばし判定では「読む」側に倒れる (どちらも安全側)。
+fn mtime_secs(p: &std::path::Path) -> Option<u32> {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as u32)
 }
 
 /// index が焼かれてからの経過 (日)。警告文と「念のため update」の閾値に使う。
@@ -2531,7 +2552,9 @@ fn maybe_auto_update(db_path: &str, auto_root: Option<&Path>) {
     match Database::open(db_path) {
         Ok(db) => {
             eprintln!("# {why_old} → 自動増分 update ({root})");
-            update_with_heal(db, &root, db_path); // 旧 schema なら full 再 index で自己修復
+            // 若い db は mtime を信じて読む量を絞る。古い db (why_old の「念のため hash 照合」) は全件。
+            let trust = age_days(built_at) * 86_400 < TRUST_MTIME_MAX_AGE;
+            update_with_heal(db, &root, db_path, trust); // 旧 schema なら full 再 index で自己修復
         }
         Err(e) => {
             eprintln!("# ⚠ index が {} 日前だが lock を取れない ({e}) → 古い結果で回答。後で `kenning update` を。", age_days(built_at));
@@ -4781,6 +4804,38 @@ mod tests {
             .filter(|n| n.contains(".tmp-") || n.contains(".old-"))
             .collect();
         assert!(leftovers.is_empty(), "作りかけ / 退避が残っている: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 増分 update は mtime を信じられる時、index 時刻より古い既知ファイルを読まない (tokio 725 files で
+    /// 全件読み + hash 25〜30ms → 数 ms)。代償として mtime の巻き戻し (rsync -a / touch -t) は
+    /// mtime 信頼中は見えない — それは trust_mtime=false (明示 update / 7 日超の db) の全件 hash 照合で
+    /// 拾う。両方の振る舞いと「普通の編集は mtime 信頼中でも拾う」を固定。
+    #[test]
+    fn incremental_update_trusts_mtime_but_full_check_catches_rollback() {
+        let (root, db) = indexed_fixture("mtime");
+        let root_s = root.to_string_lossy().to_string();
+        let a = root.join("src/a.rs");
+        let count = |name: &str| {
+            let d = Database::open_readonly(&db).unwrap();
+            d.get_table("sym").unwrap().where_eq("name", name).find().unwrap().len()
+        };
+        let built_at = read_meta(&Database::open_readonly(&db).unwrap()).map(|(_, b)| b).unwrap();
+
+        // 内容は変えたが mtime を index より前に巻き戻す (rsync -a / touch -t 相当)
+        std::fs::write(&a, "pub fn alpha() {}\npub fn beta() {}\n").unwrap();
+        let rolled = std::time::UNIX_EPOCH + std::time::Duration::from_secs(built_at as u64 - 100);
+        std::fs::File::options().write(true).open(&a).unwrap().set_modified(rolled).unwrap();
+        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, true);
+        assert_eq!(count("beta"), 0, "mtime 信頼中に古い mtime のファイルを読んでいる (絞り込みが効いていない)");
+        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, false);
+        assert_eq!(count("beta"), 1, "全件 hash 照合が mtime 巻き戻しを拾えていない");
+
+        // 普通の編集 (mtime = 今) は mtime 信頼中でも拾う。新規ファイルも同様
+        std::fs::write(&a, "pub fn alpha() {}\npub fn beta() {}\npub fn gamma() {}\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "pub fn delta() {}\n").unwrap();
+        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, true);
+        assert_eq!((count("gamma"), count("delta")), (1, 1), "mtime 信頼中に普通の編集 / 新規ファイルを取りこぼした");
         let _ = std::fs::remove_dir_all(&root);
     }
 
