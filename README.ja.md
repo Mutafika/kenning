@@ -22,8 +22,8 @@ kenning callers finish_with_oplog     # これだけ — index は初回クエ�
 
 AI コーディングエージェントは `grep` ＋ファイル通読でコードを探索する。動くが、token を
 焼く: 「X を変えたら何が壊れる?」は grep とファイル読みの再帰的な連鎖になる — 1 問で
-数百回の tool 呼び出し（enchudb で 808 回、下記で実測）。kenning の `impact` は事前に
-焼いたグラフから 1 レスポンスで答える: ベンチ corpus 全体で **13–52× 少ないバイト**、
+数百回の tool 呼び出し（enchudb で 1,384 回、下記で実測）。kenning の `impact` は事前に
+焼いたグラフから 1 レスポンスで答える: ベンチ corpus 全体で **13–84× 少ないバイト**、
 そして問いが深いほど差が広がる。
 
 古典的な精密解は language server だが、rust-analyzer は 1 問ずつ答えるために複数 GB の
@@ -42,8 +42,8 @@ RSS で常駐する。一方でエージェントはバースト的に、多数�
 3. **Serve**: fact DB から µs でクエリに答える。全列が自動 index されるので、faceted な
    連言（`kind:method vis:pub container:Engine calls:unwrap`）は scan でなくバケット交差。
 
-index は自己維持する: 古いファイルは毎クエリで検出され（~10 ms の stat-walk）増分再 index
-される（小編集で ~18 ms）ので、答えが黙って古くなることはない。
+index は自己維持する: 古いファイルは毎クエリで検出され（1–5 ms の stat-walk）増分再 index
+される（小編集で ~6 ms）ので、答えが黙って古くなることはない。
 
 ## インストール
 
@@ -78,10 +78,17 @@ enchudb-oplog = { path = "../enchudb/crates/enchudb-oplog" }
 
 ```
 kenning def     <name>              定義 + シグネチャ + doc 1 行目 (hover 相当)
-kenning read    <name> [container]  定義本体をそのまま出力 (def + ファイル読みを 1 手に)
-kenning find    <substr>            名前の部分一致 (発見用)
-kenning text    <term>              全テキストファイルの全文検索 + 文脈注釈
-                                    (.rs=enclosing symbol / .md=見出し階層 / .toml=[table])
+kenning read    <name> [container] [crate:X] [path:S] [--all]
+                                    定義本体をそのまま出力 (def + ファイル読みを 1 手に)。
+                                    同名は crate:/path:/container で絞る、--all で全部出す
+kenning read    <path>:<line>       その行を囲む item の本体 (grep -n → sed を 1 手に)
+kenning read    <file>#<見出し>      .md の見出し / .toml の [table] / .yml のキー配下
+kenning find    <substr>            symbol 名 + ファイル名 (basename) の部分一致 (発見用。
+                                    `find -name '*x*'` 相当も兼ねる)
+kenning text    <term>... [-e] [path:S]
+                                    全テキストファイルの全文検索 + 文脈注釈
+                                    (.rs=enclosing symbol / .md=見出し階層 / .toml=[table])。
+                                    複数語は OR、-e で正規表現、path: で dir 絞り
 kenning callers <name> [container]  who-calls: 確実 ∪ 未確定候補を位置付きで
 kenning callees <name> [container]  呼ぶ先 (outgoing)
 kenning edges                       全 cross-file call edge を集計 (from\tto\tcount TSV)
@@ -92,15 +99,31 @@ kenning tests   <name> [container]  この symbol に届くテスト = impact �
 kenning path    <from> <to>         A から B への呼び出し経路 1 本 (前方 BFS)
 kenning across  <name>              index 済み全 repo 横断の精密参照
 kenning search  kind:method vis:pub container:Engine   faceted 等値 AND
-kenning outline <path>              ファイルを読まずに構造把握
+kenning outline <path|dir>          ファイルを読まずに構造把握。dir なら配下 file の地図
+                                    (symbol 数 / loc)、`.` で repo の地図
 kenning bake                        rust-analyzer を 1 回走らせ SCIP 取込 → RA 級精度
 kenning stats                       index 規模 + 解決率
-kenning cache   [ls|prune]          自動 db の棚卸し / 掃除 (repo 消失・旧版、--older-than D)
+kenning cache   [ls|prune]          自動 db の棚卸し / 掃除 (repo 消失・旧版、--older-than D、
+                                    --dry-run)
+kenning --version                   バージョン
 ```
 
 出力は stdout の決定的な `path:line<TAB>詳細` 行（進捗は stderr）— 各行はそのまま
 ファイルリーダに渡せる。repo には `CLAUDE.md` が同梱され、Claude 系エージェントが
 プロンプトなしで正しいサブコマンドを選べる。
+
+索引対象は rg と同じ規約 — `.gitignore` / `.ignore` と隠しディレクトリを尊重し、`target/` と
+`node_modules/` は常に除外。自動の判断が合わない時だけ使う上書き:
+
+| env / flag | 効果 |
+|---|---|
+| `--db <path>` / `KENNING_DB` | 明示 db を使う (明示 db は自動 index しない) |
+| `KENNING_NO_AUTO=1` | 自動 index / update を全部止める |
+| `KENNING_NO_STALE=1` | 自動 index は活かしたまま、クエリごとの鮮度チェックだけ止める |
+| `KENNING_NO_IGNORE=1` | gitignore 済みの `.rs` も索引 (生成コードを compile する repo 用) |
+| `KENNING_BAKE_TIMEOUT=<秒>` | rust-analyzer 1 回の上限 (既定 900)。超えたら `bake` は process group ごと kill して default features に退避し、その選択を repo ごとに記憶する |
+| `KENNING_BAKE_DEFAULT_FEATURES=1` | 最初から `features = "all"` を試さない |
+| `KENNING_RA=<path>` | `bake` に使う rust-analyzer binary |
 
 ## 設計の要点
 
@@ -112,7 +135,10 @@ kenning cache   [ls|prune]          自動 db の棚卸し / 掃除 (repo 消失
   保守的な syn resolver にフォールバック — kenning は rust-analyzer 自身が取りこぼす
   impl や caller を見つける。
 - **GIGO は明示的。** 精度は食わせた SCIP に等しい。`bake` は `--config-path` で
-  `features = "all"` を注入する（tokio ではこれが解決 call edge 177 と 6,760 の差になる）。
+  `features = "all"` を注入する — RA が見なかった cfg ブランチの call edge は永久に手に入らないから。
+  効き目は crate 次第で、それを仮定せず出す: tokio の workspace では今や誤差
+  （SCIP 確定 edge は all 8,934 / default 8,853）、逆に enchudb では `features = "all"` が
+  上限時間を超えて固まり `bake` は default features に退避する。
   解決率は隠さず表示する。
 - **index は派生物。** `~/.cache/kenning/` に住み、repo の中には入らず、repo root で
   keying。いつ消してもよい — 次の質問で建て直す。
@@ -126,27 +152,36 @@ kenning cache   [ls|prune]          自動 db の棚卸し / 掃除 (repo 消失
 （tokio @ tokio-1.43.0）、固定乱数 seed、手法は各表の直上に自己記述。全文:
 [bench/RESULTS.md](bench/RESULTS.md)。
 
-| スイート | tokio (722 files) | ripgrep (100 files) | enchudb (175 files) | 測るもの |
+| スイート | tokio (722 files) | ripgrep (100 files) | enchudb (256 files) | 測るもの |
 |---|---|---|---|---|
-| **agent** — 「誰が X を呼ぶ?」の答えまでのバイト数 | **5.3×** 少・15 呼→1 | **2.3×** 少・3 呼→1 | **10.2×** 少・30 呼→1 | 固定 20 問、grep 経路は*楽観*モデル（下限）vs 実際の `callers` 出力 |
-| **beyond** — 「X を変えたら何が壊れる?」(`impact`) | **46×**・321 呼→1 | **13×**・75 呼→1 | **52×**・808 呼→1 | 推移的 caller BFS: grep 経路 = エージェントが実際にやる手動 grep+read 再帰 |
+| **agent** — 「誰が X を呼ぶ?」の答えまでのバイト数 | **4.1×** 少・15 呼→1 | **1.7×** 少・3 呼→1 | **12.2×** 少・52 呼→1 | 固定 20 問、grep 経路は*楽観*モデル（下限）vs 実際の `callers` 出力 |
+| **beyond** — 「X を変えたら何が壊れる?」(`impact`) | **48×**・325 呼→1 | **13×**・75 呼→1 | **84×**・1,384 呼→1 | 推移的 caller BFS: grep 経路 = エージェントが実際にやる手動 grep+read 再帰 |
 | **quality** — ランダム 100 symbol の grep ノイズ | 中央値 43% | 中央値 33% | 中央値 33% | `\bname\(` ヒットのうち def/コメント/文字列/別 symbol の割合 = 無駄に読む行 |
-| **micro** — warm クエリ遅延 | 125 ns – 4 µs | 同等 | 125 ns – 2.3 µs | faceted カウント・def 検索・精密逆引き callers |
+| **micro** — warm クエリ遅延 | 125 ns – 5 µs | 166 ns – 2 µs | 166 ns – 4.2 µs | faceted カウント・def 検索・精密逆引き callers |
 
-同じスイートは他の非サーチクエリも測る: `impls`（go-to-implementation）10–23×、
-`outline`（読まずに構造把握）7–12×（442 KB のファイルが 42× に圧縮）、`def`（hover:
-位置 + シグネチャ + doc 行）6–10×。faceted クエリは grep 等価物が存在しない — µs で走り、
+同じスイートは他の非サーチクエリも測る: `impls`（go-to-implementation）10.6–23.6×、
+`outline`（読まずに構造把握）ソースなら 8–26×（tokio の 143 KB CHANGELOG が 30×。ripgrep の
+`raw.csv` のようなデータファイルは 1,000× 超だが、それは CSV の話であって本品の手柄ではない）、
+`def`（hover: 位置 + シグネチャ + doc 行）6.2–9.2×。faceted クエリは grep 等価物が存在しない — µs で走り、
 比ではなく能力として報告する。パターンに注目: **問いが深いほど差が開く** — ripgrep では
-素の who-calls は 2.3× だが推移的 impact は 13×、grep 経路は BFS の hop ごとに掛け算になるから。
+素の who-calls は 1.7× だが推移的 impact は 13×、grep 経路は BFS の hop ごとに掛け算になるから。
 
 このばらつきが正直な物語: 優位は symbol がどれだけ広く呼ばれるかに比例する。ripgrep —
-小さく、よく分割されていることで有名 — が床（2.3×、中央値の symbol は 3 箇所から呼ばれる）；
-enchudb のホットな symbol（30 箇所）は 10.2×。最悪例は grep が最も溺れる所:
-enchudb の `len` = 988 grep ヒットのうち、ローカルな `len` の確実な caller は 46。
+小さく、よく分割されていることで有名 — が床（1.7×、中央値の symbol は 3 箇所から呼ばれる）；
+enchudb のホットな symbol（52 箇所）は 12.2×。最悪例は grep が最も溺れる所:
+enchudb の `len` = grep 1,187 ヒット → 名前一致 689 箇所、うちローカルな `len` の確実な caller は 69。
+
+**全文検索 vs `rg`**（同じ実行の `text` スイート）: corpus ごとに高頻度語 20 個、同じ語を両
+エンジンに投げる。ヒット数は **80 問中 64 問で完全一致**し、差は全て文書化済みの 2 規則に
+落ちる — kenning が生成 lock と 1 MiB 超を索引しない分（少なく出る 13 問）と、`rg` が最初の
+NUL で打ち切るのに対し kenning は最後まで読む分（ripgrep の `sherlock-nul.txt` で多く出る 3 問）。
+wall は同オーダー（4 corpus で rg 6.3–16.2 ms vs text 5.0–22.9 ms）で、その上で kenning の各行には
+囲っている関数 / 見出し階層 / TOML table が付く。「Rust repo の中では grep に戻らなくていい」を
+支えるのがこのスイート — 追加するまで、ここで唯一実測の無い主張だった。
 
 **vs rust-analyzer** ([bench/VS-RA.md](bench/VS-RA.md), `./bench/vs-ra.sh`):
 cold から「who-calls に答えられる」までの時間とメモリ — RA（`analysis-stats`、RA 自身の
-ベンチツール）: enchudb で 39 s / 6.1 GB、対して kenning syn index: 0.45 s / 175 MB、
+ベンチツール）: enchudb で 18.9 s / 3.1 GB、対して kenning syn index: 0.29 s / 130 MB、
 以後の常駐ゼロ。精度のトレードと feature スコープの注記は表の隣に明記。
 
 **vs CodeQL** ([bench/VS-CODEQL.md](bench/VS-CODEQL.md), `./bench/vs-codeql.sh`):
@@ -165,17 +200,26 @@ DB 構築 **68 分 / 9.9 GB / 301 MB** vs 2.4 s / 174 MB / 67 MB；who-calls 1 �
 facts の disk（14 MB vs 87 MB — こちらは syn コールグラフと facet も載せている）で勝ち、
 live source に join しないので古い SCIP も優雅に serve できる。
 
+CodeQL / Glean の対決は当時の enchudb スナップショット（175 files）での計測で、リリースごとに
+回し直してはいない（68 分の DB 構築を毎回払う意味がない）。主張は桁であって小数第 3 位ではない。
+
 **vs ast-grep**（構造検索; 同じ質問、agent スイート内）: その構造一致は kenning の
-確実 ∪ 候補 集合とほぼ完全に一致（`tie` 321 = 321、`clone` 621 = 224+397）— call-site
-検出が完全であることの独立相互検証。差は: 1 問あたり中央値 564–878 ms（repo walk、
-ユーザーが列挙する 3 つの call 形パターン）vs 13–19 ms（index 済み）、そして名前解決が
+確実 ∪ 候補 集合とほぼ完全に一致（tokio の `sleep` 152 = 105+47、`registration` 89 = 89+0）—
+call-site 検出が完全であることの独立相互検証。差は: 1 問あたり中央値 146–460 ms（repo walk、
+ユーザーが列挙する 3 つの call 形パターン）vs 7–20 ms（index 済み）、そして名前解決が
 ない — call が*どの*定義に属すか言えず、impact/path/faceted/cross-repo も無い。
 
-- index 構築: ~1k LOC/ms（enchudb: 175 files / 2,905 symbols / 26,131 call-sites を約 360 ms）。
-- 小編集後の増分 update: ~18 ms。クエリごとの鮮度チェック: ~10 ms。
-- `bake`: rust-analyzer のバッチ 1 回（peak ≈ 5 GB で ~30–50 s）、その後 **常駐ゼロ**。
-  enchudb の解決率: 26.6%（syn のみ）→ 39.8%（baked, features=all）。残る未解決は
-  std / 外部 crate の call が主で、これらもラベル付き候補として列挙される。
+- index 構築（syn 層、cold）: enchudb 256 files / 4,099 symbols / 37,022 call-sites を **0.29 s**、
+  tokio 722 files / 7,156 symbols / 28,834 call-sites を **0.53 s**。
+- 小編集後の増分 update: **~6 ms**。クエリごとの鮮度チェック（dir ゲート付き stat-walk）は
+  1–5 ms、`callers` 1 本の全体（プロセス起動込み）は 7–20 ms（ベンチ中央値: kenning 7.1、
+  ripgrep 12.1、enchudb 17.3、tokio 19.8 ms。同じ問いを `rg` で引くと 9.2–22.9 ms なので
+  速さは互角 — 差は返ってくる中身）。
+- `bake`: rust-analyzer のバッチ 1 回、その後 **常駐ゼロ**。実測は ripgrep 7 s / 1.1 GB、
+  tokio 28 s / 2.0 GB、enchudb 46 s / 2.3 GB。解決率の前→後: tokio 18.3% → 35.5%、
+  ripgrep 26.7% → 48.7%（ここまで features=all）、enchudb 27.5% → 43.2% — enchudb は
+  features=all が上限時間を超えて固まるため *default* features で焼く（上限が存在する理由そのもの）。
+  残る未解決は std / 外部 crate の call が主で、これらもラベル付き候補として列挙される。
 
 ## 設計の取引 — やらないこと、とその代償
 
@@ -183,10 +227,10 @@ live source に join しないので古い SCIP も優雅に serve できる。
 
 | やらないこと | 買ったもの | 代償（実測・実感） |
 |---|---|---|
-| 型推論（`x.f()` の受け手） | 0.5 s 構築、18 ms 増分、cfg 全ブランチ被覆 | syn のみの解決は 13–26% 止まり；精密は `bake`（40 s / 5 GB の RA 1 回）が要る |
+| 型推論（`x.f()` の受け手） | 0.3–0.5 s 構築、~6 ms 増分、cfg 全ブランチ被覆 | syn のみの解決は 15–28% 止まり；精密は `bake`（7–46 s / 1.1–2.3 GB の RA 1 回）が要る |
 | hover / 補完 / 診断 | 常駐ゼロ、LSP プロトコル不要 | 人間のエディタにはならない；型はエージェントが `cargo check` で得る |
 | マクロ展開 | per-file の parse 速度 | マクロ内で生まれる call / impl はどの層からも見えない |
-| 常駐サーバ / file watcher | RAM 0、運用ゼロ、SSH 先で動く | 毎クエリ ~10–20 ms の stat-walk が床；warm-µs の数字は in-process のみ |
+| 常駐サーバ / file watcher | RAM 0、運用ゼロ、SSH 先で動く | 毎クエリ 1–5 ms の stat-walk（CLI 往復まで含めて 7–20 ms）；warm-µs の数字は in-process のみ |
 | SCIP の as-is serve（代わりに live source へ位置 join） | 答えが常に今のコードを指す | 古い bake は精密 facts を落とす（Glean 戦で `refs → 0` を実地で踏んだ；`upd_since_bake` が警告） |
 | 推測（解決の偽装をしない） | 確実集合に誤検出ゼロ | エージェントは*候補*バケットの目視が残る |
 | 汎用クエリ言語（Angle/QL） | 学習コストゼロ、µs の答え | 任意の関係クエリ（taint tracking）は CodeQL の領分のまま |

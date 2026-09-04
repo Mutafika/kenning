@@ -5,7 +5,7 @@ corpus は tag 固定 (bench/corpus.sh)。乱数は固定 seed — 同じ環境�
 
 ## corpus: tokio
 
-corpus `~/.cache/kenning-bench/tokio` — 722 files / 28834 call-sites / 解決率 35.5% / **baked (SCIP)**
+corpus `~/.cache/kenning-bench/tokio` — 770 files / 28834 call-sites / 解決率 35.5% / **baked (SCIP)**
 
 ### quality — grep 相当ヒット vs 精密 callers (n=100, seed=42)
 
@@ -36,30 +36,30 @@ kenning 経路 = `callers <name>` の実出力 (別プロセス実行の実測)�
 
 | question | grep bytes | grep calls | cs bytes | cs calls | 圧縮比 |
 |---|---|---|---|---|---|
-| callers sleep | 115126 | 69 | 11544 | 1 | 10.0x |
-| callers registration | 27451 | 10 | 5495 | 1 | 5.0x |
-| callers shared | 15458 | 3 | 6998 | 1 | 2.2x |
-| callers enable_all | 44220 | 38 | 5352 | 1 | 8.3x |
-| callers insert_at | 12129 | 4 | 6150 | 1 | 2.0x |
-| callers worker_threads | 42209 | 37 | 5473 | 1 | 7.7x |
-| callers unbounded_channel | 23759 | 17 | 7245 | 1 | 3.3x |
-| callers run_one | 6149 | 3 | 5024 | 1 | 1.2x |
-| callers changed | 23694 | 13 | 4268 | 1 | 5.6x |
-| callers measure | 7381 | 3 | 5161 | 1 | 1.4x |
-| callers asyncify | 19670 | 25 | 3152 | 1 | 6.2x |
-| callers push_front | 18940 | 12 | 2803 | 1 | 6.8x |
-| callers filled | 27113 | 19 | 2549 | 1 | 10.6x |
-| callers put_slice | 32400 | 23 | 9111 | 1 | 3.6x |
-| callers sleep_until | 24500 | 16 | 4634 | 1 | 5.3x |
-| callers remaining | 25974 | 18 | 2809 | 1 | 9.2x |
-| callers run_until | 11344 | 6 | 2616 | 1 | 4.3x |
-| callers assume_init | 23654 | 15 | 3196 | 1 | 7.4x |
-| callers child_token | 6603 | 4 | 3037 | 1 | 2.2x |
-| callers socketpair | 4434 | 3 | 2625 | 1 | 1.7x |
+| callers sleep | 115856 | 70 | 15063 | 1 | 7.7x |
+| callers registration | 27112 | 10 | 6594 | 1 | 4.1x |
+| callers shared | 15239 | 3 | 9282 | 1 | 1.6x |
+| callers enable_all | 43935 | 38 | 5934 | 1 | 7.4x |
+| callers insert_at | 11934 | 4 | 8262 | 1 | 1.4x |
+| callers worker_threads | 41996 | 37 | 6380 | 1 | 6.6x |
+| callers unbounded_channel | 23621 | 17 | 9855 | 1 | 2.4x |
+| callers run_one | 6011 | 3 | 5651 | 1 | 1.1x |
+| callers changed | 23502 | 13 | 5615 | 1 | 4.2x |
+| callers measure | 7252 | 3 | 5821 | 1 | 1.2x |
+| callers asyncify | 19574 | 25 | 4654 | 1 | 4.2x |
+| callers push_front | 18865 | 12 | 3551 | 1 | 5.3x |
+| callers filled | 26987 | 19 | 3312 | 1 | 8.1x |
+| callers put_slice | 34037 | 24 | 11032 | 1 | 3.1x |
+| callers sleep_until | 24365 | 16 | 6599 | 1 | 3.7x |
+| callers remaining | 25863 | 18 | 3845 | 1 | 6.7x |
+| callers run_until | 11254 | 6 | 3099 | 1 | 3.6x |
+| callers assume_init | 23564 | 15 | 4361 | 1 | 5.4x |
+| callers child_token | 6534 | 4 | 3866 | 1 | 1.7x |
+| callers socketpair | 4362 | 3 | 3207 | 1 | 1.4x |
 
-**中央値**: 圧縮比 **5.3x**、grep 経路の tool 呼び出し 15 回 → 1 回
+**中央値**: 圧縮比 **4.1x**、grep 経路の tool 呼び出し 15 回 → 1 回
 
-**単発 wall-clock 中央値**: rg 19.9ms vs kenning 13.0ms (両者プロセス起動込み。
+**単発 wall-clock 中央値**: rg 18.2ms vs kenning 13.9ms (両者プロセス起動込み。
 kenning は鮮度チェック省略時 = デフォルトでは +stat-walk ~10ms。速さは互角 — 差は出力の精密さと bytes)
 
 ### agent — vs ast-grep (構造検索アプリ、同じ質問)
@@ -71,28 +71,28 @@ ast-grep は tree-sitter の構造一致: def/コメント/文字列のノイズ
 
 | question | ast-grep 一致 | bytes | ms (3 パターン計) | cs 確実+候補 | cs bytes | cs ms |
 |---|---|---|---|---|---|---|
-| callers sleep | 152 | 19908 | 392 | 105+47 | 11544 | 11.7 |
-| callers registration | 89 | 16295 | 526 | 89+0 | 5495 | 14.8 |
-| callers shared | 66 | 10598 | 369 | 66+0 | 6998 | 10.8 |
-| callers enable_all | 64 | 15356 | 448 | 63+0 | 5352 | 12.1 |
-| callers insert_at | 63 | 8640 | 372 | 63+0 | 6150 | 13.4 |
-| callers worker_threads | 56 | 14041 | 448 | 56+0 | 5473 | 12.6 |
-| callers unbounded_channel | 30 | 3753 | 465 | 52+7 | 7245 | 13.3 |
-| callers run_one | 45 | 4251 | 338 | 45+0 | 5024 | 11.7 |
-| callers changed | 42 | 4909 | 467 | 42+0 | 4268 | 15.4 |
-| callers measure | 42 | 4695 | 569 | 42+0 | 5161 | 11.1 |
-| callers asyncify | 32 | 4700 | 561 | 32+0 | 3152 | 20.3 |
-| callers push_front | 24 | 3249 | 623 | 24+0 | 2803 | 14.3 |
-| callers filled | 23 | 2788 | 415 | 23+0 | 2549 | 10.4 |
-| callers put_slice | 74 | 7978 | 353 | 23+51 | 9111 | 11.3 |
-| callers sleep_until | 39 | 5267 | 522 | 23+16 | 4634 | 11.7 |
-| callers remaining | 24 | 2999 | 394 | 22+2 | 2809 | 13.0 |
-| callers run_until | 22 | 25381 | 404 | 22+0 | 2616 | 14.7 |
-| callers assume_init | 27 | 3653 | 349 | 21+6 | 3196 | 12.5 |
-| callers child_token | 21 | 2944 | 423 | 21+0 | 3037 | 14.8 |
-| callers socketpair | 22 | 2820 | 628 | 21+1 | 2625 | 13.9 |
+| callers sleep | 152 | 19443 | 218 | 105+47 | 15063 | 11.5 |
+| callers registration | 89 | 15839 | 240 | 89+0 | 6594 | 11.9 |
+| callers shared | 66 | 10400 | 365 | 66+0 | 9282 | 14.7 |
+| callers enable_all | 64 | 14951 | 263 | 63+0 | 5934 | 15.0 |
+| callers insert_at | 63 | 8442 | 247 | 63+0 | 8262 | 13.3 |
+| callers worker_threads | 56 | 13681 | 332 | 56+0 | 6380 | 15.0 |
+| callers unbounded_channel | 30 | 3663 | 250 | 52+7 | 9855 | 14.6 |
+| callers run_one | 45 | 4116 | 249 | 45+0 | 5651 | 13.8 |
+| callers changed | 42 | 4783 | 335 | 42+0 | 5615 | 14.3 |
+| callers measure | 42 | 4569 | 234 | 42+0 | 5821 | 13.9 |
+| callers asyncify | 32 | 4586 | 255 | 32+0 | 4654 | 13.6 |
+| callers push_front | 24 | 3171 | 243 | 24+0 | 3551 | 31.8 |
+| callers filled | 23 | 2719 | 217 | 23+0 | 3312 | 13.8 |
+| callers put_slice | 74 | 7756 | 220 | 23+51 | 11032 | 13.1 |
+| callers sleep_until | 39 | 5150 | 251 | 23+16 | 6599 | 14.4 |
+| callers remaining | 24 | 2930 | 247 | 22+2 | 3845 | 13.9 |
+| callers run_until | 22 | 24679 | 255 | 22+0 | 3099 | 13.8 |
+| callers assume_init | 27 | 3572 | 250 | 21+6 | 4361 | 15.1 |
+| callers child_token | 21 | 2881 | 258 | 21+0 | 3866 | 13.6 |
+| callers socketpair | 22 | 2739 | 269 | 21+1 | 3207 | 13.5 |
 
-**中央値**: ast-grep 448ms / 4909B vs kenning 13.0ms / 5024B — 構造一致としては同数を拾うが、
+**中央値**: ast-grep 250ms / 4783B vs kenning 13.9ms / 5821B — 構造一致としては同数を拾うが、
 「どの定義か」の確定・impact/path/faceted は ast-grep には無い
 
 ### beyond-search — graph/構造クエリ (grep 経路モデル vs 実出力)
@@ -104,60 +104,92 @@ grep+Read を繰り返す手動 BFS (実際のエージェントの再帰探索�
 
 | question | 影響 syms | grep bytes | grep calls | cs bytes | 圧縮比 |
 |---|---|---|---|---|---|
-| impact sleep | 74 | 360312 | 321 | 7808 | 46x |
-| impact registration | 200 | 1685896 | 1022 | 15078 | 112x |
-| impact shared | 24 | 111162 | 80 | 3814 | 29x |
-| impact enable_all | 138 | 1819666 | 1171 | 14732 | 124x |
-| impact insert_at | 40 | 135426 | 123 | 6015 | 23x |
+| impact sleep | 74 | 365365 | 325 | 7643 | 48x |
+| impact registration | 200 | 1698553 | 1038 | 14718 | 115x |
+| impact shared | 24 | 110445 | 80 | 3742 | 30x |
+| impact enable_all | 138 | 1815184 | 1180 | 14387 | 126x |
+| impact insert_at | 40 | 136135 | 124 | 5895 | 23x |
 
-中央値: **46x**、tool 呼び出し 321 回 → 1 回
+中央値: **48x**、tool 呼び出し 325 回 → 1 回
 
 **impls** (trait→実装型、impl 数上位):
 
 | question | impls | grep bytes | grep calls | 圧縮比 |
 |---|---|---|---|---|
-| impls Debug | 138 | 116380 | 100 | 24.9x |
-| impls Drop | 91 | 111050 | 89 | 22.9x |
-| impls Future | 73 | 119257 | 94 | 26.0x |
-| impls Sync | 59 | 58477 | 45 | 12.8x |
-| impls Stream | 55 | 83026 | 70 | 17.3x |
+| impls Debug | 138 | 117626 | 101 | 26.0x |
+| impls Drop | 91 | 110618 | 89 | 23.6x |
+| impls Future | 73 | 119429 | 95 | 26.9x |
+| impls Sync | 59 | 59277 | 46 | 13.5x |
+| impls Stream | 55 | 85591 | 72 | 18.4x |
 
-中央値: **22.9x**
+中央値: **23.6x**
 
 **outline** (構造把握、最大 5 ファイル — 代替は Read 全文):
 
 | file | Read bytes | outline bytes | 圧縮比 |
 |---|---|---|---|
-| named_pipe.rs | 99154 | 12061 | 8x |
-| udp.rs | 84068 | 12051 | 7x |
-| bounded.rs | 64865 | 10622 | 6x |
-| builder.rs | 59923 | 6640 | 9x |
-| async_fd.rs | 58959 | 11710 | 5x |
+| CHANGELOG.md | 143415 | 4859 | 30x |
+| named_pipe.rs | 99154 | 11908 | 8x |
+| udp.rs | 84068 | 11898 | 7x |
+| bounded.rs | 64865 | 10469 | 6x |
+| builder.rs | 59923 | 6553 | 9x |
 
-中央値: **7x**
+中央値: **8x**
 
 **def** (定義+sig+doc、被呼上位 10 問 — 代替は `rg "fn NAME"` + 前後 Read):
 
-中央値: grep 1640 B / 2 回 → def 241 B / 1 回 = **6.3x**
+中央値: grep 1637 B / 2 回 → def 238 B / 1 回 = **6.4x**
 
-**faceted** (`kind:method vis:pub test:0`): 1300 件 315.458µs — grep では表現不能 (比較なし、能力差)
+**faceted** (`kind:method vis:pub test:0`): 1300 件 290.541µs — grep では表現不能 (比較なし、能力差)
+
+### text — 全文検索 vs rg (同じ語、同じ repo)
+
+問い = 「この語はどこ?」。rg 経路 = `rg -i -n <term>` (kenning text は大小無視なので -i)。
+kenning 経路 = `text <term> --limit 100000` の実出力。**ヒット数の一致**が主指標 —
+バイトは kenning が増える (行ごとに関数名 / 見出し階層を付けるため)。それが payload。
+
+| term | rg hits | rg ms | rg bytes | text hits | text ms | text bytes | 一致 |
+|---|---|---|---|---|---|---|---|
+| assert_eq | 2701 | 15 | 319769 | 2701 | 24 | 374607 | = |
+| unwrap | 2686 | 16 | 318940 | 2686 | 24 | 367798 | = |
+| Result | 2839 | 17 | 380851 | 2839 | 39 | 435412 | = |
+| runtime | 2482 | 25 | 327851 | 2482 | 23 | 370248 | = |
+| stream | 3200 | 16 | 415027 | 3200 | 22 | 476035 | = |
+| github | 1571 | 17 | 189393 | 1571 | 16 | 248234 | = |
+| assert | 6693 | 17 | 805288 | 6693 | 30 | 932314 | = |
+| future | 2545 | 15 | 328368 | 2545 | 23 | 368578 | = |
+| return | 3257 | 14 | 443672 | 3257 | 26 | 507918 | = |
+| handle | 2879 | 18 | 378121 | 2879 | 24 | 427659 | = |
+| thread | 2868 | 14 | 380972 | 2868 | 23 | 428817 | = |
+| Context | 1584 | 18 | 213427 | 1584 | 24 | 240731 | = |
+| feature | 1227 | 16 | 148931 | 1227 | 20 | 161248 | = |
+| struct | 1414 | 19 | 166367 | 1414 | 24 | 190203 | = |
+| channel | 1280 | 17 | 165719 | 1280 | 21 | 194170 | = |
+| method | 1186 | 15 | 173192 | 1186 | 20 | 197761 | = |
+| socket | 1847 | 16 | 237089 | 1847 | 17 | 274055 | = |
+| buffer | 1225 | 15 | 166630 | 1225 | 18 | 191065 | = |
+| unsafe | 1067 | 16 | 136843 | 1067 | 18 | 151971 | = |
+| function | 1070 | 16 | 153227 | 1070 | 19 | 178654 | = |
+
+**一致**: 20/20 問でヒット数が同一。**wall 中央値**: rg 16.2ms vs text 22.9ms
+(両者プロセス起動込み。text は `#` の件数行と文脈注釈を含んだ上でこの wall)
 
 ### micro — warm latency
 ```
-open(readonly): 215.459µs
-index: 722 files / 7156 symbols / 28834 call-sites
-  kind=fn                                              =    2300 件  [708ns]
-  pub fn                                               =      89 件  [4.541µs]
-  pub async fn 非test                                   =      38 件  [4.958µs]
-  def new                                              =     271 件  [208ns]
-  callers new (名前一致)                                   =    2242 件  [708ns]
-  callers new (確実 逆引き)                                 =       1 件  [166ns]
+open(readonly): 855.041µs
+index: 770 files / 7156 symbols / 28834 call-sites
+  kind=fn                                              =    2300 件  [541ns]
+  pub fn                                               =      89 件  [3.5µs]
+  pub async fn 非test                                   =      38 件  [3.791µs]
+  def new                                              =     271 件  [166ns]
+  callers new (名前一致)                                   =    2242 件  [583ns]
+  callers new (確実 逆引き)                                 =       1 件  [83ns]
 ```
 
 
 ## corpus: ripgrep
 
-corpus `~/.cache/kenning-bench/ripgrep` — 100 files / 12268 call-sites / 解決率 48.7% / **baked (SCIP)**
+corpus `~/.cache/kenning-bench/ripgrep` — 207 files / 12268 call-sites / 解決率 48.7% / **baked (SCIP)**
 
 ### quality — grep 相当ヒット vs 精密 callers (n=100, seed=42)
 
@@ -168,13 +200,13 @@ grep 相当 = `\bNAME\s*\(` の全ヒット (def/コメント/文字列/別型�
 |---|---|---|---|---|
 | parse_low_raw | 546 | 545 | 0 | 1 |
 | create | 447 | 4 | 5 | 438 |
-| path | 330 | 268 | 22 | 40 |
+| path | 333 | 268 | 22 | 43 |
 | line_number | 165 | 158 | 0 | 7 |
-| map | 138 | 14 | 120 | 4 |
+| map | 139 | 14 | 120 | 5 |
 | doc_short | 108 | 2 | 0 | 106 |
 | create_dir | 100 | 1 | 0 | 99 |
-| end | 82 | 55 | 25 | 2 |
-| get | 63 | 17 | 36 | 10 |
+| end | 83 | 55 | 25 | 3 |
+| get | 64 | 17 | 36 | 11 |
 | create_bytes | 47 | 1 | 0 | 46 |
 | … | (上位 10 件のみ表示) | | | |
 
@@ -188,30 +220,30 @@ kenning 経路 = `callers <name>` の実出力 (別プロセス実行の実測)�
 
 | question | grep bytes | grep calls | cs bytes | cs calls | 圧縮比 |
 |---|---|---|---|---|---|
-| callers parse_low_raw | 77308 | 3 | 5276 | 1 | 14.7x |
-| callers expected_no_line_number | 9823 | 3 | 5729 | 1 | 1.7x |
-| callers test | 8847 | 3 | 5710 | 1 | 1.5x |
-| callers unwrap_switch | 12273 | 3 | 4217 | 1 | 2.9x |
-| callers add_child | 8416 | 3 | 4278 | 1 | 2.0x |
-| callers assert_paths | 5207 | 2 | 3368 | 1 | 1.5x |
-| callers unwrap_value | 6380 | 3 | 3457 | 1 | 1.8x |
-| callers as_byte | 16373 | 10 | 3403 | 1 | 4.8x |
-| callers push_token | 4411 | 2 | 2395 | 1 | 1.8x |
-| callers with_path | 8391 | 5 | 2316 | 1 | 3.6x |
-| callers expected_with_line_number | 5363 | 3 | 2357 | 1 | 2.3x |
-| callers pos | 5818 | 4 | 2569 | 1 | 2.3x |
-| callers analysis | 2759 | 2 | 1559 | 1 | 1.8x |
-| callers wtr | 3538 | 2 | 1792 | 1 | 2.0x |
-| callers with_depth | 4531 | 3 | 1486 | 1 | 3.0x |
-| callers set_pos | 4060 | 3 | 1549 | 1 | 2.6x |
-| callers str | 2820 | 2 | 1306 | 1 | 2.2x |
-| callers build_glob_set | 2558 | 2 | 1308 | 1 | 2.0x |
-| callers heap_limit | 7872 | 5 | 1389 | 1 | 5.7x |
-| callers nice_err | 2567 | 2 | 1063 | 1 | 2.4x |
+| callers parse_low_raw | 75670 | 3 | 7995 | 1 | 9.5x |
+| callers expected_no_line_number | 9655 | 3 | 7083 | 1 | 1.4x |
+| callers test | 8679 | 3 | 6007 | 1 | 1.4x |
+| callers unwrap_switch | 12063 | 3 | 5594 | 1 | 2.2x |
+| callers add_child | 8302 | 3 | 6312 | 1 | 1.3x |
+| callers assert_paths | 5105 | 2 | 4399 | 1 | 1.2x |
+| callers unwrap_value | 6281 | 3 | 4873 | 1 | 1.3x |
+| callers as_byte | 16289 | 10 | 4570 | 1 | 3.6x |
+| callers push_token | 4345 | 2 | 3151 | 1 | 1.4x |
+| callers with_path | 8331 | 5 | 3319 | 1 | 2.5x |
+| callers expected_with_line_number | 5303 | 3 | 3009 | 1 | 1.8x |
+| callers pos | 5755 | 4 | 3374 | 1 | 1.7x |
+| callers analysis | 2711 | 2 | 1934 | 1 | 1.4x |
+| callers wtr | 3490 | 2 | 2341 | 1 | 1.5x |
+| callers with_depth | 4492 | 3 | 2078 | 1 | 2.2x |
+| callers set_pos | 4024 | 3 | 1833 | 1 | 2.2x |
+| callers str | 4592 | 3 | 1789 | 1 | 2.6x |
+| callers build_glob_set | 2525 | 2 | 1771 | 1 | 1.4x |
+| callers heap_limit | 7839 | 5 | 1825 | 1 | 4.3x |
+| callers nice_err | 2537 | 2 | 1505 | 1 | 1.7x |
 
-**中央値**: 圧縮比 **2.3x**、grep 経路の tool 呼び出し 3 回 → 1 回
+**中央値**: 圧縮比 **1.7x**、grep 経路の tool 呼び出し 3 回 → 1 回
 
-**単発 wall-clock 中央値**: rg 11.3ms vs kenning 6.5ms (両者プロセス起動込み。
+**単発 wall-clock 中央値**: rg 10.7ms vs kenning 8.3ms (両者プロセス起動込み。
 kenning は鮮度チェック省略時 = デフォルトでは +stat-walk ~10ms。速さは互角 — 差は出力の精密さと bytes)
 
 ### agent — vs ast-grep (構造検索アプリ、同じ質問)
@@ -223,28 +255,28 @@ ast-grep は tree-sitter の構造一致: def/コメント/文字列のノイズ
 
 | question | ast-grep 一致 | bytes | ms (3 パターン計) | cs 確実+候補 | cs bytes | cs ms |
 |---|---|---|---|---|---|---|
-| callers parse_low_raw | 545 | 79818 | 177 | 545+0 | 5276 | 7.3 |
-| callers expected_no_line_number | 55 | 27283 | 163 | 55+0 | 5729 | 6.4 |
-| callers test | 55 | 35978 | 194 | 55+0 | 5710 | 6.6 |
-| callers unwrap_switch | 39 | 4729 | 173 | 39+0 | 4217 | 6.6 |
-| callers add_child | 38 | 6798 | 157 | 38+0 | 4278 | 6.4 |
-| callers assert_paths | 33 | 13354 | 141 | 33+0 | 3368 | 6.9 |
-| callers unwrap_value | 32 | 4183 | 167 | 32+0 | 3457 | 6.5 |
-| callers as_byte | 27 | 3798 | 150 | 27+0 | 3403 | 6.5 |
-| callers push_token | 21 | 2715 | 148 | 21+0 | 2395 | 6.4 |
-| callers with_path | 20 | 3298 | 177 | 20+0 | 2316 | 6.6 |
-| callers expected_with_line_number | 19 | 11701 | 157 | 19+0 | 2357 | 8.1 |
-| callers pos | 19 | 2698 | 195 | 18+1 | 2569 | 6.6 |
-| callers analysis | 15 | 1623 | 155 | 15+0 | 1559 | 6.5 |
-| callers wtr | 13 | 1755 | 163 | 13+0 | 1792 | 6.1 |
-| callers with_depth | 12 | 2744 | 143 | 12+0 | 1486 | 6.4 |
-| callers set_pos | 11 | 1399 | 132 | 11+0 | 1549 | 6.4 |
-| callers str | 11 | 1430 | 167 | 11+0 | 1306 | 6.0 |
-| callers build_glob_set | 10 | 1326 | 142 | 10+0 | 1308 | 6.0 |
-| callers heap_limit | 10 | 2039 | 138 | 10+0 | 1389 | 5.8 |
-| callers nice_err | 10 | 1177 | 144 | 10+0 | 1063 | 6.3 |
+| callers parse_low_raw | 545 | 77997 | 119 | 545+0 | 7995 | 7.1 |
+| callers expected_no_line_number | 55 | 26623 | 116 | 55+0 | 7083 | 6.8 |
+| callers test | 55 | 35090 | 169 | 55+0 | 6007 | 7.1 |
+| callers unwrap_switch | 39 | 4612 | 162 | 39+0 | 5594 | 8.9 |
+| callers add_child | 38 | 6645 | 126 | 38+0 | 6312 | 8.5 |
+| callers assert_paths | 33 | 12988 | 149 | 33+0 | 4399 | 14.5 |
+| callers unwrap_value | 32 | 4087 | 179 | 32+0 | 4873 | 9.0 |
+| callers as_byte | 27 | 3717 | 178 | 27+0 | 4570 | 10.5 |
+| callers push_token | 21 | 2652 | 162 | 21+0 | 3151 | 8.3 |
+| callers with_path | 20 | 3226 | 189 | 20+0 | 3319 | 8.3 |
+| callers expected_with_line_number | 19 | 11422 | 137 | 19+0 | 3009 | 8.6 |
+| callers pos | 19 | 2641 | 155 | 18+1 | 3374 | 8.7 |
+| callers analysis | 15 | 1578 | 171 | 15+0 | 1934 | 10.4 |
+| callers wtr | 13 | 1716 | 135 | 13+0 | 2341 | 8.3 |
+| callers with_depth | 12 | 2681 | 132 | 12+0 | 2078 | 7.8 |
+| callers set_pos | 11 | 1366 | 125 | 11+0 | 1833 | 7.3 |
+| callers str | 11 | 1397 | 148 | 11+0 | 1789 | 7.6 |
+| callers build_glob_set | 10 | 1296 | 115 | 10+0 | 1771 | 7.5 |
+| callers heap_limit | 10 | 1994 | 128 | 10+0 | 1825 | 8.0 |
+| callers nice_err | 10 | 1147 | 142 | 10+0 | 1505 | 8.1 |
 
-**中央値**: ast-grep 157ms / 3298B vs kenning 6.5ms / 2395B — 構造一致としては同数を拾うが、
+**中央値**: ast-grep 148ms / 3226B vs kenning 8.3ms / 3319B — 構造一致としては同数を拾うが、
 「どの定義か」の確定・impact/path/faceted は ast-grep には無い
 
 ### beyond-search — graph/構造クエリ (grep 経路モデル vs 実出力)
@@ -256,11 +288,11 @@ grep+Read を繰り返す手動 BFS (実際のエージェントの再帰探索�
 
 | question | 影響 syms | grep bytes | grep calls | cs bytes | 圧縮比 |
 |---|---|---|---|---|---|
-| impact parse_low_raw | 105 | 209653 | 211 | 6412 | 33x |
-| impact expected_no_line_number | 34 | 62326 | 75 | 4778 | 13x |
-| impact test | 34 | 61350 | 75 | 4759 | 13x |
-| impact unwrap_switch | 41 | 36201 | 8 | 5160 | 7x |
-| impact add_child | 57 | 185686 | 159 | 7135 | 26x |
+| impact parse_low_raw | 105 | 207703 | 211 | 6259 | 33x |
+| impact expected_no_line_number | 34 | 62041 | 75 | 4676 | 13x |
+| impact test | 34 | 61065 | 75 | 4657 | 13x |
+| impact unwrap_switch | 41 | 35634 | 8 | 5037 | 7x |
+| impact add_child | 57 | 191914 | 163 | 6964 | 28x |
 
 中央値: **13x**、tool 呼び出し 75 回 → 1 回
 
@@ -268,48 +300,80 @@ grep+Read を繰り返す手動 BFS (実際のエージェントの再帰探索�
 
 | question | impls | grep bytes | grep calls | 圧縮比 |
 |---|---|---|---|---|
-| impls Flag | 104 | 15890 | 4 | 3.5x |
-| impls Default | 24 | 23090 | 17 | 10.3x |
-| impls Display | 17 | 20174 | 15 | 13.0x |
-| impls Error | 11 | 19352 | 13 | 10.3x |
-| impls Serialize | 10 | 6095 | 5 | 6.8x |
+| impls Flag | 104 | 15560 | 4 | 3.6x |
+| impls Default | 24 | 23015 | 17 | 10.6x |
+| impls Display | 17 | 20114 | 15 | 13.4x |
+| impls Error | 11 | 19253 | 13 | 10.6x |
+| impls Serialize | 10 | 6062 | 5 | 7.0x |
 
-中央値: **10.3x**
+中央値: **10.6x**
 
 **outline** (構造把握、最大 5 ファイル — 代替は Read 全文):
 
 | file | Read bytes | outline bytes | 圧縮比 |
 |---|---|---|---|
-| defs.rs | 235436 | 7947 | 30x |
-| standard.rs | 136288 | 12501 | 11x |
-| walk.rs | 88407 | 8941 | 10x |
-| glob.rs | 60771 | 9829 | 6x |
-| dir.rs | 58199 | 10818 | 5x |
+| defs.rs | 235436 | 7794 | 30x |
+| raw.csv | 226710 | 106 | 2139x |
+| standard.rs | 136288 | 12348 | 11x |
+| raw.csv | 114939 | 109 | 1054x |
+| raw.csv | 91922 | 107 | 859x |
 
-中央値: **10x**
+中央値: **859x**
 
 **def** (定義+sig+doc、被呼上位 10 問 — 代替は `rg "fn NAME"` + 前後 Read):
 
-中央値: grep 1482 B / 2 回 → def 247 B / 1 回 = **6.2x**
+中央値: grep 1479 B / 2 回 → def 244 B / 1 回 = **6.2x**
 
-**faceted** (`kind:method vis:pub test:0`): 477 件 140.583µs — grep では表現不能 (比較なし、能力差)
+**faceted** (`kind:method vis:pub test:0`): 477 件 174µs — grep では表現不能 (比較なし、能力差)
+
+### text — 全文検索 vs rg (同じ語、同じ repo)
+
+問い = 「この語はどこ?」。rg 経路 = `rg -i -n <term>` (kenning text は大小無視なので -i)。
+kenning 経路 = `text <term> --limit 100000` の実出力。**ヒット数の一致**が主指標 —
+バイトは kenning が増える (行ごとに関数名 / 見出し階層を付けるため)。それが payload。
+
+| term | rg hits | rg ms | rg bytes | text hits | text ms | text bytes | 一致 |
+|---|---|---|---|---|---|---|---|
+| subtitles | 3298 | 9 | 856322 | 3298 | 11 | 746164 | = |
+| ignore | 3475 | 9 | 566374 | 3473 | 12 | 585001 | ≠ |
+| OpenSubtitles2016 | 2349 | 9 | 637772 | 2349 | 9 | 547110 | = |
+| ripgrep | 1886 | 9 | 244360 | 1885 | 11 | 262354 | ≠ |
+| benchsuite | 1896 | 9 | 507042 | 1896 | 9 | 440490 | = |
+| Sherlock | 2133 | 9 | 421572 | 2139 | 10 | 383183 | ≠ |
+| Holmes | 1679 | 9 | 396369 | 1688 | 10 | 349402 | ≠ |
+| sample | 1580 | 8 | 406148 | 1580 | 9 | 343953 | = |
+| Холмс | 1406 | 9 | 379069 | 1406 | 9 | 339776 | = |
+| Шерлок | 1206 | 10 | 330816 | 1206 | 8 | 295258 | = |
+| assert_eq | 1296 | 9 | 158656 | 1296 | 10 | 177179 | = |
+| unwrap | 1306 | 10 | 165821 | 1306 | 11 | 185555 | = |
+| LC_ALL | 1103 | 10 | 281795 | 1103 | 7 | 244529 | = |
+| PM_RESUME | 969 | 9 | 175046 | 969 | 8 | 173294 | = |
+| matcher | 1200 | 9 | 151245 | 1194 | 10 | 171829 | ≠ |
+| github | 954 | 8 | 121749 | 886 | 10 | 116086 | ≠ |
+| BurntSushi | 806 | 9 | 102017 | 806 | 8 | 103321 | = |
+| matches | 972 | 9 | 123456 | 972 | 11 | 139052 | = |
+| return | 1307 | 9 | 164960 | 1308 | 12 | 188021 | ≠ |
+| pattern | 1002 | 10 | 143447 | 1002 | 11 | 155061 | = |
+
+**一致**: 13/20 問でヒット数が同一。差の内訳: 少ない 4 問 = 生成 lock (`Cargo.lock`) / >1MiB / binary の非索引分。 多い 3 問 = NUL を含む file (rg は binary 判定で打ち切り、kenning は最後まで読む)。**wall 中央値**: rg 9.1ms vs text 10.0ms
+(両者プロセス起動込み。text は `#` の件数行と文脈注釈を含んだ上でこの wall)
 
 ### micro — warm latency
 ```
-open(readonly): 235.167µs
-index: 100 files / 3192 symbols / 12268 call-sites
-  kind=fn                                              =     705 件  [250ns]
+open(readonly): 605.083µs
+index: 207 files / 3192 symbols / 12268 call-sites
+  kind=fn                                              =     705 件  [208ns]
   pub fn                                               =      30 件  [1.458µs]
-  pub async fn 非test                                   =       0 件  [166ns]
-  def new                                              =      84 件  [208ns]
-  callers new (名前一致)                                   =    1073 件  [416ns]
+  pub async fn 非test                                   =       0 件  [125ns]
+  def new                                              =      84 件  [166ns]
+  callers new (名前一致)                                   =    1073 件  [333ns]
   callers new (確実 逆引き)                                 =       3 件  [125ns]
 ```
 
 
 ## corpus: enchudb
 
-corpus `~/myapp/enchudb` — 175 files / 26131 call-sites / 解決率 39.8% / **baked (SCIP)**
+corpus `~/myapp/enchudb` — 295 files / 37022 call-sites / 解決率 43.2% / **baked (SCIP)**
 
 ### quality — grep 相当ヒット vs 精密 callers (n=100, seed=42)
 
@@ -318,19 +382,19 @@ grep 相当 = `\bNAME\s*\(` の全ヒット (def/コメント/文字列/別型�
 
 | symbol | grep hits | 確実 | 候補 | grep との差 (≈ノイズ) |
 |---|---|---|---|---|
-| tmp | 350 | 172 | 145 | 33 |
-| contains | 280 | 0 | 54 | 226 |
-| set | 268 | 237 | 9 | 22 |
-| create | 118 | 89 | 19 | 10 |
-| oplog_sync | 91 | 84 | 0 | 7 |
-| make_eid | 83 | 68 | 0 | 15 |
-| max | 78 | 3 | 45 | 30 |
-| tie_async | 75 | 71 | 0 | 4 |
-| merge | 52 | 0 | 46 | 6 |
-| publish_since | 42 | 36 | 0 | 6 |
+| cleanup | 861 | 752 | 0 | 109 |
+| oplog_sync | 145 | 128 | 0 | 17 |
+| with_capacity | 130 | 36 | 84 | 10 |
+| filter | 119 | 8 | 99 | 12 |
+| open_standalone | 108 | 105 | 0 | 3 |
+| publish_since | 104 | 95 | 0 | 9 |
+| as_bytes | 100 | 0 | 73 | 27 |
+| value | 48 | 17 | 6 | 25 |
+| vocab_id | 46 | 37 | 0 | 9 |
+| remote_tie_apply | 35 | 15 | 0 | 20 |
 | … | (上位 10 件のみ表示) | | | |
 
-**中央値**: grep 5 行 → 確実 3 + 候補 0 = 検討対象 4 行、ノイズ率 33%
+**中央値**: grep 4 行 → 確実 2 + 候補 0 = 検討対象 2 行、ノイズ率 33%
 
 ### agent — 「誰が呼ぶ?」20 問の tool 出力バイト比較
 
@@ -340,30 +404,30 @@ kenning 経路 = `callers <name>` の実出力 (別プロセス実行の実測)�
 
 | question | grep bytes | grep calls | cs bytes | cs calls | 圧縮比 |
 |---|---|---|---|---|---|
-| callers tie | 102038 | 47 | 4784 | 1 | 21.3x |
-| callers define_himo | 135464 | 68 | 4895 | 1 | 27.7x |
-| callers clone | 191952 | 76 | 11198 | 1 | 17.1x |
-| callers create_standalone | 93788 | 47 | 4955 | 1 | 18.9x |
-| callers number | 39495 | 19 | 5770 | 1 | 6.8x |
-| callers eid_local | 51232 | 23 | 5035 | 1 | 10.2x |
-| callers flush_writes | 64260 | 37 | 5939 | 1 | 10.8x |
-| callers entity_in | 59139 | 29 | 6409 | 1 | 9.2x |
-| callers tie_text | 54113 | 29 | 5254 | 1 | 10.3x |
-| callers open_concurrent_with_oplog | 60610 | 32 | 5518 | 1 | 11.0x |
-| callers define_table | 56963 | 30 | 6209 | 1 | 9.2x |
-| callers open_standalone | 60133 | 34 | 5863 | 1 | 10.3x |
-| callers define_himo_in | 61281 | 31 | 6013 | 1 | 10.2x |
-| callers oplog_sync | 58437 | 34 | 5664 | 1 | 10.3x |
-| callers oplog_commit | 50484 | 30 | 6257 | 1 | 8.1x |
-| callers create_with_capacity | 47044 | 25 | 5958 | 1 | 7.9x |
-| callers tie_async | 33669 | 19 | 4995 | 1 | 6.7x |
-| callers make_eid | 42627 | 21 | 5405 | 1 | 7.9x |
-| callers tie_to | 31923 | 17 | 6692 | 1 | 4.8x |
-| callers append | 19174 | 8 | 5582 | 1 | 3.4x |
+| callers tie | 140495 | 67 | 6118 | 1 | 23.0x |
+| callers define_himo | 160026 | 79 | 7569 | 1 | 21.1x |
+| callers entity_in | 156951 | 79 | 8589 | 1 | 18.3x |
+| callers create_standalone | 106037 | 52 | 7843 | 1 | 13.5x |
+| callers define_himo_in | 161746 | 84 | 9490 | 1 | 17.0x |
+| callers define_table | 154109 | 83 | 8570 | 1 | 18.0x |
+| callers flush_writes | 110881 | 64 | 7126 | 1 | 15.6x |
+| callers eid_local | 70423 | 30 | 7636 | 1 | 9.2x |
+| callers number | 63553 | 29 | 7752 | 1 | 8.2x |
+| callers oplog_sync | 108003 | 62 | 7873 | 1 | 13.7x |
+| callers tie_to | 82714 | 46 | 8298 | 1 | 10.0x |
+| callers oplog_commit | 93794 | 56 | 7483 | 1 | 12.5x |
+| callers open_concurrent_with_oplog | 79958 | 41 | 10030 | 1 | 8.0x |
+| callers pull_once | 57695 | 28 | 8422 | 1 | 6.9x |
+| callers open_standalone | 73729 | 41 | 8542 | 1 | 8.6x |
+| callers tie_text | 66964 | 36 | 7655 | 1 | 8.7x |
+| callers publish_since | 51797 | 25 | 8441 | 1 | 6.1x |
+| callers transfer_oplog_to_sync_ops | 70834 | 38 | 7976 | 1 | 8.9x |
+| callers remove_db | 73537 | 44 | 7669 | 1 | 9.6x |
+| callers enable_sync_tables | 100171 | 53 | 8180 | 1 | 12.2x |
 
-**中央値**: 圧縮比 **10.2x**、grep 経路の tool 呼び出し 30 回 → 1 回
+**中央値**: 圧縮比 **12.2x**、grep 経路の tool 呼び出し 52 回 → 1 回
 
-**単発 wall-clock 中央値**: rg 11.0ms vs kenning 6.6ms (両者プロセス起動込み。
+**単発 wall-clock 中央値**: rg 11.5ms vs kenning 12.0ms (両者プロセス起動込み。
 kenning は鮮度チェック省略時 = デフォルトでは +stat-walk ~10ms。速さは互角 — 差は出力の精密さと bytes)
 
 ### agent — vs ast-grep (構造検索アプリ、同じ質問)
@@ -375,28 +439,28 @@ ast-grep は tree-sitter の構造一致: def/コメント/文字列のノイズ
 
 | question | ast-grep 一致 | bytes | ms (3 パターン計) | cs 確実+候補 | cs bytes | cs ms |
 |---|---|---|---|---|---|---|
-| callers tie | 338 | 33620 | 209 | 338+0 | 4784 | 6.4 |
-| callers define_himo | 324 | 36927 | 268 | 324+0 | 4895 | 6.5 |
-| callers clone | 622 | 60718 | 235 | 224+398 | 11198 | 7.2 |
-| callers create_standalone | 217 | 27302 | 227 | 217+0 | 4955 | 6.5 |
-| callers number | 114 | 19241 | 217 | 124+0 | 5770 | 6.8 |
-| callers eid_local | 119 | 16745 | 247 | 119+0 | 5035 | 7.0 |
-| callers flush_writes | 117 | 10663 | 236 | 117+0 | 5939 | 6.6 |
-| callers entity_in | 114 | 14342 | 234 | 114+0 | 6409 | 6.4 |
-| callers tie_text | 95 | 11448 | 246 | 95+0 | 5254 | 6.7 |
-| callers open_concurrent_with_oplog | 91 | 13281 | 228 | 91+0 | 5518 | 8.3 |
-| callers define_table | 87 | 10839 | 213 | 87+0 | 6209 | 6.6 |
-| callers open_standalone | 85 | 10799 | 211 | 85+0 | 5863 | 6.6 |
-| callers define_himo_in | 84 | 12734 | 241 | 84+0 | 6013 | 6.6 |
-| callers oplog_sync | 84 | 8319 | 245 | 84+0 | 5664 | 6.8 |
-| callers oplog_commit | 82 | 7754 | 244 | 82+0 | 6257 | 6.6 |
-| callers create_with_capacity | 81 | 11231 | 229 | 81+0 | 5958 | 6.2 |
-| callers tie_async | 71 | 7125 | 209 | 71+0 | 4995 | 6.5 |
-| callers make_eid | 68 | 9135 | 229 | 68+0 | 5405 | 6.4 |
-| callers tie_to | 68 | 7927 | 203 | 68+0 | 6692 | 6.1 |
-| callers append | 66 | 11383 | 217 | 64+2 | 5582 | 6.2 |
+| callers tie | 382 | 38098 | 308 | 382+0 | 6118 | 11.0 |
+| callers define_himo | 350 | 40571 | 313 | 350+0 | 7569 | 11.6 |
+| callers entity_in | 230 | 28501 | 313 | 230+0 | 8589 | 13.0 |
+| callers create_standalone | 218 | 27457 | 307 | 218+0 | 7843 | 12.0 |
+| callers define_himo_in | 181 | 27272 | 294 | 181+0 | 9490 | 13.0 |
+| callers define_table | 177 | 21829 | 319 | 177+0 | 8570 | 12.3 |
+| callers flush_writes | 166 | 16131 | 303 | 166+0 | 7126 | 11.9 |
+| callers eid_local | 142 | 20070 | 303 | 142+0 | 7636 | 12.2 |
+| callers number | 128 | 22251 | 283 | 138+0 | 7752 | 9.7 |
+| callers oplog_sync | 128 | 13343 | 288 | 128+0 | 7873 | 12.4 |
+| callers tie_to | 127 | 14971 | 272 | 127+0 | 8298 | 11.4 |
+| callers oplog_commit | 117 | 11398 | 315 | 117+0 | 7483 | 10.4 |
+| callers open_concurrent_with_oplog | 114 | 16909 | 294 | 114+0 | 10030 | 13.9 |
+| callers pull_once | 108 | 11305 | 319 | 108+0 | 8422 | 10.9 |
+| callers open_standalone | 105 | 13714 | 321 | 105+0 | 8542 | 14.9 |
+| callers tie_text | 100 | 12269 | 340 | 100+0 | 7655 | 12.6 |
+| callers publish_since | 95 | 11458 | 304 | 95+0 | 8441 | 10.9 |
+| callers transfer_oplog_to_sync_ops | 84 | 9717 | 331 | 84+0 | 7976 | 13.6 |
+| callers remove_db | 83 | 9772 | 275 | 83+0 | 7669 | 10.5 |
+| callers enable_sync_tables | 82 | 9531 | 287 | 82+0 | 8180 | 11.4 |
 
-**中央値**: ast-grep 229ms / 11448B vs kenning 6.6ms / 5770B — 構造一致としては同数を拾うが、
+**中央値**: ast-grep 307ms / 16131B vs kenning 12.0ms / 7976B — 構造一致としては同数を拾うが、
 「どの定義か」の確定・impact/path/faceted は ast-grep には無い
 
 ### beyond-search — graph/構造クエリ (grep 経路モデル vs 実出力)
@@ -408,60 +472,92 @@ grep+Read を繰り返す手動 BFS (実際のエージェントの再帰探索�
 
 | question | 影響 syms | grep bytes | grep calls | cs bytes | 圧縮比 |
 |---|---|---|---|---|---|
-| impact tie | 307 | 912983 | 808 | 18606 | 49x |
-| impact define_himo | 343 | 985599 | 866 | 18706 | 53x |
-| impact clone | 77 | 323987 | 228 | 6259 | 52x |
-| impact create_standalone | 417 | 1130816 | 1070 | 18149 | 62x |
-| impact number | 76 | 195890 | 192 | 9158 | 21x |
+| impact tie | 362 | 1240989 | 1012 | 21699 | 57x |
+| impact define_himo | 437 | 1444225 | 1179 | 20829 | 69x |
+| impact entity_in | 603 | 3407034 | 2234 | 40353 | 84x |
+| impact create_standalone | 451 | 2008456 | 1438 | 19369 | 104x |
+| impact define_himo_in | 439 | 2036877 | 1384 | 23250 | 88x |
 
-中央値: **52x**、tool 呼び出し 808 回 → 1 回
+中央値: **84x**、tool 呼び出し 1384 回 → 1 回
 
 **impls** (trait→実装型、impl 数上位):
 
 | question | impls | grep bytes | grep calls | 圧縮比 |
 |---|---|---|---|---|
-| impls Sync | 16 | 26640 | 16 | 20.0x |
-| impls Send | 15 | 27045 | 16 | 21.5x |
-| impls Drop | 14 | 17682 | 12 | 15.0x |
-| impls Default | 11 | 14061 | 12 | 15.8x |
-| impls From | 9 | 6154 | 5 | 8.9x |
+| impls Drop | 17 | 19498 | 13 | 13.9x |
+| impls Sync | 17 | 29036 | 17 | 20.4x |
+| impls Send | 16 | 29130 | 17 | 21.6x |
+| impls Default | 12 | 16571 | 13 | 17.0x |
+| impls From | 10 | 8057 | 6 | 10.4x |
 
-中央値: **15.8x**
+中央値: **17.0x**
 
 **outline** (構造把握、最大 5 ファイル — 代替は Read 全文):
 
 | file | Read bytes | outline bytes | 圧縮比 |
 |---|---|---|---|
-| engine.rs | 442565 | 10446 | 42x |
-| lib.rs | 118459 | 9708 | 12x |
-| oplog.rs | 82256 | 7148 | 12x |
-| lib.rs | 69756 | 8688 | 8x |
-| dist_dashboard.rs | 47651 | 5994 | 8x |
+| engine.rs | 829572 | 11610 | 71x |
+| CHANGELOG.md | 368129 | 6496 | 57x |
+| lib.rs | 133158 | 10031 | 13x |
+| oplog.rs | 106684 | 7519 | 14x |
+| sync.rs | 105249 | 10332 | 10x |
 
-中央値: **12x**
+中央値: **14x**
 
 **def** (定義+sig+doc、被呼上位 10 問 — 代替は `rg "fn NAME"` + 前後 Read):
 
-中央値: grep 2373 B / 2 回 → def 221 B / 1 回 = **9.7x**
+中央値: grep 2340 B / 2 回 → def 270 B / 1 回 = **8.7x**
 
-**faceted** (`kind:method vis:pub test:0`): 823 件 171.875µs — grep では表現不能 (比較なし、能力差)
+**faceted** (`kind:method vis:pub test:0`): 1049 件 221.041µs — grep では表現不能 (比較なし、能力差)
+
+### text — 全文検索 vs rg (同じ語、同じ repo)
+
+問い = 「この語はどこ?」。rg 経路 = `rg -i -n <term>` (kenning text は大小無視なので -i)。
+kenning 経路 = `text <term> --limit 100000` の実出力。**ヒット数の一致**が主指標 —
+バイトは kenning が増える (行ごとに関数名 / 見出し階層を付けるため)。それが payload。
+
+| term | rg hits | rg ms | rg bytes | text hits | text ms | text bytes | 一致 |
+|---|---|---|---|---|---|---|---|
+| unwrap | 4641 | 11 | 588311 | 4641 | 20 | 708537 | = |
+| assert_eq | 2122 | 11 | 264621 | 2122 | 15 | 329341 | = |
+| Engine | 2793 | 11 | 387712 | 2787 | 17 | 472371 | ≠ |
+| format | 1355 | 11 | 179180 | 1355 | 15 | 204033 | = |
+| assert | 3574 | 11 | 448725 | 3568 | 17 | 564122 | ≠ |
+| entity | 2234 | 10 | 303790 | 2234 | 15 | 372214 | = |
+| return | 1042 | 11 | 124846 | 1042 | 12 | 141061 | = |
+| cleanup | 876 | 10 | 82901 | 876 | 12 | 111948 | = |
+| ValueType | 846 | 10 | 106174 | 846 | 12 | 123558 | = |
+| enchudb | 2239 | 10 | 288666 | 2199 | 15 | 329404 | ≠ |
+| author | 1160 | 10 | 170149 | 1160 | 12 | 215453 | = |
+| engine | 2793 | 10 | 387712 | 2787 | 17 | 472371 | ≠ |
+| enchudb_oplog | 793 | 11 | 105879 | 793 | 12 | 121694 | = |
+| himo_id | 751 | 11 | 104080 | 751 | 12 | 120278 | = |
+| record | 1411 | 12 | 205089 | 1411 | 13 | 253253 | = |
+| Ordering | 676 | 10 | 89131 | 676 | 11 | 100478 | = |
+| schema | 936 | 10 | 133715 | 923 | 12 | 159313 | ≠ |
+| remove_file | 620 | 11 | 76292 | 620 | 13 | 87526 | = |
+| String | 948 | 11 | 119279 | 936 | 14 | 134739 | ≠ |
+| transport | 743 | 9 | 101927 | 740 | 11 | 127678 | ≠ |
+
+**一致**: 13/20 問でヒット数が同一。差の内訳: 少ない 7 問 = 生成 lock (`Cargo.lock`) / >1MiB / binary の非索引分。**wall 中央値**: rg 10.7ms vs text 12.9ms
+(両者プロセス起動込み。text は `#` の件数行と文脈注釈を含んだ上でこの wall)
 
 ### micro — warm latency
 ```
-open(readonly): 198.542µs
-index: 175 files / 2905 symbols / 26131 call-sites
-  kind=fn                                              =    1395 件  [416ns]
-  pub fn                                               =      42 件  [2.125µs]
-  pub async fn 非test                                   =       0 件  [250ns]
-  def new                                              =      48 件  [166ns]
-  callers new (名前一致)                                   =    1496 件  [458ns]
-  callers new (確実 逆引き)                                 =      10 件  [83ns]
+open(readonly): 776.5µs
+index: 295 files / 4099 symbols / 37022 call-sites
+  kind=fn                                              =    2080 件  [500ns]
+  pub fn                                               =      74 件  [2.917µs]
+  pub async fn 非test                                   =       0 件  [208ns]
+  def new                                              =      50 件  [125ns]
+  callers new (名前一致)                                   =    1965 件  [500ns]
+  callers new (確実 逆引き)                                 =      10 件  [125ns]
 ```
 
 
 ## corpus: kenning
 
-corpus `~/myapp/kenning` — 2 files / 2418 call-sites / 解決率 13.5% / syn-only (未 bake)
+corpus `~/myapp/kenning` — 20 files / 4436 call-sites / 解決率 16.0% / **baked (SCIP)**
 
 ### quality — grep 相当ヒット vs 精密 callers (n=100, seed=42)
 
@@ -470,19 +566,19 @@ grep 相当 = `\bNAME\s*\(` の全ヒット (def/コメント/文字列/別型�
 
 | symbol | grep hits | 確実 | 候補 | grep との差 (≈ノイズ) |
 |---|---|---|---|---|
-| txt | 41 | 37 | 0 | 4 |
-| num | 29 | 23 | 0 | 6 |
-| next | 28 | 23 | 0 | 5 |
-| drop | 16 | 15 | 0 | 1 |
-| ref_of | 16 | 15 | 0 | 1 |
-| parse_opts | 14 | 13 | 0 | 1 |
-| open_ro | 13 | 12 | 0 | 1 |
-| file_paths | 12 | 11 | 0 | 1 |
-| line_of | 11 | 10 | 0 | 1 |
-| col_of | 10 | 9 | 0 | 1 |
+| txt | 44 | 40 | 0 | 4 |
+| query | 43 | 35 | 0 | 8 |
+| index | 28 | 11 | 0 | 17 |
+| ref_of | 22 | 21 | 0 | 1 |
+| file_paths | 17 | 16 | 0 | 1 |
+| tmp | 17 | 16 | 0 | 1 |
+| write_fixture | 15 | 14 | 0 | 1 |
+| tmp_tree | 12 | 11 | 0 | 1 |
+| fmt_sym | 11 | 1 | 0 | 10 |
+| acquire | 10 | 6 | 0 | 4 |
 | … | (上位 10 件のみ表示) | | | |
 
-**中央値**: grep 3 行 → 確実 1 + 候補 0 = 検討対象 1 行、ノイズ率 50%
+**中央値**: grep 3 行 → 確実 2 + 候補 0 = 検討対象 2 行、ノイズ率 33%
 
 ### agent — 「誰が呼ぶ?」20 問の tool 出力バイト比較
 
@@ -492,30 +588,30 @@ kenning 経路 = `callers <name>` の実出力 (別プロセス実行の実測)�
 
 | question | grep bytes | grep calls | cs bytes | cs calls | 圧縮比 |
 |---|---|---|---|---|---|
-| callers txt | 6681 | 2 | 2848 | 1 | 2.3x |
-| callers next | 6847 | 3 | 1822 | 1 | 3.8x |
-| callers num | 5702 | 2 | 1839 | 1 | 3.1x |
-| callers drop | 2988 | 2 | 1340 | 1 | 2.2x |
-| callers ref_of | 4100 | 2 | 1283 | 1 | 3.2x |
-| callers parse_opts | 3009 | 2 | 1128 | 1 | 2.7x |
-| callers open_ro | 2887 | 2 | 1058 | 1 | 2.7x |
-| callers file_paths | 2693 | 2 | 995 | 1 | 2.7x |
-| callers line_of | 2972 | 2 | 953 | 1 | 3.1x |
-| callers col_of | 2867 | 2 | 882 | 1 | 3.3x |
-| callers first_doc_line | 2124 | 2 | 705 | 1 | 3.0x |
-| callers record_symbol | 1891 | 2 | 704 | 1 | 2.7x |
-| callers classify_vis | 2903 | 2 | 634 | 1 | 4.6x |
-| callers read_meta | 2600 | 2 | 662 | 1 | 3.9x |
-| callers rust_files | 2584 | 2 | 684 | 1 | 3.8x |
-| callers timed | 2560 | 2 | 647 | 1 | 4.0x |
-| callers defs_of | 2479 | 2 | 572 | 1 | 4.3x |
-| callers cs_run_bytes | 2296 | 2 | 516 | 1 | 4.4x |
-| callers now_secs | 2248 | 2 | 511 | 1 | 4.4x |
-| callers repo_root_of | 2279 | 2 | 510 | 1 | 4.5x |
+| callers txt | 6843 | 2 | 4936 | 1 | 1.4x |
+| callers num | 7395 | 2 | 5024 | 1 | 1.5x |
+| callers query | 8231 | 3 | 5308 | 1 | 1.6x |
+| callers next | 7222 | 3 | 3884 | 1 | 1.9x |
+| callers drop | 3353 | 2 | 2570 | 1 | 1.3x |
+| callers ref_of | 4822 | 2 | 3215 | 1 | 1.5x |
+| callers open_ro | 3538 | 2 | 2123 | 1 | 1.7x |
+| callers file_paths | 3043 | 2 | 1771 | 1 | 1.7x |
+| callers parse_opts | 3149 | 2 | 1718 | 1 | 1.8x |
+| callers tmp | 2272 | 2 | 2024 | 1 | 1.1x |
+| callers write_fixture | 2447 | 2 | 2032 | 1 | 1.2x |
+| callers index | 17301 | 7 | 1435 | 1 | 12.1x |
+| callers kenning | 16876 | 8 | 1680 | 1 | 10.0x |
+| callers tmp_tree | 2810 | 2 | 1556 | 1 | 1.8x |
+| callers line_of | 3181 | 2 | 1682 | 1 | 1.9x |
+| callers col_of | 3014 | 2 | 1578 | 1 | 1.9x |
+| callers indexed_fixture | 3059 | 2 | 1605 | 1 | 1.9x |
+| callers quiet | 3531 | 2 | 948 | 1 | 3.7x |
+| callers read_meta | 2840 | 2 | 1290 | 1 | 2.2x |
+| callers suggest_similar | 2699 | 2 | 1035 | 1 | 2.6x |
 
-**中央値**: 圧縮比 **3.3x**、grep 経路の tool 呼び出し 2 回 → 1 回
+**中央値**: 圧縮比 **1.8x**、grep 経路の tool 呼び出し 2 回 → 1 回
 
-**単発 wall-clock 中央値**: rg 7.6ms vs kenning 4.0ms (両者プロセス起動込み。
+**単発 wall-clock 中央値**: rg 6.5ms vs kenning 5.1ms (両者プロセス起動込み。
 kenning は鮮度チェック省略時 = デフォルトでは +stat-walk ~10ms。速さは互角 — 差は出力の精密さと bytes)
 
 ### agent — vs ast-grep (構造検索アプリ、同じ質問)
@@ -527,28 +623,28 @@ ast-grep は tree-sitter の構造一致: def/コメント/文字列のノイズ
 
 | question | ast-grep 一致 | bytes | ms (3 パターン計) | cs 確実+候補 | cs bytes | cs ms |
 |---|---|---|---|---|---|---|
-| callers txt | 37 | 4181 | 75 | 37+0 | 2848 | 3.1 |
-| callers next | 23 | 3062 | 108 | 23+0 | 1822 | 10.4 |
-| callers num | 23 | 2619 | 75 | 23+0 | 1839 | 3.6 |
-| callers drop | 15 | 1100 | 70 | 15+0 | 1340 | 4.6 |
-| callers ref_of | 15 | 2176 | 72 | 15+0 | 1283 | 3.3 |
-| callers parse_opts | 13 | 1137 | 71 | 13+0 | 1128 | 3.2 |
-| callers open_ro | 12 | 1248 | 70 | 12+0 | 1058 | 4.1 |
-| callers file_paths | 11 | 991 | 72 | 11+0 | 995 | 3.9 |
-| callers line_of | 10 | 1403 | 72 | 10+0 | 953 | 3.1 |
-| callers col_of | 9 | 1290 | 75 | 9+0 | 882 | 3.3 |
-| callers first_doc_line | 7 | 662 | 143 | 7+0 | 705 | 4.4 |
-| callers record_symbol | 7 | 4696 | 181 | 7+0 | 704 | 8.6 |
-| callers classify_vis | 6 | 890 | 144 | 6+0 | 634 | 7.2 |
-| callers read_meta | 6 | 613 | 102 | 6+0 | 662 | 4.0 |
-| callers rust_files | 6 | 567 | 91 | 6+0 | 684 | 3.9 |
-| callers timed | 6 | 1558 | 88 | 6+0 | 647 | 5.2 |
-| callers defs_of | 5 | 532 | 83 | 5+0 | 572 | 3.9 |
-| callers cs_run_bytes | 4 | 466 | 81 | 4+0 | 516 | 4.0 |
-| callers now_secs | 4 | 584 | 81 | 4+0 | 511 | 4.1 |
-| callers repo_root_of | 4 | 422 | 82 | 4+0 | 510 | 3.9 |
+| callers txt | 40 | 4361 | 109 | 40+0 | 4936 | 5.0 |
+| callers num | 38 | 4048 | 110 | 38+0 | 5024 | 5.0 |
+| callers query | 35 | 3478 | 109 | 35+0 | 5308 | 5.4 |
+| callers next | 29 | 3603 | 105 | 29+0 | 3884 | 5.2 |
+| callers drop | 24 | 1587 | 109 | 24+0 | 2570 | 5.0 |
+| callers ref_of | 21 | 2834 | 107 | 21+0 | 3215 | 4.8 |
+| callers open_ro | 17 | 1673 | 105 | 17+0 | 2123 | 5.7 |
+| callers file_paths | 16 | 1340 | 106 | 16+0 | 1771 | 5.0 |
+| callers parse_opts | 16 | 1289 | 107 | 16+0 | 1718 | 5.4 |
+| callers tmp | 16 | 1045 | 107 | 16+0 | 2024 | 5.0 |
+| callers write_fixture | 14 | 1150 | 89 | 14+0 | 2032 | 4.3 |
+| callers index | 11 | 735 | 108 | 11+0 | 1435 | 4.8 |
+| callers kenning | 11 | 960 | 107 | 11+0 | 1680 | 4.4 |
+| callers tmp_tree | 11 | 908 | 107 | 11+0 | 1556 | 5.5 |
+| callers line_of | 10 | 1439 | 106 | 10+0 | 1682 | 5.2 |
+| callers col_of | 9 | 1332 | 109 | 9+0 | 1578 | 5.1 |
+| callers indexed_fixture | 9 | 885 | 117 | 9+0 | 1605 | 6.8 |
+| callers quiet | 9 | 590 | 108 | 9+0 | 948 | 11.8 |
+| callers read_meta | 9 | 919 | 108 | 9+0 | 1290 | 5.4 |
+| callers suggest_similar | 8 | 742 | 106 | 8+0 | 1035 | 4.9 |
 
-**中央値**: ast-grep 81ms / 1137B vs kenning 4.0ms / 882B — 構造一致としては同数を拾うが、
+**中央値**: ast-grep 107ms / 1332B vs kenning 5.1ms / 1771B — 構造一致としては同数を拾うが、
 「どの定義か」の確定・impact/path/faceted は ast-grep には無い
 
 ### beyond-search — graph/構造クエリ (grep 経路モデル vs 実出力)
@@ -560,38 +656,73 @@ grep+Read を繰り返す手動 BFS (実際のエージェントの再帰探索�
 
 | question | 影響 syms | grep bytes | grep calls | cs bytes | 圧縮比 |
 |---|---|---|---|---|---|
-| impact txt | 46 | 145469 | 109 | 4307 | 34x |
-| impact next | 43 | 136812 | 105 | 4034 | 34x |
-| impact num | 41 | 131899 | 99 | 3886 | 34x |
-| impact drop | 24 | 92028 | 65 | 2358 | 39x |
-| impact ref_of | 26 | 87398 | 65 | 2499 | 35x |
+| impact txt | 76 | 227704 | 174 | 6818 | 33x |
+| impact num | 72 | 217414 | 166 | 6508 | 33x |
+| impact query | 17 | 41257 | 35 | 2074 | 20x |
+| impact next | 82 | 241780 | 188 | 7355 | 33x |
+| impact drop | 41 | 138201 | 102 | 4048 | 34x |
 
-中央値: **34x**、tool 呼び出し 99 回 → 1 回
+中央値: **33x**、tool 呼び出し 166 回 → 1 回
 
 **outline** (構造把握、最大 5 ファイル — 代替は Read 全文):
 
 | file | Read bytes | outline bytes | 圧縮比 |
 |---|---|---|---|
-| kenning.rs | 152494 | 7817 | 20x |
-| main.rs | 6814 | 136 | 50x |
+| kenning.rs | 290626 | 7325 | 40x |
+| RESULTS.md | 28152 | 3511 | 8x |
+| core.rs | 26910 | 5813 | 5x |
+| README.ja.md | 18786 | 657 | 29x |
+| README.md | 17047 | 593 | 29x |
 
-中央値: **50x**
+中央値: **29x**
 
 **def** (定義+sig+doc、被呼上位 10 問 — 代替は `rg "fn NAME"` + 前後 Read):
 
-中央値: grep 1615 B / 2 回 → def 149 B / 1 回 = **10.2x**
+中央値: grep 1671 B / 2 回 → def 139 B / 1 回 = **11.7x**
 
-**faceted** (`kind:method vis:pub test:0`): 0 件 138.209µs — grep では表現不能 (比較なし、能力差)
+**faceted** (`kind:method vis:pub test:0`): 0 件 133.5µs — grep では表現不能 (比較なし、能力差)
+
+### text — 全文検索 vs rg (同じ語、同じ repo)
+
+問い = 「この語はどこ?」。rg 経路 = `rg -i -n <term>` (kenning text は大小無視なので -i)。
+kenning 経路 = `text <term> --limit 100000` の実出力。**ヒット数の一致**が主指標 —
+バイトは kenning が増える (行ごとに関数名 / 見出し階層を付けるため)。それが payload。
+
+| term | rg hits | rg ms | rg bytes | text hits | text ms | text bytes | 一致 |
+|---|---|---|---|---|---|---|---|
+| unwrap | 415 | 6 | 47188 | 415 | 5 | 56813 | = |
+| kenning | 375 | 7 | 50233 | 374 | 6 | 62841 | ≠ |
+| String | 371 | 12 | 43061 | 371 | 28 | 48882 | = |
+| callers | 259 | 14 | 30168 | 259 | 6 | 50481 | = |
+| println | 296 | 7 | 38372 | 296 | 5 | 40661 | = |
+| assert | 256 | 6 | 33256 | 256 | 6 | 44720 | = |
+| contains | 110 | 6 | 14392 | 110 | 5 | 18302 | = |
+| return | 135 | 6 | 11117 | 135 | 5 | 12574 | = |
+| container | 155 | 6 | 19575 | 155 | 5 | 22402 | = |
+| eprintln | 117 | 6 | 16123 | 117 | 4 | 16839 | = |
+| enchudb | 115 | 6 | 14439 | 99 | 5 | 16987 | ≠ |
+| collect | 112 | 7 | 12645 | 112 | 5 | 13953 | = |
+| format | 97 | 6 | 13436 | 97 | 5 | 14899 | = |
+| update | 133 | 5 | 18994 | 133 | 5 | 22772 | = |
+| assert_eq | 93 | 8 | 11739 | 93 | 5 | 15643 | = |
+| is_empty | 87 | 5 | 8695 | 87 | 5 | 9686 | = |
+| to_string | 148 | 8 | 17973 | 148 | 6 | 20798 | = |
+| symbol | 134 | 6 | 17612 | 134 | 5 | 21314 | = |
+| call_t | 86 | 6 | 9379 | 86 | 5 | 10366 | = |
+| file_t | 86 | 6 | 8683 | 86 | 5 | 9729 | = |
+
+**一致**: 18/20 問でヒット数が同一。差の内訳: 少ない 2 問 = 生成 lock (`Cargo.lock`) / >1MiB / binary の非索引分。**wall 中央値**: rg 6.3ms vs text 5.0ms
+(両者プロセス起動込み。text は `#` の件数行と文脈注釈を含んだ上でこの wall)
 
 ### micro — warm latency
 ```
-open(readonly): 486.125µs
-index: 2 files / 144 symbols / 2418 call-sites
-  kind=fn                                              =     104 件  [166ns]
-  pub fn                                               =      20 件  [291ns]
-  pub async fn 非test                                   =       0 件  [166ns]
-  def txt                                              =       1 件  [125ns]
-  callers txt (名前一致)                                   =      37 件  [166ns]
-  callers txt (確実 逆引き)                                 =      37 件  [125ns]
+open(readonly): 540.834µs
+index: 20 files / 321 symbols / 4436 call-sites
+  kind=fn                                              =     244 件  [166ns]
+  pub fn                                               =      25 件  [250ns]
+  pub async fn 非test                                   =       0 件  [125ns]
+  def new                                              =       2 件  [83ns]
+  callers new (名前一致)                                   =     128 件  [166ns]
+  callers new (確実 逆引き)                                 =       1 件  [84ns]
 ```
 

@@ -22,8 +22,8 @@ kenning callers finish_with_oplog     # that's it — the index builds itself on
 
 AI coding agents explore code with `grep` + reading whole files. That works, but it burns
 tokens: *"what breaks if I change X?"* becomes a recursive chain of greps and reads —
-hundreds of tool calls for a single question (808 on enchudb, measured below). kenning's
-`impact` answers it from a pre-baked graph in one reply: **13–52× fewer bytes** across the
+hundreds of tool calls for a single question (1,384 on enchudb, measured below). kenning's
+`impact` answers it from a pre-baked graph in one reply: **13–84× fewer bytes** across the
 benchmark corpora, and the deeper the question the wider the gap.
 
 The classic precise answer is a language server — but rust-analyzer runs resident at
@@ -42,8 +42,8 @@ down to a single local binary:
    faceted conjunctions (`kind:method vis:pub container:Engine calls:unwrap`) are bucket
    intersections, not scans.
 
-The index is self-maintaining: stale files are detected on every query (a ~10 ms stat-walk)
-and re-indexed incrementally (~18 ms for a small edit), so answers are never silently stale.
+The index is self-maintaining: stale files are detected on every query (a 1–5 ms stat-walk)
+and re-indexed incrementally (~6 ms for a small edit), so answers are never silently stale.
 
 ## Install
 
@@ -77,10 +77,17 @@ enchudb-oplog = { path = "../enchudb/crates/enchudb-oplog" }
 
 ```
 kenning def     <name>              definition + signature + first doc line (hover)
-kenning read    <name> [container]  print the definition body itself (def + file-read in one step)
-kenning find    <substr>            fuzzy name discovery
-kenning text    <term>              full-text search over every text file, annotated with
-                                    context (.rs: enclosing symbol, .md: heading path, .toml: table)
+kenning read    <name> [container] [crate:X] [path:S] [--all]
+                                    the definition body itself (def + file-read in one step);
+                                    narrow same-named symbols, or --all to print every one
+kenning read    <path>:<line>       the item enclosing that line (grep -n → sed, in one step)
+kenning read    <file>#<heading>    one .md heading / .toml [table] / .yml key section
+kenning find    <substr>            fuzzy discovery over symbol names *and* file names
+                                    (the `find -name '*x*'` half, so "where is that file" stays here)
+kenning text    <term>... [-e] [path:S]
+                                    full-text search over every text file, annotated with
+                                    context (.rs: enclosing symbol, .md: heading path, .toml:
+                                    table). Several terms = OR, -e = regex, path: = dir filter
 kenning callers <name> [container]  who-calls: confirmed ∪ unresolved candidates, with positions
 kenning callees <name> [container]  outgoing calls
 kenning edges                       all cross-file call edges, aggregated (from\tto\tcount TSV)
@@ -91,15 +98,32 @@ kenning tests   <name> [container]  tests that reach this symbol = impact ∩ is
 kenning path    <from> <to>         one call path from A to B (forward BFS)
 kenning across  <name>              cross-repo precise references over every indexed repo
 kenning search  kind:method vis:pub container:Engine   faceted equality-AND
-kenning outline <path>              file structure without reading the file
+kenning outline <path|dir>          file structure without reading the file; a directory maps
+                                    the files under it (symbol count / loc), `.` maps the repo
 kenning bake                        run rust-analyzer once, ingest SCIP → RA-grade precision
 kenning stats                       index size + resolution rate
-kenning cache   [ls|prune]          list / prune auto-derived indexes (missing repo, old format, --older-than D)
+kenning cache   [ls|prune]          list / prune auto-derived indexes (missing repo, old format,
+                                    --older-than D, --dry-run)
+kenning --version                   version
 ```
 
 Output is deterministic `path:line<TAB>detail` rows on stdout (progress goes to stderr) —
 each line can be fed straight into a file reader. A `CLAUDE.md` ships with the repo so
 Claude-family agents pick the right subcommand without prompting.
+
+Indexing follows ripgrep's rules — `.gitignore` / `.ignore` and hidden directories are respected,
+`target/` and `node_modules/` are always excluded. Overrides, for when the automatic behaviour is
+wrong:
+
+| env / flag | effect |
+|---|---|
+| `--db <path>` / `KENNING_DB` | use an explicit index (an explicit db is never auto-indexed) |
+| `KENNING_NO_AUTO=1` | no auto index / update at all |
+| `KENNING_NO_STALE=1` | keep auto-indexing, skip the per-query freshness check |
+| `KENNING_NO_IGNORE=1` | index gitignored `.rs` too (repos whose build generates sources) |
+| `KENNING_BAKE_TIMEOUT=<sec>` | cap one rust-analyzer run (default 900). On timeout `bake` kills the process group, falls back to default features, and remembers that choice per repo |
+| `KENNING_BAKE_DEFAULT_FEATURES=1` | skip `features = "all"` from the start |
+| `KENNING_RA=<path>` | rust-analyzer binary to use for `bake` |
 
 ## Design points
 
@@ -111,9 +135,12 @@ Claude-family agents pick the right subcommand without prompting.
   is silent inside `#[cfg(...)]` branches that are off. `syn` sees every branch. Where SCIP
   is silent, resolution falls back to a conservative syn resolver — kenning finds impls
   and callers that rust-analyzer itself misses.
-- **GIGO is explicit.** Precision equals the SCIP you feed it. `bake` injects
-  `features = "all"` via `--config-path` (on tokio this is the difference between 177 and
-  6,760 resolved call edges). Resolution rates are printed, not hidden.
+- **GIGO is explicit.** Precision equals the SCIP you feed it. `bake` asks rust-analyzer for
+  `features = "all"` via `--config-path` — a cfg-gated branch RA never sees is a call edge you
+  never get. What that buys varies by crate, and we print it rather than assume it: on tokio's
+  workspace it is marginal today (8,934 SCIP-confirmed edges with `all` vs 8,853 with default),
+  while on enchudb `features = "all"` stalls past the timeout and `bake` falls back to default
+  features. Resolution rates are printed, not hidden.
 - **The index is a derived artifact.** It lives in `~/.cache/kenning/`, never in your
   repo, keyed by repo root. Delete it any time; it rebuilds on the next question.
 - **Cross-repo.** SCIP symbols are globally unique (crate + version), so `across` joins
@@ -126,28 +153,41 @@ Run it yourself: `./bench/corpus.sh && ./bench/run.sh` — pinned corpora (tokio
 fixed random seed, methodology self-described next to every table. Full output:
 [bench/RESULTS.md](bench/RESULTS.md).
 
-| Suite | tokio (722 files) | ripgrep (100 files) | enchudb (175 files) | What it measures |
+| Suite | tokio (722 files) | ripgrep (100 files) | enchudb (256 files) | What it measures |
 |---|---|---|---|---|
-| **agent** — bytes to answer "who calls X?" | **5.3×** less, 15 calls → 1 | **2.3×** less, 3 calls → 1 | **10.2×** less, 30 calls → 1 | 20 fixed questions, grep-route modeled *optimistically* (lower bound) vs actual `callers` output |
-| **beyond** — "what breaks if I change X?" (`impact`) | **46×**, 321 calls → 1 | **13×**, 75 calls → 1 | **52×**, 808 calls → 1 | transitive-caller BFS: grep route = the manual grep+read recursion an agent actually performs |
+| **agent** — bytes to answer "who calls X?" | **4.1×** less, 15 calls → 1 | **1.7×** less, 3 calls → 1 | **12.2×** less, 52 calls → 1 | 20 fixed questions, grep-route modeled *optimistically* (lower bound) vs actual `callers` output |
+| **beyond** — "what breaks if I change X?" (`impact`) | **48×**, 325 calls → 1 | **13×**, 75 calls → 1 | **84×**, 1,384 calls → 1 | transitive-caller BFS: grep route = the manual grep+read recursion an agent actually performs |
 | **quality** — grep noise on 100 random symbols | median 43 % | median 33 % | median 33 % | share of `\bname\(` hits that are defs/comments/strings/other symbols — rows an agent reads for nothing |
-| **micro** — warm query latency | 125 ns – 4 µs | similar | 125 ns – 2.3 µs | faceted counts, def lookup, precise reverse-edge callers |
+| **micro** — warm query latency | 125 ns – 5 µs | 166 ns – 2 µs | 166 ns – 4.2 µs | faceted counts, def lookup, precise reverse-edge callers |
 
 The same suite also measures the other non-search queries: `impls` (go-to-implementation)
-10–23×, `outline` (structure without reading the file) 7–12× (a 442 KB file compresses 42×),
-`def` (hover: location + signature + doc line) 6–10×. Faceted queries have no grep equivalent
-at all — they run in µs and are reported as a capability, not a ratio. Note the pattern:
-**the deeper the question, the bigger the win** — on ripgrep, plain who-calls is only 2.3×
+10.6–23.6×, `outline` (structure without reading the file) 8–26× on source files (tokio's 143 KB
+CHANGELOG compresses 30×; ripgrep's `raw.csv` test data hits 1,000×+, which says more about CSV
+than about kenning), `def` (hover: location + signature + doc line) 6.2–9.2×. Faceted queries
+have no grep equivalent at all — they run in µs and are reported as a capability, not a ratio.
+Note the pattern:
+**the deeper the question, the bigger the win** — on ripgrep, plain who-calls is only 1.7×
 but transitive impact is 13×, because the grep route multiplies per BFS hop.
 
 The spread is the honest story: the advantage scales with how widely symbols are called.
-ripgrep — small and famously well-factored — is the floor (2.3×, median symbol called from
-3 sites); enchudb's hot symbols (30 sites) show 10.2×. Worst cases are where grep drowns
-hardest: `len` in enchudb = 988 grep hits, of which 46 are confirmed callers of the local `len`.
+ripgrep — small and famously well-factored — is the floor (1.7×, median symbol called from
+3 sites); enchudb's hot symbols (52 sites) show 12.2×. Worst cases are where grep drowns
+hardest: `len` in enchudb = 1,187 grep hits → 689 name-matching call-sites, of which 69 are
+confirmed callers of the local `len`.
+
+**Text search vs `rg`** (the `text` suite, same run): 20 high-frequency terms per corpus, the
+same word handed to both engines. Hit counts are **identical on 64 of 80** questions, and every
+difference falls under one of two documented rules — kenning does not index generated lock files
+or anything over 1 MiB (13 questions where it reports fewer), and `rg` stops at the first NUL byte
+while kenning reads the file whole (3 questions on ripgrep's `sherlock-nul.txt`, where kenning
+reports more). Wall clock is the same order: rg 6.3–16.2 ms vs text 5.0–22.9 ms across the four
+corpora, with every kenning row additionally carrying its enclosing function, heading path or
+TOML table. This is the suite behind the claim that you can stop reaching for grep inside a Rust
+repo — before it, that was the one claim here with no measurement under it.
 
 **Head-to-head vs rust-analyzer** ([bench/VS-RA.md](bench/VS-RA.md), `./bench/vs-ra.sh`):
 time and memory to go from cold to "can answer who-calls" — RA (`analysis-stats`, its own bench
-tool): 39 s / 6.1 GB on enchudb, vs kenning syn index: 0.45 s / 175 MB, zero resident after.
+tool): 18.9 s / 3.1 GB on enchudb, vs kenning syn index: 0.29 s / 130 MB, zero resident after.
 Precision trade and feature-scope caveats are written next to the table.
 
 **Head-to-head vs CodeQL** ([bench/VS-CODEQL.md](bench/VS-CODEQL.md), `./bench/vs-codeql.sh`):
@@ -166,18 +206,29 @@ answers agree (57 vs 58, a def-role counting nuance — fourth independent cross
 Glean wins on facts disk (14 MB vs 87 MB — ours also carries the syn call graph and facets)
 and serves stale SCIP gracefully, since it never joins against live source.
 
+The CodeQL and Glean matchups were measured on an earlier enchudb snapshot (175 files) and are
+not re-run every release — a 68-minute database build is not a per-release cost anyone should pay
+twice. The order of magnitude is the claim, not the third decimal.
+
 **Head-to-head vs ast-grep** (structural search; same questions, inside the agent suite):
 its structural matches equal kenning's confirmed ∪ candidate sets almost exactly
-(`tie` 321 = 321, `clone` 621 = 224+397) — an independent cross-validation that call-site
-detection is complete. The differences: median 564–878 ms per question (repo walk, three
-call-shape patterns the user must enumerate) vs 13–19 ms (indexed), and no name resolution —
+(tokio `sleep` 152 = 105+47, `registration` 89 = 89+0) — an independent cross-validation that
+call-site detection is complete. The differences: median 146–460 ms per question (repo walk, three
+call-shape patterns the user must enumerate) vs 7–20 ms (indexed), and no name resolution —
 it cannot say *which* definition a call belongs to, and has no impact/path/faceted/cross-repo.
 
-- Index build: ~1k LOC/ms (enchudb: 175 files / 2,905 symbols / 26,131 call-sites in ~360 ms).
-- Incremental update after a small edit: ~18 ms. Staleness check per query: ~10 ms.
-- `bake`: one rust-analyzer batch run (peak ≈ 5 GB for ~30–50 s), then **zero** resident memory.
-  Resolution on enchudb: 26.6 % (syn only) → 39.8 % (baked, features=all). The unresolved
-  remainder is dominated by std/external-crate calls, which are still listed as labeled candidates.
+- Index build (syn layer, cold): enchudb 256 files / 4,099 symbols / 37,022 call-sites in
+  **0.29 s**; tokio 722 files / 7,156 symbols / 28,834 call-sites in **0.53 s**.
+- Incremental update after a small edit: **~6 ms**. The per-query freshness check (a dir-gated
+  stat-walk) costs 1–5 ms; a whole `callers` query, process start included, is 7–20 ms
+  (bench medians: kenning 7.1, ripgrep 12.1, enchudb 17.3, tokio 19.8 ms — `rg` answering the
+  same questions takes 9.2–22.9 ms, so the speed is a tie and the difference is what comes back).
+- `bake`: one rust-analyzer batch run, then **zero** resident memory. Measured: ripgrep 7 s /
+  1.1 GB, tokio 28 s / 2.0 GB, enchudb 46 s / 2.3 GB. Resolution rate before → after:
+  tokio 18.3 % → 35.5 %, ripgrep 26.7 % → 48.7 % (both `features = "all"`), enchudb
+  27.5 % → 43.2 % — enchudb bakes with *default* features because `features = "all"` stalls
+  past the timeout there, exactly the fallback the cap exists for. The unresolved remainder is
+  dominated by std/external-crate calls, which are still listed as labeled candidates.
 
 ## Deliberate trade-offs — what we don't do, and what it cost
 
@@ -185,10 +236,10 @@ Every number above was bought by *not* doing something. The full ledger:
 
 | We don't do | What it bought | What it costs (measured / observed) |
 |---|---|---|
-| Type inference (`x.f()` receivers) | 0.5 s builds, 18 ms incremental updates, cfg-blind coverage | syn-only resolution stays at 13–26 %; precision requires `bake` (one 40 s / 5 GB RA run) |
+| Type inference (`x.f()` receivers) | 0.3–0.5 s builds, ~6 ms incremental updates, cfg-blind coverage | syn-only resolution stays at 15–28 %; precision requires `bake` (one 7–46 s / 1.1–2.3 GB RA run) |
 | Hover / completion / diagnostics | zero-resident, no LSP protocol | not a human editor; agents use `cargo check` for types |
 | Macro expansion | per-file parse speed | calls and impls born inside macros are invisible to every layer |
-| Resident server / file watcher | 0 RAM, zero ops, works over SSH | a ~10–20 ms stat-walk floor on every query; warm-µs numbers only apply in-process |
+| Resident server / file watcher | 0 RAM, zero ops, works over SSH | a 1–5 ms stat-walk on every query (7–20 ms for the whole CLI round trip); warm-µs numbers only apply in-process |
 | Serving SCIP as-is (we position-join against live source instead) | answers always point at today's code | stale bakes shed precise facts (we hit `refs → 0` live in the Glean matchup; `upd_since_bake` warns) |
 | Guessing (no fabricated resolution) | zero false positives in the confirmed set | agents still eyeball the *candidates* bucket |
 | A general query language (Angle/QL) | zero learning curve, µs answers | arbitrary relational questions (taint tracking) stay CodeQL's territory |

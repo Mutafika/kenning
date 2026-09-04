@@ -6,10 +6,10 @@ kenning 側は `index` (syn 層)。**精密モード (bake) の構築コスト�
 
 | corpus | 対象 | 構築 wall | peak RSS | 構築後のクエリ |
 |---|---|---|---|---|
-| enchudb | rust-analyzer (resident 相当) | 38.94s | 6058 MB | LSP 常駐が続く限り ms |
-| enchudb | kenning (syn 層) | 0.45s | 175 MB | 44 ms (CLI 起動込み)、常駐 0 |
-| tokio | rust-analyzer (resident 相当) | 20.67s | 2416 MB | LSP 常駐が続く限り ms |
-| tokio | kenning (syn 層) | 0.60s | 232 MB | 37 ms (CLI 起動込み)、常駐 0 |
+| enchudb | rust-analyzer (resident 相当) | 18.89s | 3146 MB | LSP 常駐が続く限り ms |
+| enchudb | kenning (syn 層) | 0.29s | 130 MB | 39 ms (CLI 起動込み)、常駐 0 |
+| tokio | rust-analyzer (resident 相当) | 20.76s | 2469 MB | LSP 常駐が続く限り ms |
+| tokio | kenning (syn 層) | 0.37s | 146 MB | 42 ms (CLI 起動込み)、常駐 0 |
 
 公平のための注記: ①kenning (syn 層) は RA より解決精度が低い (型推論なし。callers は
 確実∪候補のラベル付きで返す) — 精密が要る時の bake コスト ≈ RA 列を一発だけ払う。
