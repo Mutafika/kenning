@@ -43,7 +43,7 @@ kenning stats                       # 規模と名前解決率
 kenning cache [ls|prune] [--older-than D] [--dry-run]  # 自動 db の棚卸し / 掃除 (repo 消失・旧版を回収)
 ```
 
-索引対象は **rg と同じ規約** (.gitignore / .ignore / 隠し dir を尊重、`target/` は常に除外)。
+索引対象は **rg と同じ規約** (.gitignore / .ignore / 隠し dir を尊重、`target/` と `node_modules/` は常に除外)。
 gitignore 済みだが実際に compile される生成 `.rs` を持つ repo だけ `KENNING_NO_IGNORE=1`。
 
 手動制御が要る時だけ: `--db <path>` / env `KENNING_DB` (明示 db は自動 index しない)、

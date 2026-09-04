@@ -75,7 +75,7 @@ const GENERATED_FILES: &[&str] = &[
 /// v5: file 表に非 Rust テキスト (md/toml/yml/…) も載せる — `text` の対象が .rs 限定でなくなった。
 // v6 (2026-08): enchudb 0.14.4 → 0.25.1。意味論は不変だが、旧 enchudb で作った db を一度焼き直して
 // growable lazy commit (実 disk 半減) と新 recovery に乗せるため bump (次クエリで自動 heal、repo あたり ~1s)。
-const INDEX_VER: u32 = 7; // 7: dir 表 (鮮度判定の dir ゲート用) を追加
+const INDEX_VER: u32 = 8; // 7: dir 表 (鮮度判定の dir ゲート用) を追加 / 8: node_modules を常時除外 (walk 集合が変わる)
 
 /// このプロセスで鮮度チェック済みか。parse_opts の auto 経路 (maybe_auto_update / auto-index) が
 /// 立てる。open_ro 側の warn_if_stale が同じ stat-walk を繰り返さないため — 非 Rust の大 dir を
@@ -990,8 +990,15 @@ fn index_walk(dir: &str) -> ignore::WalkBuilder {
         .git_global(respect)
         .git_exclude(respect)
         .parents(respect)
-        .filter_entry(|e| e.depth() == 0 || (e.file_name() != "target" && !is_kenning_artifact(e.file_name())));
+        .filter_entry(|e| e.depth() == 0 || (!is_always_pruned(e.file_name()) && !is_kenning_artifact(e.file_name())));
     b
+}
+
+/// gitignore に関係なく常に降りない dir。`target/` (cargo 成果物) と `node_modules/` (ravn の mcp/ で
+/// 未 ignore の 3,420 file が text として索引され、full index 1.8s / `text` 110ms の主因だった)。
+/// Rust の source がここに住むことは無い。
+fn is_always_pruned(name: &std::ffi::OsStr) -> bool {
+    name == "target" || name == "node_modules"
 }
 
 /// kenning 自身が repo 内に置き得る成果物 (明示 `--db` で repo 内に index を作った時の db directory /
@@ -1370,12 +1377,16 @@ fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Option<&str>, ca
     let n_files_est = ws.rs.len().max(1) as u32;
     // file 表だけは非 Rust テキストも載る (sym/call 系の見積りは Rust ファイル数のまま)。
     let n_text_est = ws.text.len() as u32;
+    // file 数だけの見積りは「少数の巨大 file」で外れる (ravn: 46 files / 160k 行 / 41,792 call で
+    // 32,768 を枯渇 → 4x で焼き直し = full index 2 回)。.rs の総 byte でも見積もり、大きい方を取る。
+    // 実測 (6 repo): call ≤ 10.4/KB、sym ≤ 1.3/KB、impl ≤ 0.3/KB → 余裕 2 倍強。
+    let rs_kb = (ws.rs.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum::<u64>() / 1024) as u32;
     let file_cap = ((n_files_est + n_text_est) * 2).max(1_024);
     let dir_cap = (ws.dirs.len() as u32 * 2).max(256);
-    let sym_cap = (n_files_est * 64).max(8_192) * cap_mult; // enchudb 実測 ~17 sym/file、余裕 64
-    let call_cap = (n_files_est * 400).max(32_768) * cap_mult; // 実測 ~154 call/file、余裕 400
-    let ref_cap = if scip_path.is_some() { (n_files_est * 400).max(32_768) * cap_mult } else { 1_024 };
-    let impl_cap = (n_files_est * 16).max(1_024) * cap_mult; // impl Trait for Type edge
+    let sym_cap = (n_files_est * 64).max(rs_kb * 3).max(8_192) * cap_mult; // enchudb 実測 ~17 sym/file、余裕 64
+    let call_cap = (n_files_est * 400).max(rs_kb * 24).max(32_768) * cap_mult; // 実測 ~154 call/file、余裕 400
+    let ref_cap = if scip_path.is_some() { (n_files_est * 400).max(rs_kb * 24).max(32_768) * cap_mult } else { 1_024 };
+    let impl_cap = (n_files_est * 16).max(rs_kb).max(1_024) * cap_mult; // impl Trait for Type edge
     let extref_cap = if scip_path.is_some() { (n_files_est * 100).max(8_192) * cap_mult } else { 1_024 };
     let max_entities = (file_cap + dir_cap + sym_cap + call_cap + ref_cap + impl_cap + extref_cap) * 11 / 10; // +10% 余白
     let mut db = Database::create_growable_with_capacity(tmp, max_entities).unwrap();
@@ -5822,6 +5833,28 @@ note: run with `RUST_BACKTRACE=1` to display a backtrace
         let r = run_with_timeout(c, &err, Duration::from_secs(10)).unwrap().expect("完了するはず");
         assert_eq!(r.code(), Some(3));
         assert_eq!(std::fs::read_to_string(&err).unwrap().trim(), "boom", "stderr が file に落ちていない");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `target/` と `node_modules/` は gitignore の有無に関係なく降りない (git 管理外の dir でも)。
+    #[test]
+    fn walk_always_prunes_target_and_node_modules() {
+        let d = std::env::temp_dir().join(format!("kenning-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for sub in ["src", "target/debug", "node_modules/pkg", "mcp/node_modules/x"] {
+            std::fs::create_dir_all(d.join(sub)).unwrap();
+        }
+        std::fs::write(d.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(d.join("target/debug/b.rs"), "pub fn b() {}\n").unwrap();
+        std::fs::write(d.join("node_modules/pkg/c.rs"), "pub fn c() {}\n").unwrap();
+        std::fs::write(d.join("node_modules/pkg/README.md"), "# c\n").unwrap();
+        std::fs::write(d.join("mcp/node_modules/x/index.js"), "x\n").unwrap();
+        std::fs::write(d.join("README.md"), "# root\n").unwrap();
+        let ws = walk_index_set(&d.to_string_lossy());
+        let names = |v: &[PathBuf]| v.iter().map(|p| p.strip_prefix(&d).unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!(names(&ws.rs), ["src/a.rs"], "rs: {:?}", names(&ws.rs));
+        assert_eq!(names(&ws.text), ["README.md"], "text: {:?}", names(&ws.text));
+        assert!(names(&ws.dirs).iter().all(|p| !p.contains("node_modules") && !p.contains("target")), "dirs: {:?}", names(&ws.dirs));
         let _ = std::fs::remove_dir_all(&d);
     }
 }
