@@ -90,8 +90,6 @@ const R_QUALIFIED: u32 = 2; // `Type::` / `mod::` 修飾で 1 つに絞れた
 const R_AMBIG: u32 = 3; // 同名定義が複数 → 型不明で絞れず未解決
 const RES_NAMES: &[&str] = &["unresolved", "unique", "qualified", "ambiguous"];
 
-/// enchudb oplog (checkpoint 型 ring) の予約容量。
-const OPLOG_CAPACITY: usize = 256 * 1024 * 1024;
 
 // ─────────────────────────── indexer (syn) ───────────────────────────
 
@@ -543,15 +541,45 @@ struct Acc {
     crate_cache: HashMap<PathBuf, String>,    // file の親 dir → crate 名 (crate_of の memo)
 }
 
-/// 木を歩く間の可変状態。
+/// 木を歩く間の可変状態 (worker 側。db にも eid にも触らない)。
 struct Ctx {
-    file_eid: EntityId,
-    rel_path: String, // index root からの相対パス (SCIP join 用)
-    crate_name: String,
     module: Vec<String>,
     in_test: bool,
     container: String, // 現在の impl 型 (method の所属)
-    n_sym: u64,
+}
+
+/// 1 ファイルから取り出した facts (eid 未割当の中間表現)。parse した thread で行/列・sig・doc まで
+/// 確定させる — proc-macro2 の span-locations は thread-local なので、span を別 thread に持ち出せない。
+/// 挿入 (eid 採番) は main thread が walk 順どおりに行う (insert_file_facts)。
+struct FileFacts {
+    loc: u32,
+    hash: u32,
+    syms: Vec<RawSym>,
+    impls: Vec<RawImpl>,
+}
+
+/// 1 定義 + その本体の呼び出し箇所。
+struct RawSym {
+    name: String,
+    kind: u32,
+    vis: u32,
+    is_async: bool,
+    is_test: bool,
+    module: String,
+    container: String,
+    line: u32,
+    col: u32,
+    end_line: u32,
+    sig: String,
+    doc: String,
+    calls: Vec<RawCall>,
+}
+
+/// `impl Trait for Type` (file eid は挿入時に付く)。
+struct RawImpl {
+    trait_name: String,
+    type_name: String,
+    line: u32,
 }
 
 /// fn シグネチャを 1 行文字列に (hover 相当)。token stream の機械的な空白を詰める。
@@ -567,10 +595,10 @@ fn sig_text(sig: &syn::Signature) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 1 定義を facts に積む (worker 側)。本体があれば呼び出し箇所もここで拾う (pass2 へ持ち越す材料)。
 fn record_symbol(
-    sym_t: &Table,
     ctx: &mut Ctx,
-    acc: &mut Acc,
+    out: &mut FileFacts,
     name: &str,
     kind: u32,
     vis: u32,
@@ -583,54 +611,82 @@ fn record_symbol(
     body: Option<&syn::Block>,
     doc: &str,
 ) {
-    let module = ctx.module.join("::");
-    // SCIP があれば、この定義の位置に対応するグローバル symbol 文字列を引いて焼き込む。
-    let symbol = acc
-        .scip
-        .as_ref()
-        .and_then(|s| s.symbol_at(&ctx.rel_path, line, col))
-        .map(str::to_string)
-        .unwrap_or_default();
-    let sym_eid = sym_t
-        .insert()
-        .set("name", name)
-        .set("kind", kind)
-        .set("vis", vis)
-        .set("is_async", is_async as u32)
-        .set("is_test", is_test as u32)
-        .set("file", Value::Ref(ctx.file_eid))
-        .set("module", module.clone())
-        .set("crate_", ctx.crate_name.clone())
-        .set("container", ctx.container.clone())
-        .set("symbol", symbol.as_str())
-        .set("sig", sig.map(sig_text).unwrap_or_default().as_str())
-        .set("doc", doc)
-        .set("line", line)
-        .set("end_line", end_line)
-        .commit()
-        .unwrap();
-    ctx.n_sym += 1;
-    // 名前解決の突き合わせ先として登録 (syn 用)。
-    acc.defs.entry(name.to_string()).or_default().push(SymDef {
-        eid: sym_eid,
-        kind,
-        container: ctx.container.clone(),
-        module,
-    });
-    // SCIP symbol → 自 index の eid (call の正確解決に使う)。
-    if !symbol.is_empty() {
-        acc.sym_by_symbol.insert(symbol, sym_eid);
-    }
-    // 呼び出し箇所は全 sym 確定後に解決するので pass2 へ持ち越す。
+    let mut calls = Vec::new();
     if let Some(b) = body {
         let mut cc = CallCollector::default();
         cc.visit_block(b);
-        for rc in cc.calls {
+        calls = cc.calls;
+    }
+    out.syms.push(RawSym {
+        name: name.to_string(),
+        kind,
+        vis,
+        is_async,
+        is_test,
+        module: ctx.module.join("::"),
+        container: ctx.container.clone(),
+        line,
+        col,
+        end_line,
+        sig: sig.map(sig_text).unwrap_or_default(),
+        doc: doc.to_string(),
+        calls,
+    });
+}
+
+/// facts を db に挿入して eid を採番する (main thread、walk 順)。SCIP があれば定義位置から
+/// グローバル symbol 文字列を引いて焼き込み、call-site は caller eid 付きで pass2 へ持ち越す。
+fn insert_file_facts(file_t: &Table, sym_t: &Table, acc: &mut Acc, root: &str, path_s: &str, facts: FileFacts) {
+    let crate_name = crate_of(path_s, &mut acc.crate_cache);
+    let file_eid = file_t
+        .insert()
+        .set("path", path_s)
+        .set("crate_", crate_name.clone())
+        .set("lang", LANG_RUST)
+        .set("loc", facts.loc)
+        .set("hash", facts.hash)
+        .commit()
+        .unwrap();
+    let rel_path = rel_of(path_s, root);
+    acc.file_by_rel.insert(rel_path.clone(), file_eid);
+    for s in facts.syms {
+        let symbol = acc
+            .scip
+            .as_ref()
+            .and_then(|sc| sc.symbol_at(&rel_path, s.line, s.col))
+            .map(str::to_string)
+            .unwrap_or_default();
+        let sym_eid = sym_t
+            .insert()
+            .set("name", s.name.as_str())
+            .set("kind", s.kind)
+            .set("vis", s.vis)
+            .set("is_async", s.is_async as u32)
+            .set("is_test", s.is_test as u32)
+            .set("file", Value::Ref(file_eid))
+            .set("module", s.module.clone())
+            .set("crate_", crate_name.clone())
+            .set("container", s.container.clone())
+            .set("symbol", symbol.as_str())
+            .set("sig", s.sig.as_str())
+            .set("doc", s.doc.as_str())
+            .set("line", s.line)
+            .set("end_line", s.end_line)
+            .commit()
+            .unwrap();
+        // 名前解決の突き合わせ先として登録 (syn 用)。
+        acc.defs.entry(s.name).or_default().push(SymDef { eid: sym_eid, kind: s.kind, container: s.container.clone(), module: s.module });
+        // SCIP symbol → 自 index の eid (call の正確解決に使う)。
+        if !symbol.is_empty() {
+            acc.sym_by_symbol.insert(symbol, sym_eid);
+        }
+        // 呼び出し箇所は全 sym 確定後に解決するので pass2 へ持ち越す。
+        for rc in s.calls {
             acc.pending.push(CallSite {
                 caller: sym_eid,
-                caller_container: ctx.container.clone(),
-                file: ctx.file_eid,
-                rel_path: ctx.rel_path.clone(),
+                caller_container: s.container.clone(),
+                file: file_eid,
+                rel_path: rel_path.clone(),
                 name: rc.name,
                 qualifier: rc.qualifier,
                 is_method: rc.is_method,
@@ -638,6 +694,9 @@ fn record_symbol(
                 col: rc.col,
             });
         }
+    }
+    for im in facts.impls {
+        acc.impls.push(ImplEdge { trait_name: im.trait_name, type_name: im.type_name, file: file_eid, line: im.line });
     }
 }
 
@@ -659,20 +718,19 @@ fn first_doc_line(attrs: &[syn::Attribute]) -> String {
     String::new()
 }
 
-fn walk_items(items: &[syn::Item], ctx: &mut Ctx, acc: &mut Acc, sym_t: &Table) {
+fn walk_items(items: &[syn::Item], ctx: &mut Ctx, out: &mut FileFacts) {
     for it in items {
-        walk_item(it, ctx, acc, sym_t);
+        walk_item(it, ctx, out);
     }
 }
 
-fn walk_item(it: &syn::Item, ctx: &mut Ctx, acc: &mut Acc, sym_t: &Table) {
+fn walk_item(it: &syn::Item, ctx: &mut Ctx, out: &mut FileFacts) {
     match it {
         syn::Item::Fn(f) => {
             let is_test = ctx.in_test || is_test_attrs(&f.attrs);
             record_symbol(
-                sym_t,
                 ctx,
-                acc,
+                out,
                 &f.sig.ident.to_string(),
                 K_FN,
                 classify_vis(&f.vis),
@@ -687,23 +745,23 @@ fn walk_item(it: &syn::Item, ctx: &mut Ctx, acc: &mut Acc, sym_t: &Table) {
             );
         }
         syn::Item::Struct(s) => record_symbol(
-            sym_t, ctx, acc, &s.ident.to_string(), K_STRUCT,
+            ctx, out, &s.ident.to_string(), K_STRUCT,
             classify_vis(&s.vis), false, ctx.in_test, line_of(s.ident.span()), col_of(s.ident.span()), end_line_of(s), None, None,
             &first_doc_line(&s.attrs),
         ),
         syn::Item::Enum(e) => record_symbol(
-            sym_t, ctx, acc, &e.ident.to_string(), K_ENUM,
+            ctx, out, &e.ident.to_string(), K_ENUM,
             classify_vis(&e.vis), false, ctx.in_test, line_of(e.ident.span()), col_of(e.ident.span()), end_line_of(e), None, None,
             &first_doc_line(&e.attrs),
         ),
         syn::Item::Const(c) => record_symbol(
-            sym_t, ctx, acc, &c.ident.to_string(), K_CONST,
+            ctx, out, &c.ident.to_string(), K_CONST,
             classify_vis(&c.vis), false, ctx.in_test, line_of(c.ident.span()), col_of(c.ident.span()), end_line_of(c), None, None,
             &first_doc_line(&c.attrs),
         ),
         syn::Item::Trait(t) => {
             record_symbol(
-                sym_t, ctx, acc, &t.ident.to_string(), K_TRAIT,
+                ctx, out, &t.ident.to_string(), K_TRAIT,
                 classify_vis(&t.vis), false, ctx.in_test, line_of(t.ident.span()), col_of(t.ident.span()), end_line_of(t), None, None,
                 &first_doc_line(&t.attrs),
             );
@@ -713,7 +771,7 @@ fn walk_item(it: &syn::Item, ctx: &mut Ctx, acc: &mut Acc, sym_t: &Table) {
                 if let syn::TraitItem::Fn(m) = ti {
                     let is_test = ctx.in_test || is_test_attrs(&m.attrs);
                     record_symbol(
-                        sym_t, ctx, acc, &m.sig.ident.to_string(), K_METHOD,
+                        ctx, out, &m.sig.ident.to_string(), K_METHOD,
                         V_PUB, m.sig.asyncness.is_some(), is_test,
                         line_of(m.sig.ident.span()), col_of(m.sig.ident.span()), end_line_of(m), Some(&m.sig), m.default.as_ref(),
                         &first_doc_line(&m.attrs),
@@ -728,10 +786,9 @@ fn walk_item(it: &syn::Item, ctx: &mut Ctx, acc: &mut Acc, sym_t: &Table) {
             // trait 名 = path 末尾 seg、line も同 seg の Ident span (Type の span は trait 不要で避ける)。
             if let Some((_, tpath, _)) = &i.trait_
                 && let Some(seg) = tpath.segments.last() {
-                    acc.impls.push(ImplEdge {
+                    out.impls.push(RawImpl {
                         trait_name: seg.ident.to_string(),
                         type_name: type_name.clone(),
-                        file: ctx.file_eid,
                         line: line_of(seg.ident.span()),
                     });
                 }
@@ -740,7 +797,7 @@ fn walk_item(it: &syn::Item, ctx: &mut Ctx, acc: &mut Acc, sym_t: &Table) {
                 if let syn::ImplItem::Fn(m) = ii {
                     let is_test = ctx.in_test || is_test_attrs(&m.attrs);
                     record_symbol(
-                        sym_t, ctx, acc, &m.sig.ident.to_string(), K_METHOD,
+                        ctx, out, &m.sig.ident.to_string(), K_METHOD,
                         classify_vis(&m.vis), m.sig.asyncness.is_some(), is_test,
                         line_of(m.sig.ident.span()), col_of(m.sig.ident.span()), end_line_of(m), Some(&m.sig), Some(&m.block),
                         &first_doc_line(&m.attrs),
@@ -754,7 +811,7 @@ fn walk_item(it: &syn::Item, ctx: &mut Ctx, acc: &mut Acc, sym_t: &Table) {
                 let test = ctx.in_test || m.attrs.iter().any(is_cfg_test);
                 ctx.module.push(m.ident.to_string());
                 let prev = std::mem::replace(&mut ctx.in_test, test);
-                walk_items(inner, ctx, acc, sym_t);
+                walk_items(inner, ctx, out);
                 ctx.in_test = prev;
                 ctx.module.pop();
             }
@@ -872,34 +929,36 @@ fn purge_file(sym_t: &Table, call_t: &Table, file_t: &Table, impl_t: Option<&Tab
 /// 1 ファイルを parse して file 行 + sym 行を挿入し、call-site を `acc.pending` へ持ち越す。
 /// parse 失敗なら false (呼び出し側で skip カウント)。
 fn index_one_file(file_t: &Table, sym_t: &Table, acc: &mut Acc, root: &str, path_s: &str, src: &str) -> bool {
-    let file = match syn::parse_file(src) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let crate_name = crate_of(path_s, &mut acc.crate_cache);
-    let loc = src.lines().count() as u32;
-    let file_eid = file_t
-        .insert()
-        .set("path", path_s)
-        .set("crate_", crate_name.clone())
-        .set("lang", LANG_RUST)
-        .set("loc", loc)
-        .set("hash", hash_u32(src))
-        .commit()
-        .unwrap();
-    let rel_path = rel_of(path_s, root);
-    acc.file_by_rel.insert(rel_path.clone(), file_eid);
-    let mut ctx = Ctx {
-        file_eid,
-        rel_path,
-        crate_name,
-        module: Vec::new(),
-        in_test: false,
-        container: String::new(),
-        n_sym: 0,
-    };
-    walk_items(&file.items, &mut ctx, acc, sym_t);
+    let Some(facts) = extract_file(src) else { return false };
+    insert_file_facts(file_t, sym_t, acc, root, path_s, facts);
     true
+}
+
+/// 1 ファイルを parse して facts を取り出す (thread-safe: db にも acc にも触らない)。parse 失敗は None。
+fn extract_file(src: &str) -> Option<FileFacts> {
+    let file = syn::parse_file(src).ok()?;
+    let mut out = FileFacts { loc: src.lines().count() as u32, hash: hash_u32(src), syms: Vec::new(), impls: Vec::new() };
+    let mut ctx = Ctx { module: Vec::new(), in_test: false, container: String::new() };
+    walk_items(&file.items, &mut ctx, &mut out);
+    Some(out)
+}
+
+/// full index の pass1 で 1 度に並列 parse する file 数。facts の常駐をこの単位に抑える
+/// (巨大 repo で全 file の facts を同時に抱えない)。
+const PARSE_BATCH: usize = 512;
+
+/// `paths` を読んで parse し facts を返す (順序は `paths` と同じ)。parse は syn で tokio 725 files に
+/// 逐次 290ms / 12 thread 72ms。読めない・parse できない file は None。
+fn extract_parallel(paths: &[PathBuf]) -> Vec<Option<FileFacts>> {
+    let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, paths.len().max(1));
+    let chunk = paths.len().div_ceil(n).max(1);
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = paths
+            .chunks(chunk)
+            .map(|c| sc.spawn(move || c.iter().map(|p| std::fs::read_to_string(p).ok().and_then(|s| extract_file(&s))).collect::<Vec<_>>()))
+            .collect();
+        hs.into_iter().flat_map(|h| h.join().expect("parse worker panicked")).collect()
+    })
 }
 
 /// index 対象の walk 規約 (.rs / それ以外の共通土台)。**ripgrep と同じ規約**:
@@ -1285,6 +1344,7 @@ fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Option<&str>, ca
     if let Some(sp) = scip_path {
         eprintln!("(SCIP 正確解決: {})", sp);
     }
+    let t_all = Instant::now();
 
     // built_at は index の **開始**時刻 (完了時刻ではない)。完了時刻を焼くと、index 中に別プロセスが
     // 編集したファイルが「mtime < built_at」に収まり、以後の mtime ベース stale 判定を**永久に**
@@ -1410,13 +1470,16 @@ fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Option<&str>, ca
     let t = Instant::now();
 
     // ── pass1: 全ファイルを歩いて sym を挿入 + call-site を deferred 収集 ──
-    for p in &ws.rs {
-        let ps = p.to_string_lossy();
-        let Ok(src) = std::fs::read_to_string(p) else { continue };
-        if index_one_file(&file_t, &sym_t, &mut acc, dir, &ps, &src) {
-            n_files += 1;
-        } else {
-            n_skip += 1;
+    //    parse は worker で並列 (facts の中間表現に落とす)、挿入は eid の採番順 = walk 順を保つため main で逐次。
+    for batch in ws.rs.chunks(PARSE_BATCH) {
+        for (p, facts) in batch.iter().zip(extract_parallel(batch)) {
+            match facts {
+                Some(facts) => {
+                    insert_file_facts(&file_t, &sym_t, &mut acc, dir, &p.to_string_lossy(), facts);
+                    n_files += 1;
+                }
+                None => n_skip += 1,
+            }
         }
     }
     // ── pass1b: 非 Rust テキストを file 表に載せる (sym 無し = `text` の対象が増えるだけ) ──
@@ -1618,12 +1681,21 @@ fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Option<&str>, ca
     drop(ref_t);
     drop(meta_t);
     assert_no_faults(&db, "index"); // 拒否された write があれば capacity ×4 で焼き直し
-    let db = db.finish_with_oplog(OPLOG_CAPACITY).unwrap();
+    let t_fin = Instant::now();
+    // finish_with_oplog (consumer thread + 256MB oplog の concurrent 化) は要らない — index は single-writer で、
+    // 以後は open (standalone) / open_readonly しか使わない。Drop が schema と sidecar を 1 回 persist する。
     drop(db);
+    let fin_el = t_fin.elapsed();
 
+    let t_swap = Instant::now();
     if !swap_in(tmp, path) {
         return false;
     }
+    eprintln!(
+        "(index 内訳: parse+挿入 {parse_el:?} / finish+drop {fin_el:?} / 配置 {:?} / 全体 {:?})",
+        t_swap.elapsed(),
+        t_all.elapsed()
+    );
     eprintln!("db real disk: {:.1} MB", real_bytes(Path::new(path)) as f64 / 1_048_576.0);
     eprintln!("\n次: `kenning def <name>` / `callers <name>` / `search kind:fn vis:pub`");
     true
