@@ -23,11 +23,13 @@ repository = "https://github.com/Mutafika/kenning"
 # .crc 封緘 / sync 有効だと遅延が効かないが kenning はどちらも未使用)。across 20db 並列 21.8→27.9ms。
 # 旧 v9 の db は open で弾かれる (src は 1 byte も触られない) → maybe_auto_update が full 再 index で自己修復。
 # ⚠ v10 の db は directory なので「is_dir なら repo」判別が壊れる。振り分けは is_db_path を使うこと。
-# v0.26.2 が出ているが **意図的に 0.26.1 据え置き** — docs only で振る舞いは不変 (上の罠と
-# DbState::Incomplete の rustdoc 修正が中身で、どちらも既に is_db_path に反映済み)。
-# 次に実装上の理由で版を動かす時に 0.26.2 以降を取れば足りる。
-enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.1" }
-enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.1" }
+# 0.26.1 → 0.26.6 (2026-09-04): format 不変・breaking なし、追従のみ。0.26.5 (#255, writer open の eager
+# cylinder build 撤去) は kenning の db 形状には効かなかった — tokio 725 files で update 無変更 100→91ms
+# (誤差内)。ENCHU_OPEN_PROFILE で open は 0ms で、90ms の正体は update_inner が全ファイルを読んで hash
+# 照合する kenning 側の 31ms + process/rw open/drop の固定費。0.26.2〜0.26.4 / 0.26.6 は docs・migrate・
+# Windows・sync transport の修正で kenning の経路には無関係。
+enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.6" }
+enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.6" }
 # indexer = syn で Rust ソースをパースして symbol/call fact を抽出。
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
