@@ -25,9 +25,12 @@ repository = "https://github.com/Mutafika/kenning"
 # ⚠ v10 の db は directory なので「is_dir なら repo」判別が壊れる。振り分けは is_db_path を使うこと。
 # 0.26.1 → 0.26.6 (2026-09-04): format 不変・breaking なし、追従のみ。0.26.5 (#255, writer open の eager
 # cylinder build 撤去) は kenning の db 形状には効かなかった — tokio 725 files で update 無変更 100→91ms
-# (誤差内)。ENCHU_OPEN_PROFILE で open は 0ms で、90ms の正体は update_inner が全ファイルを読んで hash
-# 照合する kenning 側の 31ms + process/rw open/drop の固定費。0.26.2〜0.26.4 / 0.26.6 は docs・migrate・
-# Windows・sync transport の修正で kenning の経路には無関係。
+# (誤差内)。実測の内訳 (`kenning update` が stderr に出す): rw open 42〜69ms は enchudb-schema の
+# load_schema が ref relation (kenning は 8 本) ごとに define_ref_in → 無条件 try_persist_tables で
+# `tables` sidecar を fsync していたもの (enchudb 側で「新規 entry の時だけ persist」に修正、0.26.6 には
+# 未収録 → 取り込むと 1ms、tokio の update 91→53ms / 編集直後の query 123→80ms)。残りは drop の
+# persist_schema ~18ms (無変更でも sidecar を fsync) と update_inner の全ファイル hash 照合 25〜30ms。
+# 0.26.2〜0.26.4 / 0.26.6 は docs・migrate・Windows・sync transport の修正で kenning の経路には無関係。
 enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.6" }
 enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.6" }
 # indexer = syn で Rust ソースをパースして symbol/call fact を抽出。

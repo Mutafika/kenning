@@ -1604,6 +1604,7 @@ pub fn run_update(dir: &str, path: &str) {
     // 既存 DB を書込可能で開く (drop で永続 / entity_in は新 eid を再発行)。
     // db ファイルがまだ無ければ full index にフォールバック (update = 初回でも動く)。
     // ※ ファイルが在るのに open 失敗 (= lock 等) は full にしない — 消して作り直す事故を防ぐ。
+    let t = Instant::now();
     let db = match Database::open(path) {
         Ok(db) => db,
         Err(e) => {
@@ -1616,7 +1617,9 @@ pub fn run_update(dir: &str, path: &str) {
             return;
         }
     };
+    let open = t.elapsed();
     update_with_heal(db, dir, path);
+    eprintln!("(update 内訳: rw open {open:?} / 走査+書込+drop {:?})", t.elapsed() - open);
 }
 
 /// update を試み、失敗 (旧 schema の index 等で panic) したら full 再 index で自己修復。
@@ -1730,7 +1733,7 @@ fn update_inner(db: Database, dir: &str) {
     }
 
     if to_add.is_empty() && to_remove.is_empty() {
-        eprintln!("変更なし ({} files 走査、{:?})。", cur.len(), t.elapsed());
+        let scan = t.elapsed();
         // built_at だけ再スタンプして返る。これをしないと mtime だけ変わったファイル (touch 等) が
         // 毎クエリ「古い」判定 → 空 update が永遠に走り続ける (実測で踏んだバグ)。
         if let Some(meta_t) = db.get_table("meta")
@@ -1747,6 +1750,7 @@ fn update_inner(db: Database, dir: &str) {
                 }
                 ins.commit().unwrap();
             }
+        eprintln!("変更なし ({} files 走査 {scan:?}、meta 再スタンプ {:?})。", cur.len(), t.elapsed() - scan);
         return;
     }
 
