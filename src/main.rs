@@ -100,38 +100,48 @@ fn main() {
         Some("stats") => kenning::cmd_stats(&args[2..]),
         Some("cache") => kenning::cmd_cache(&args[2..]),
         Some("bench") => kenning::cmd_bench(&args[2..]),
-        _ => {
-            eprintln!(
-                "kenning — enchudb-backed code intelligence (PoC)\n\
-                 探索コマンドの出力は `path:line<TAB>詳細` = そのまま Read に渡せる。\n\
-                 db は末尾 [db_path] / `--db P` / env KENNING_DB (default /tmp/kenning.db)。\n\n\
-                 index:\n  \
-                 index  [dir] [db] [--db P] [--scip F]  Rust ソースを full index (--scip で正確名前解決)\n  \
-                 update <dir> [db] | update <db>  変更分だけ増分 re-index (dir 省略で index の root)\n  \
-                 bake   [dir]                     rust-analyzer scip を焚いて精密 facts を焼き込む\n  \
-                 \u{0020}                              (空きメモリゲート + 直列 lock、常駐なし)\n\n\
-                 探索 (共通 flag: --db <path> / --limit <n>):\n  \
-                 def <name>                       名前の定義位置 (exact, path:line)\n  \
-                 read <name> [container]          定義本体をそのまま出す (def + Read の 1 手化)\n  \
-                 find <substr>                    名前の部分一致 (発見用、大小無視)\n  \
-                 text <term>                      全文検索 + どの関数内かの注釈 (grep superset)\n  \
-                 callers <name> [container]       精密 who-calls (確実 ∪ 未確定候補を位置付きで)\n  \
-                 callees <name> [container]       X が呼ぶ先 (outgoing、callers の鏡)\n  \
-                 edges                            全 cross-file call edge の集計 TSV (from TAB to TAB count)\n  \
-                 refs <name> [container]          正確 find-all-refs (要 --scip index、読み書き型も)\n  \
-                 impact <name> [container]        推移的 callers = 変えると壊れる範囲 (逆 BFS)\n  \
-                 tests <name> [container]         これに届くテスト = impact ∩ is_test (回す物の特定)\n  \
-                 impls <trait|type>               go-to-implementation (trait↔型)\n  \
-                 across <name>                    全 repo 横断: 全 repo db で定義/利用 + repo 跨ぎ精密参照\n  \
-                 path <from> <to>                 from→to の呼び出し経路 1 本 (前方 BFS)\n  \
-                 search <facet...>                faceted AND。例: kind:method vis:pub container:Engine\n  \
-                 \u{0020}                              facet= name: kind: vis: async: test: crate: container: module:\n  \
-                 outline <path>                   ファイルの symbol 一覧 (Read せず構造把握、末尾一致可)\n  \
-                 stats                            規模と名前解決率\n  \
-                 cache  [ls|prune] [--older-than D] [--dry-run]  自動 db の棚卸し / 掃除 (root 消失・旧版)\n  \
-                 bench  [quality|agent|micro|all] 再現可能ベンチ (--n/--nq/--seed、markdown 出力)"
-            );
+        Some("--version" | "-V" | "version") => println!("kenning {}", env!("CARGO_PKG_VERSION")),
+        Some("help" | "--help" | "-h") => println!("{USAGE}"),
+        other => {
+            if let Some(c) = other {
+                eprintln!("# 不明なコマンド: {c}\n");
+            }
+            eprintln!("{USAGE}");
             std::process::exit(1);
         }
     }
 }
+
+const USAGE: &str = concat!(
+    "kenning ", env!("CARGO_PKG_VERSION"), " — enchudb-backed code intelligence\n\
+     探索コマンドの出力は `path:line<TAB>詳細` = そのまま Read に渡せる。stdout はデータのみ、進捗は stderr。\n\
+     db は repo root から自動導出 (~/.cache/kenning/、自動作成・自動更新)。手動なら `--db P` / env KENNING_DB。\n\n\
+     index (普段は不要 — query が自動で面倒を見る):\n  \
+     index  [dir] [db] [--db P] [--scip F]  Rust ソースを full index (--scip で正確名前解決)\n  \
+     update <dir> [db] | update <db>  変更分だけ増分 re-index (dir 省略で index の root)\n  \
+     bake   [dir]                     rust-analyzer scip を焚いて精密 facts を焼き込む\n  \
+     \u{0020}                              (空きメモリゲート + 直列 lock、常駐なし)\n\n\
+     探索 (共通 flag: --db <path> / --limit <n>):\n  \
+     def <name>                       名前の定義位置 (exact, path:line)\n  \
+     read <name> [container] [crate:X] [path:S] [--all]  定義本体 (def + Read の 1 手化)。同名は絞るか --all\n  \
+     read <path>:<line>               その行を囲む item の本体 (非 Rust は見出し配下)\n  \
+     read <file>#<見出し>              md の見出し / toml の [table] / yaml のキー配下\n  \
+     find <substr>                    名前の部分一致 (発見用、大小無視)\n  \
+     text <term>... [-e] [path:S]     全文検索 + どの関数内かの注釈 (grep superset)。複数語 OR、-e 正規表現\n  \
+     callers <name> [container]       精密 who-calls (確実 ∪ 未確定候補を位置付きで)\n  \
+     callees <name> [container]       X が呼ぶ先 (outgoing、callers の鏡)\n  \
+     edges                            全 cross-file call edge の集計 TSV (from TAB to TAB count)\n  \
+     refs <name> [container]          正確 find-all-refs (要 --scip index、読み書き型も)\n  \
+     impact <name> [container]        推移的 callers = 変えると壊れる範囲 (逆 BFS)\n  \
+     tests <name> [container]         これに届くテスト = impact ∩ is_test (回す物の特定)\n  \
+     impls <trait|type>               go-to-implementation (trait↔型)\n  \
+     across <name>                    全 repo 横断: 全 repo db で定義/利用 + repo 跨ぎ精密参照\n  \
+     path <from> <to>                 from→to の呼び出し経路 1 本 (前方 BFS)\n  \
+     search <facet...>                faceted AND。例: kind:method vis:pub container:Engine\n  \
+     \u{0020}                              facet= name: kind: vis: async: test: crate: container: module:\n  \
+     outline <path|dir>               ファイルの symbol / 見出し一覧、dir なら配下 file の地図 (末尾一致可)\n  \
+     stats                            規模と名前解決率\n  \
+     cache  [ls|prune] [--older-than D] [--dry-run]  自動 db の棚卸し / 掃除 (root 消失・旧版)\n  \
+     bench  [quality|agent|micro|all] 再現可能ベンチ (--n/--nq/--seed、markdown 出力)\n\n\
+     `--version` / `help`"
+);

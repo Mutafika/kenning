@@ -81,6 +81,12 @@ const INDEX_VER: u32 = 7; // 7: dir 表 (鮮度判定の dir ゲート用) を�
 /// 立てる。open_ro 側の warn_if_stale が同じ stat-walk を繰り返さないため — 非 Rust の大 dir を
 /// 抱えた repo (例: ios/android 同梱) では walk がクエリ時間の支配項で、二重取りは丸ごと無駄。
 static STALE_CHECKED: AtomicBool = AtomicBool::new(false);
+/// query の前座 (自動 full index / 自動 update / heal) では stderr を要点 1 行に畳む。
+/// 明示 `kenning index` / `update` は計測用の内訳まで出す。stdout はどちらもデータのみ。
+static AUTO_QUIET: AtomicBool = AtomicBool::new(false);
+fn quiet() -> bool {
+    AUTO_QUIET.load(Ordering::Relaxed)
+}
 
 // ── 名前解決の信頼度 (call.res facet) ──
 // 推測はしない。曖昧・外部は resolved にせず callee_sym を空にする。
@@ -950,14 +956,17 @@ const PARSE_BATCH: usize = 512;
 /// `paths` を読んで parse し facts を返す (順序は `paths` と同じ)。parse は syn で tokio 725 files に
 /// 逐次 290ms / 12 thread 72ms。読めない・parse できない file は None。
 fn extract_parallel(paths: &[PathBuf]) -> Vec<Option<FileFacts>> {
-    let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, paths.len().max(1));
-    let chunk = paths.len().div_ceil(n).max(1);
+    par_map(paths, |p| std::fs::read_to_string(p).ok().and_then(|s| extract_file(&s)))
+}
+
+/// `items` を core 数で等分して scoped thread に撒き、結果を **入力順** で返す (出力の決定性は
+/// 呼び側が気にしなくていい)。parse (extract_parallel) と `text` の file 読みで共用。
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, items.len().max(1));
+    let chunk = items.len().div_ceil(n).max(1);
     std::thread::scope(|sc| {
-        let hs: Vec<_> = paths
-            .chunks(chunk)
-            .map(|c| sc.spawn(move || c.iter().map(|p| std::fs::read_to_string(p).ok().and_then(|s| extract_file(&s))).collect::<Vec<_>>()))
-            .collect();
-        hs.into_iter().flat_map(|h| h.join().expect("parse worker panicked")).collect()
+        let hs: Vec<_> = items.chunks(chunk).map(|c| sc.spawn(|| c.iter().map(&f).collect::<Vec<_>>())).collect();
+        hs.into_iter().flat_map(|h| h.join().expect("worker panicked")).collect()
     })
 }
 
@@ -1340,9 +1349,11 @@ const V9_SIDECAR_EXTS: [&str; 7] = ["oplog", "lock", "schema", "tables", "eidmap
 fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Option<&str>, cap_mult: u32) -> bool {
     wipe_db(tmp); // 前 loop (capacity 不足で panic) の作りかけ
 
-    eprintln!("=== kenning index: {} → {} ===", dir, path);
-    if let Some(sp) = scip_path {
-        eprintln!("(SCIP 正確解決: {})", sp);
+    if !quiet() {
+        eprintln!("=== kenning index: {} → {} ===", dir, path);
+        if let Some(sp) = scip_path {
+            eprintln!("(SCIP 正確解決: {})", sp);
+        }
     }
     let t_all = Instant::now();
 
@@ -1567,32 +1578,33 @@ fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Option<&str>, ca
     let resolve_el = t2.elapsed();
     let resolved = res_counts[R_UNIQUE as usize] + res_counts[R_QUALIFIED as usize];
 
-    eprintln!(
-        "indexed: {} files (+{} text) / {} symbols / {} call-sites (parse {:?} + resolve {:?}, {} parse-skip)",
-        n_files, n_text, n_sym, n_call, parse_el, resolve_el, n_skip
-    );
-    if acc.scip.is_some() {
+    let pct = if n_call > 0 { resolved as f64 * 100.0 / n_call as f64 } else { 0.0 };
+    if !quiet() {
         eprintln!(
-            "resolve[SCIP]: {} / {} 解決 ({:.1}%) = SCIP確定 {} + syn回収 {} (cfg非活性/SCIP沈黙を best-effort) — external/std {} (SCIP識別), 未解決 {}",
-            resolved,
-            n_call,
-            if n_call > 0 { resolved as f64 * 100.0 / n_call as f64 } else { 0.0 },
-            scip_ws,
-            syn_recovered,
-            scip_external,
-            res_counts[R_UNRESOLVED as usize] - scip_external,
+            "indexed: {} files (+{} text) / {} symbols / {} call-sites (parse {:?} + resolve {:?}, {} parse-skip)",
+            n_files, n_text, n_sym, n_call, parse_el, resolve_el, n_skip
         );
-    } else {
-        eprintln!(
-            "resolve[syn]: {} / {} call-sites 解決 ({:.1}%) — unique {} / qualified {} / ambiguous {} / external {}",
-            resolved,
-            n_call,
-            if n_call > 0 { resolved as f64 * 100.0 / n_call as f64 } else { 0.0 },
-            res_counts[R_UNIQUE as usize],
-            res_counts[R_QUALIFIED as usize],
-            res_counts[R_AMBIG as usize],
-            res_counts[R_UNRESOLVED as usize],
-        );
+        if acc.scip.is_some() {
+            eprintln!(
+                "resolve[SCIP]: {} / {} 解決 ({pct:.1}%) = SCIP確定 {} + syn回収 {} (cfg非活性/SCIP沈黙を best-effort) — external/std {} (SCIP識別), 未解決 {}",
+                resolved,
+                n_call,
+                scip_ws,
+                syn_recovered,
+                scip_external,
+                res_counts[R_UNRESOLVED as usize] - scip_external,
+            );
+        } else {
+            eprintln!(
+                "resolve[syn]: {} / {} call-sites 解決 ({pct:.1}%) — unique {} / qualified {} / ambiguous {} / external {}",
+                resolved,
+                n_call,
+                res_counts[R_UNIQUE as usize],
+                res_counts[R_QUALIFIED as usize],
+                res_counts[R_AMBIG as usize],
+                res_counts[R_UNRESOLVED as usize],
+            );
+        }
     }
 
     // ── ref-ingest: SCIP の全 occurrence を workspace sym への参照 edge にする (find-all-refs) ──
@@ -1636,7 +1648,9 @@ fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Option<&str>, ca
             }
         }
         drop(extref_t);
-        eprintln!("ref: {} workspace 参照 + {} 外部 crate 参照 (extref) を edge 化 ({:?})", n_ref, n_ext, t3.elapsed());
+        if !quiet() {
+            eprintln!("ref: {} workspace 参照 + {} 外部 crate 参照 (extref) を edge 化 ({:?})", n_ref, n_ext, t3.elapsed());
+        }
     }
 
     // ── impl edge を焼く (impl Trait for Type)。go-to-implementation 用。 ──
@@ -1651,7 +1665,9 @@ fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Option<&str>, ca
             .commit()
             .unwrap();
     }
-    eprintln!("impl: {} 個の impl Trait for Type edge", acc.impls.len());
+    if !quiet() {
+        eprintln!("impl: {} 個の impl Trait for Type edge", acc.impls.len());
+    }
     drop(impl_t);
 
     // 自己記述メタを焼く (root は絶対パスに正規化して、cwd に依らず update/staleness を効かせる)。
@@ -1691,13 +1707,17 @@ fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Option<&str>, ca
     if !swap_in(tmp, path) {
         return false;
     }
-    eprintln!(
-        "(index 内訳: parse+挿入 {parse_el:?} / finish+drop {fin_el:?} / 配置 {:?} / 全体 {:?})",
-        t_swap.elapsed(),
-        t_all.elapsed()
-    );
-    eprintln!("db real disk: {:.1} MB", real_bytes(Path::new(path)) as f64 / 1_048_576.0);
-    eprintln!("\n次: `kenning def <name>` / `callers <name>` / `search kind:fn vis:pub`");
+    if quiet() {
+        eprintln!("# full index 完了: {n_files} files (+{n_text} text) / {n_sym} symbols / 解決率 {pct:.1}% ({:.2?})", t_all.elapsed());
+    } else {
+        eprintln!(
+            "(index 内訳: parse+挿入 {parse_el:?} / finish+drop {fin_el:?} / 配置 {:?} / 全体 {:?})",
+            t_swap.elapsed(),
+            t_all.elapsed()
+        );
+        eprintln!("db real disk: {:.1} MB", real_bytes(Path::new(path)) as f64 / 1_048_576.0);
+        eprintln!("\n次: `kenning def <name>` / `callers <name>` / `search kind:fn vis:pub`");
+    }
     true
 }
 
@@ -1726,17 +1746,18 @@ pub fn run_update(dir: &str, path: &str) {
         }
     };
     let open = t.elapsed();
-    update_with_heal(db, dir, path, UpdateScan::Walk { trust_mtime: false }); // 明示 update = 全件 hash 照合 (mtime 巻き戻しの答え合わせ)
+    update_with_heal(db, dir, path, UpdateScan::Walk { trust_mtime: false }, "update"); // 明示 update = 全件 hash 照合 (mtime 巻き戻しの答え合わせ)
     eprintln!("(update 内訳: rw open {open:?} / 走査+書込+drop {:?})", t.elapsed() - open);
 }
 
 /// update を試み、失敗 (旧 schema の index 等で panic) したら full 再 index で自己修復。
 /// bake 済みの .scip が残っていれば精度も維持して焼き直す。
 /// `scan`: 走査方式 (UpdateScan)。明示 update は `Walk { trust_mtime: false }` = 全件 hash 照合。
-fn update_with_heal(db: Database, dir: &str, path: &str, scan: UpdateScan) {
+/// `why`: 自動 update の理由 (quiet 時の 1 行要約に載せる。明示 update は "update")。
+fn update_with_heal(db: Database, dir: &str, path: &str, scan: UpdateScan, why: &str) {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| update_inner(db, dir, scan)));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| update_inner(db, dir, scan, why)));
     std::panic::set_hook(prev);
     if r.is_err() {
         heal_full_reindex(dir, path, "増分 update 失敗 (旧 schema の index?)");
@@ -1767,7 +1788,7 @@ fn heal_full_reindex(dir: &str, path: &str, why: &str) {
 }
 
 /// update の本体 (open 済み db を受け取る)。auto-update (maybe_auto_update) と run_update が共用。
-fn update_inner(db: Database, dir: &str, scan: UpdateScan) {
+fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str) {
     // index 意味論の版が違えば増分は不整合 (旧値と新値が混ざる) → panic して
     // update_with_heal の full 再 index (.scip 再利用) に落とす。
     let mut built_at = 0u32; // 前回 index / update の開始時刻 (mtime 絞り込みの基準)
@@ -1902,7 +1923,9 @@ fn update_inner(db: Database, dir: &str, scan: UpdateScan) {
                 }
                 ins.commit().unwrap();
             }
-        eprintln!("変更なし ({} files 走査 / {n_read} 読込 {scan:?}、meta 再スタンプ {:?})。", cur.len(), t.elapsed() - scan);
+        if !quiet() {
+            eprintln!("変更なし ({} files 走査 / {n_read} 読込 {scan:?}、meta 再スタンプ {:?})。", cur.len(), t.elapsed() - scan);
+        }
         return;
     }
 
@@ -1980,20 +2003,24 @@ fn update_inner(db: Database, dir: &str, scan: UpdateScan) {
     }
 
     let n_changed = to_add.len() as u64;
-    eprintln!(
-        "update: {} 再 index / {} 削除 / {} 未変更 ({:?}, {} parse-skip)",
-        n_changed,
-        n_deleted,
-        cur.len() as u64 - n_changed,
-        t.elapsed(),
-        n_skip,
-    );
-    eprintln!(
-        "  新規 outgoing call {} / incoming 再解決 {} / affected 名前 {}",
-        n_new_call,
-        reresolved,
-        affected.len(),
-    );
+    if quiet() {
+        eprintln!("# {why} → 自動 update: {n_changed} 再 index / {n_deleted} 削除 ({:.1?})", t.elapsed());
+    } else {
+        eprintln!(
+            "update: {} 再 index / {} 削除 / {} 未変更 ({:?}, {} parse-skip)",
+            n_changed,
+            n_deleted,
+            cur.len() as u64 - n_changed,
+            t.elapsed(),
+            n_skip,
+        );
+        eprintln!(
+            "  新規 outgoing call {} / incoming 再解決 {} / affected 名前 {}",
+            n_new_call,
+            reresolved,
+            affected.len(),
+        );
+    }
 
     // meta を再スタンプ (built_at を現在に)。bake 情報は持ち越し + 変更数を積算 (閾値で bake 推奨)。
     // 旧 index (meta 表 / bake 列なし) は present なフィールドだけ扱い後方互換。
@@ -2031,7 +2058,9 @@ fn update_inner(db: Database, dir: &str, scan: UpdateScan) {
     drop(impl_t);
     assert_no_faults(&db, "update"); // 拒否された write があれば heal (full 再 index) へ
     drop(db); // standalone: drop で schema + data を永続化。
-    eprintln!("\n次: `kenning def <name>` / `callers <name>` / `search kind:fn vis:pub`");
+    if !quiet() {
+        eprintln!("\n次: `kenning def <name>` / `callers <name>` / `search kind:fn vis:pub`");
+    }
 }
 
 /// `update <db>` — dir 省略時: meta の root を読んで再 index (自己記述 index の活用)。
@@ -2673,6 +2702,7 @@ fn parse_opts(args: &[String]) -> Opts {
         }
     };
     if !no_auto {
+        AUTO_QUIET.store(true, Ordering::Relaxed); // query の前座: stderr は要点 1 行だけ
         // auto-index: 導出 db が無ければこの場で作る (root 既知の時のみ。明示 db は誤爆防止で作らない)。
         if !std::path::Path::new(&db).exists() {
             if let Some(root) = &auto_root {
@@ -2752,8 +2782,10 @@ fn maybe_auto_update(db_path: &str, auto_root: Option<&Path>) {
     };
     match Database::open(db_path) {
         Ok(db) => {
-            eprintln!("# {why_old} → 自動増分 update ({root})");
-            update_with_heal(db, &root, db_path, scan); // 旧 schema なら full 再 index で自己修復
+            if !quiet() {
+                eprintln!("# {why_old} → 自動増分 update ({root})");
+            }
+            update_with_heal(db, &root, db_path, scan, &why_old); // 旧 schema なら full 再 index で自己修復
         }
         Err(e) => {
             eprintln!("# ⚠ index が {} 日前だが lock を取れない ({e}) → 古い結果で回答。後で `kenning update` を。", age_days(built_at));
@@ -2796,6 +2828,13 @@ pub fn cmd_read(args: &[String]) {
         && looks_like_path(p)
     {
         run_read_section(&o.db, p, h);
+        return;
+    }
+    // `read <path>` (行も見出しも無し) = file 全体は Read tool の仕事。「定義が無い」+ 近い symbol 名を
+    // 返すと嘘になるので、outline を出して `:<line>` / `#<見出し>` へ誘導する。
+    if looks_like_path(first) {
+        eprintln!("# {first} は file → outline を出す (本体は read <path>:<line> / read <file>#<見出し>、全文は Read)");
+        run_outline(&o.db, first, o.limit);
         return;
     }
     let (mut container, mut crate_f, mut path_f) = (None, None, None);
@@ -3382,21 +3421,26 @@ fn run_impls(db_path: &str, name: &str, limit: usize) {
     }
 }
 
-/// `text <term>... [-e]` — 全文検索 (コメント/文字列も) + **enclosing symbol 注釈**。
+/// `text <term>... [-e] [path:S]` — 全文検索 (コメント/文字列も) + **enclosing symbol 注釈**。
 /// grep superset with structure: どの関数の中のヒットかが 1 行で分かる = 追い Read を 1 個消す。
 /// 検索対象は index 済みファイル (live に読む = 常に最新)。大小無視。
-/// 複数語は OR (`grep -E "a|b"` の代わり)、`-e` で各語を正規表現として扱う (`grep -E` 相当。
-/// これが無いと Claude が grep に戻る)。
+/// 複数語は OR (`grep -E "a|b"` の代わり)、`-e` で各語を正規表現として扱う (`grep -E` 相当)、
+/// `path:<substr>` で対象ファイルを絞る (`rg <pat> <dir>` の代わり)。これらが無いと Claude が grep に戻る。
+/// 末尾に `# N 件 / M files` を必ず出す (「何箇所で使われてる?」に数えずに答える)。
 pub fn cmd_text(args: &[String]) {
     let regex = args.iter().any(|a| a == "-e" || a == "--regex");
     let rest: Vec<String> = args.iter().filter(|a| *a != "-e" && *a != "--regex").cloned().collect();
     let o = parse_opts(&rest);
-    if o.pos.is_empty() {
-        eprintln!("usage: kenning text <term>... [-e] [--db P] [--limit N]   (複数語は OR、-e で正規表現)");
+    let (path_fs, terms): (Vec<&String>, Vec<&String>) = o.pos.iter().partition(|a| a.starts_with("path:"));
+    let path_fs: Vec<&str> = path_fs.iter().map(|a| &a["path:".len()..]).filter(|f| !f.is_empty()).collect();
+    let terms: Vec<String> = terms.into_iter().cloned().collect();
+    if terms.is_empty() {
+        eprintln!("usage: kenning text <term>... [-e] [path:<substr>] [--db P] [--limit N]");
+        eprintln!("  複数語は OR。-e で正規表現 (大小無視、区別するなら (?-i)Foo)。path: で対象ファイルを絞る (複数は OR)");
         return;
     }
-    let needle = o.pos.join(" | ");
-    let Some(m) = TextMatcher::new(&o.pos, regex) else { return };
+    let needle = terms.join(" | ");
+    let Some(m) = TextMatcher::new(&terms, regex) else { return };
     let Some(db) = open_ro(&o.db) else { return };
     let file_t = db.get_table("file").unwrap();
     let sym_t = db.get_table("sym").unwrap();
@@ -3420,15 +3464,18 @@ pub fn cmd_text(args: &[String]) {
             let er = file_t.entity(e);
             (txt(er.get("path")), e, num(er.get("lang")))
         })
+        .filter(|(p, _, _)| path_fs.is_empty() || path_fs.iter().any(|f| p.contains(f)))
         .collect();
     files.sort();
     let mut shown = 0usize;
     let mut total = 0usize;
-    for (path, fe, lang) in &files {
-        let Ok(src) = std::fs::read_to_string(path) else { continue };
-        if !m.hit(&src) {
-            continue; // ファイル単位の早期スキップ
-        }
+    let mut n_files = 0usize;
+    // 読みが支配的 (tokio 770 files で逐次 11ms) なので thread で撒き、hit した file の本文だけ持ち帰る。
+    // 注釈と出力は main thread で path 順 (決定的)。
+    let srcs = par_map(&files, |(path, _, _)| std::fs::read_to_string(path).ok().filter(|s| m.hit(s)));
+    for ((path, fe, lang), src) in files.iter().zip(srcs) {
+        let Some(src) = src else { continue }; // 読めない or file 単位で不一致
+        n_files += 1;
         let syms = syms_by_file.get(fe);
         // 非 Rust は sym を持たないので、本文から container を作る (見出し階層 / [table] / キーパス)。
         let containers = if *lang == LANG_RUST { Vec::new() } else { text_containers(*lang, &src) };
@@ -3474,46 +3521,35 @@ pub fn cmd_text(args: &[String]) {
             }
         }
     }
-    if total > shown {
-        println!("… (+{} 件省略、--limit {total} で全部)", total - shown);
-    }
+    let scope = if path_fs.is_empty() { String::new() } else { format!(" (path: {} の {} files)", path_fs.join(" | "), files.len()) };
     if total == 0 {
-        println!("# \"{needle}\" は index 済みファイルに無い (.rs + テキスト全般。binary と >1MiB と gitignore 済みは対象外)");
+        println!("# \"{needle}\" は index 済みファイルに無い{scope} (.rs + テキスト全般。binary と >1MiB と gitignore 済みは対象外)");
+    } else if total > shown {
+        println!("# {total} 件 / {n_files} files{scope} — 表示 {shown}、`--limit {total}` で全部");
+    } else {
+        println!("# {total} 件 / {n_files} files{scope}");
     }
 }
 
-/// `text` の一致判定。語の OR (大小無視の部分一致) か、`-e` の正規表現 (各語を `(?i)` で compile、OR)。
-enum TextMatcher {
-    Terms(Vec<String>),
-    Regex(Vec<regex::Regex>),
-}
+/// `text` の一致判定: 語は `regex::escape` して OR、`-e` なら各語をそのまま正規表現として OR。
+/// 1 本の regex に畳んで file 全体 → 行の順で当てる (語ごとに `to_lowercase` で全 file を複製する
+/// より速い: tokio 770 files で 20ms → 10ms 台)。大小無視は `(?i)` 相当、`-e` 側は `(?-i)` で打ち消せる。
+struct TextMatcher(regex::Regex);
 
 impl TextMatcher {
     fn new(terms: &[String], regex: bool) -> Option<TextMatcher> {
-        if !regex {
-            return Some(TextMatcher::Terms(terms.iter().map(|t| t.to_lowercase()).collect()));
-        }
-        let mut res = Vec::new();
-        for t in terms {
-            match regex::RegexBuilder::new(t).case_insensitive(true).build() {
-                Ok(re) => res.push(re),
-                Err(e) => {
-                    println!("# 正規表現が不正: {t}: {e}");
-                    return None;
-                }
+        let alts: Vec<String> = terms.iter().map(|t| if regex { format!("(?:{t})") } else { regex::escape(t) }).collect();
+        match regex::RegexBuilder::new(&alts.join("|")).case_insensitive(true).build() {
+            Ok(re) => Some(TextMatcher(re)),
+            Err(e) => {
+                println!("# 正規表現が不正: {}: {e}", terms.join(" | "));
+                None
             }
         }
-        Some(TextMatcher::Regex(res))
     }
     /// 文字列 (行でもファイル全体でも) に 1 語でも当たるか。
     fn hit(&self, s: &str) -> bool {
-        match self {
-            TextMatcher::Terms(ts) => {
-                let l = s.to_lowercase();
-                ts.iter().any(|t| l.contains(t))
-            }
-            TextMatcher::Regex(rs) => rs.iter().any(|re| re.is_match(s)),
-        }
+        self.0.is_match(s)
     }
 }
 
@@ -4045,20 +4081,26 @@ fn sym_qual(sym_t: &Table, eid: EntityId) -> String {
     if ct.is_empty() { nm } else { format!("{ct}::{nm}") }
 }
 
-/// `outline <path>` — ファイルの symbol 一覧。Read せず構造を掴む (path は末尾一致でも可)。
+/// `outline <path|dir>` — ファイルの symbol 一覧。Read せず構造を掴む (path は末尾一致でも可)。
+/// dir なら配下の index 済み file を symbol 数 / 行数付きで列挙 (crate の地図。`ls -R` + wc の代わり)。
 pub fn cmd_outline(args: &[String]) {
     let o = parse_opts(args);
     let Some(path_arg) = o.pos.first() else {
-        eprintln!("usage: kenning outline <path> [--db P]");
+        eprintln!("usage: kenning outline <path|dir> [--db P]");
         return;
     };
-    let Some(db) = open_ro(&o.db) else { return };
+    run_outline(&o.db, path_arg, o.limit);
+}
+
+/// outline の本体 (`read <path>` からも使う)。
+fn run_outline(db_path: &str, path_arg: &str, limit: usize) {
+    let Some(db) = open_ro(db_path) else { return };
     let file_t = db.get_table("file").unwrap();
     let sym_t = db.get_table("sym").unwrap();
     let paths = file_paths(&file_t);
 
     let Some(fe) = find_file(&file_t, &paths, path_arg) else {
-        eprintln!("# file not found: {path_arg}");
+        outline_dir(&file_t, &sym_t, &paths, path_arg, limit);
         return;
     };
     let path = paths.get(&fe).map(String::as_str).unwrap_or("?");
@@ -4070,17 +4112,47 @@ pub fn cmd_outline(args: &[String]) {
         };
         let containers = text_containers(num(file_t.entity(fe).get("lang")), &src);
         println!("# {path} : {} sections", containers.len());
-        for (l, c) in containers.iter().take(o.limit) {
+        for (l, c) in containers.iter().take(limit) {
             println!("{path}:{l}\t{c}");
         }
-        if containers.len() > o.limit {
-            println!("… (+{} 件省略、--limit で全部)", containers.len() - o.limit);
+        if containers.len() > limit {
+            println!("… (+{} 件省略、--limit で全部)", containers.len() - limit);
         }
         return;
     }
     let syms = sym_t.all().where_ref("file", fe).find().unwrap();
     println!("# {path} : {} symbols", syms.len());
-    print_syms(&sym_t, &paths, &syms, o.limit, true);
+    print_syms(&sym_t, &paths, &syms, limit, true);
+}
+
+/// `outline <dir>` — 配下の index 済み file を `path<TAB>N symbols / L loc` で列挙。相対 (`src`、
+/// `crates/foo`) は path 中の `/<dir>/` 一致、絶対は前方一致。無ければ file not found。
+fn outline_dir(file_t: &Table, sym_t: &Table, paths: &HashMap<EntityId, String>, dir_arg: &str, limit: usize) {
+    let pref = dir_arg.trim_end_matches('/');
+    let (abs, inner) = (format!("{pref}/"), format!("/{pref}/"));
+    let mut files: Vec<(&String, EntityId)> =
+        paths.iter().filter(|(_, p)| p.starts_with(&abs) || p.contains(&inner)).map(|(e, p)| (p, *e)).collect();
+    if pref.is_empty() || files.is_empty() {
+        eprintln!("# file not found: {dir_arg}");
+        return;
+    }
+    files.sort();
+    let mut n_syms: HashMap<EntityId, usize> = HashMap::new();
+    for s in sym_t.all().find().unwrap() {
+        *n_syms.entry(ref_of(sym_t.entity(s).get("file"))).or_default() += 1;
+    }
+    println!("# {pref} : {} files (詳細は outline <path>)", files.len());
+    for (p, e) in files.iter().take(limit) {
+        let er = file_t.entity(*e);
+        let loc = num(er.get("loc"));
+        match n_syms.get(e) {
+            Some(n) if num(er.get("lang")) == LANG_RUST => println!("{p}\t{n} symbols / {loc} loc"),
+            _ => println!("{p}\t{loc} loc"),
+        }
+    }
+    if files.len() > limit {
+        println!("… (+{} 件省略、--limit で全部)", files.len() - limit);
+    }
 }
 
 /// `stats` — index の規模と名前解決率。
@@ -5274,15 +5346,15 @@ mod tests {
         std::fs::write(&a, "pub fn alpha() {}\npub fn beta() {}\n").unwrap();
         let rolled = std::time::UNIX_EPOCH + std::time::Duration::from_secs(built_at as u64 - 100);
         std::fs::File::options().write(true).open(&a).unwrap().set_modified(rolled).unwrap();
-        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, UpdateScan::Walk { trust_mtime: true });
+        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, UpdateScan::Walk { trust_mtime: true }, "test");
         assert_eq!(count("beta"), 0, "mtime 信頼中に古い mtime のファイルを読んでいる (絞り込みが効いていない)");
-        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, UpdateScan::Walk { trust_mtime: false });
+        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, UpdateScan::Walk { trust_mtime: false }, "test");
         assert_eq!(count("beta"), 1, "全件 hash 照合が mtime 巻き戻しを拾えていない");
 
         // 普通の編集 (mtime = 今) は mtime 信頼中でも拾う。新規ファイルも同様
         std::fs::write(&a, "pub fn alpha() {}\npub fn beta() {}\npub fn gamma() {}\n").unwrap();
         std::fs::write(root.join("src/b.rs"), "pub fn delta() {}\n").unwrap();
-        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, UpdateScan::Walk { trust_mtime: true });
+        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, UpdateScan::Walk { trust_mtime: true }, "test");
         assert_eq!((count("gamma"), count("delta")), (1, 1), "mtime 信頼中に普通の編集 / 新規ファイルを取りこぼした");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5317,7 +5389,7 @@ mod tests {
             _ => panic!("編集した file が Stale に出ていない"),
         }
         // Stale 経路の update: walk せずその file だけ読んで反映
-        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, UpdateScan::Stale(vec![a.clone()]));
+        update_with_heal(Database::open(&db).unwrap(), &root_s, &db, UpdateScan::Stale(vec![a.clone()]), "test");
         let d = Database::open_readonly(&db).unwrap();
         assert_eq!(d.get_table("sym").unwrap().where_eq("name", "beta").find().unwrap().len(), 1, "Stale 経路で編集が反映されていない");
         drop(d);

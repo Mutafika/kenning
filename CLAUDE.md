@@ -9,7 +9,8 @@ grep+Read の代わりに、精密な少数行 (`path:line<TAB>詳細` = その�
 faceted) は `kenning <cmd>`、全文検索は `kenning text` — **`.rs` も `.md`/`.toml`/`.yml` も同じ 1 本**で、
 文脈注釈が付く分 grep の上位互換。db 管理は考えなくていい (自動)。
 grep に落ちるのは対象外だけ: binary / 1MiB 超 / gitignore 済み / 生成 lock ファイル。正規表現は `text -e`、
-同名 symbol は `read` の `crate:` / `path:` / `--all`、行の周辺は `read <path>:<line>`、md の見出し配下は `read <file>#<見出し>`。
+dir 絞りは `text … path:<dir>`、同名 symbol は `read` の `crate:` / `path:` / `--all`、行の周辺は `read <path>:<line>`、
+md の見出し配下は `read <file>#<見出し>`、crate の地図は `outline <dir>`。stderr は要点 1 行だけなので `2>/dev/null` は不要。
 
 ## 使い方 (儀式ゼロ: cd して聞くだけ)
 
@@ -24,7 +25,8 @@ kenning read    <name> [container] [crate:X] [path:S] [--all]  # 定義本体 (d
 kenning read    <path>:<line>       # その行を囲む item の本体 (grep -n → sed の代わり)。非 Rust は見出し配下
 kenning read    <file>#<見出し>      # md の見出し / toml の [table] / yaml のキー配下 (CHANGELOG を awk で切る代わり)
 kenning find    <substr>            # 名前の部分一致 (発見用)
-kenning text    <term>... [-e]      # 全文検索 + 文脈注釈 (.rs=関数 / .md=見出し階層 / .toml=[table])。複数語は OR、-e で正規表現
+kenning text    <term>... [-e] [path:S]  # 全文検索 + 文脈注釈 (.rs=関数 / .md=見出し階層 / .toml=[table])。複数語は OR、
+                                    #   -e で正規表現 ((?-i) で大小区別)、path: で dir 絞り。末尾に `# N 件 / M files`
 kenning callers <name> [container]  # who-calls: 確実 ∪ 未確定候補を位置付き
 kenning callees <name> [container]  # X が呼ぶ先 (outgoing)
 kenning edges                       # 全 cross-file call edge の集計 TSV (from TAB to TAB count)。依存グラフの素材
@@ -35,7 +37,8 @@ kenning impact  <name> [container]  # 変えると壊れる推移的 callers
 kenning tests   <name> [container]  # これに届くテスト = impact ∩ is_test (変更後に何を回すか)
 kenning path    <from> <to>         # from→to の呼び出し経路
 kenning search  kind:method vis:pub container:Engine calls:unwrap  # faceted AND
-kenning outline <path>              # ファイル構造 (Read せず)。.md/.toml/.yml は見出し構造 = read <file>#… の目次
+kenning outline <path|dir>          # ファイル構造 (Read せず)。.md/.toml/.yml は見出し構造 = read <file>#… の目次。
+                                    #   dir なら配下 file の地図 (symbol 数 / loc)。`read <path>` も同じ (file 全体は Read)
 kenning stats                       # 規模と名前解決率
 kenning cache [ls|prune] [--older-than D] [--dry-run]  # 自動 db の棚卸し / 掃除 (repo 消失・旧版を回収)
 ```
@@ -61,6 +64,7 @@ syn 層の索引は repo 全体のままなので、workspace 外は精度控え
 ## 出力の読み方 (Claude 向け)
 
 - 各行 `path:line<TAB>詳細` = **そのまま Read に渡せる**。stdout はデータのみ (装飾なし・決定的順序)。
+- stderr は自動 index / update の要点 1 行 (初回 2 行) と `⚠` 警告だけ。捨てずに読む (古い結果の警告が載る)。
 - `#` 行 = 件数と次の一手 (「確実 N + 候補 M」「絞る: callers X <container>」など)。
 - `callers` は **確実 (callee_sym 逆引き、誤りなし) + 候補 (未確定=要 Read で確認) + 別 sym に確定** の3分割。
   「全 caller を掴んだか」はこの3つの合計で判断でき、grep に戻らなくていい。

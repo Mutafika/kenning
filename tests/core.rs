@@ -461,3 +461,72 @@ fn text_supports_or_terms_and_regex() {
     assert!(out.contains("正規表現が不正"), "不正 regex の案内:\n{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// grep / ls に落ちる残りの場面: `text` の `path:` 絞りと件数行、`read <path>` は outline へ、
+/// `outline <dir>` は配下 file の地図 (symbol 数 / loc)。
+#[test]
+fn text_path_facet_count_line_and_outline_dir() {
+    let dir = tmp();
+    write_fixture(&dir, "pub fn caller() {\n    target(); // zzterm\n}\n");
+    std::fs::create_dir_all(dir.join("docs")).unwrap();
+    std::fs::write(dir.join("docs/A.md"), "# A\nzzterm one\n").unwrap();
+    std::fs::write(dir.join("docs/B.md"), "# B\nzzterm two\nzzterm three\n").unwrap();
+    let db = dir.join("k.db");
+    index(&dir, &db);
+
+    let out = query(&["text", "zzterm"], &db);
+    assert!(out.contains("# 4 件 / 3 files"), "件数行:\n{out}");
+    let out = query(&["text", "zzterm", "path:docs/"], &db);
+    assert!(out.contains("A.md:2") && out.contains("B.md:2") && !out.contains("other.rs"), "path: 絞り:\n{out}");
+    assert!(out.contains("# 3 件 / 2 files (path: docs/ の 2 files)"), "絞った件数行:\n{out}");
+    let out = query(&["text", "zzterm", "path:docs/", "--limit", "1"], &db);
+    assert!(out.contains("`--limit 3` で全部"), "省略の案内:\n{out}");
+    // -e は大小無視だが (?-i) で区別できる
+    assert!(query(&["text", "-e", "(?-i)ZZTERM"], &db).contains("index 済みファイルに無い"));
+    assert!(query(&["text", "-e", "ZZTERM"], &db).contains("# 4 件"));
+
+    // read <path> (行も見出しも無し) は outline へ。「定義が無い」+ 近い symbol 名は返さない
+    let out = query(&["read", "src/lib.rs"], &db);
+    assert!(out.contains("src/lib.rs : ") && out.contains("\tpub fn target"), "read <path>:\n{out}");
+    assert!(!out.contains("定義が index に無い"), "{out}");
+
+    // outline <dir>: 相対 dir は path 中の /<dir>/ 一致
+    let out = query(&["outline", "src"], &db);
+    assert!(out.contains("# src : 2 files"), "{out}");
+    assert!(out.contains("src/lib.rs\t") && out.contains(" symbols / ") && out.contains(" loc"), "{out}");
+    let out = query(&["outline", "docs"], &db);
+    assert!(out.contains("# docs : 2 files") && out.contains("A.md\t2 loc"), "{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 自動 index / 自動 update は stderr を要点だけに畳む (賑やかだと Claude が `2>/dev/null` を付けて
+/// ⚠ まで捨てる)。初回 = 2 行 (理由 + 完了)、編集後の query = 1 行、最新なら 0 行。`--version` も。
+#[test]
+fn auto_paths_keep_stderr_terse_and_version_prints() {
+    let out = kenning().arg("--version").output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), format!("kenning {}", env!("CARGO_PKG_VERSION")));
+
+    let home = tmp();
+    let repo = tmp();
+    write_fixture(&repo, OTHER_RS);
+    let run = |args: &[&str]| {
+        let out = kenning().args(args).current_dir(&repo).env("HOME", &home).env_remove("KENNING_DB").output().unwrap();
+        assert!(out.status.success(), "{args:?} failed: {out:?}");
+        (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let (o, e) = run(&["def", "target"]);
+    assert!(o.contains("src/lib.rs:3\t"), "{o}");
+    let lines: Vec<&str> = e.lines().collect();
+    assert_eq!(lines.len(), 2, "初回 auto index の stderr は 2 行:\n{e}");
+    assert!(lines[1].starts_with("# full index 完了: "), "{e}");
+    let (_, e) = run(&["def", "target"]);
+    assert!(e.is_empty(), "最新なら stderr は空:\n{e}");
+
+    std::thread::sleep(std::time::Duration::from_millis(1100)); // built_at は秒粒度
+    std::fs::write(repo.join("src/other.rs"), "pub fn caller() {\n    target();\n    target();\n}\n").unwrap();
+    let (_, e) = run(&["def", "target"]);
+    assert_eq!(e.lines().count(), 1, "編集後の auto update は 1 行:\n{e}");
+    assert!(e.contains("→ 自動 update: 1 再 index"), "{e}");
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&repo);
+}
