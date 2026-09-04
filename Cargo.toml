@@ -1,6 +1,6 @@
 [package]
 name = "kenning"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 rust-version = "1.89"        # enchudb 0.16+ の MSRV (std::fs::File::lock)。edition 2024 の下限 1.85 より上
 description = "Semantic code search for Rust, built for AI coding agents — rust-analyzer facts baked into an embedded faceted DB, served in microseconds"
