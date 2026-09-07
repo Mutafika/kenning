@@ -730,3 +730,97 @@ fn file_level_cfg_test_marks_every_symbol_in_the_file() {
     let g = extract_file("fn helper() {}\n#[test]\nfn t() {}\n").unwrap();
     assert_eq!(g.syms.iter().filter(|s| s.is_test).count(), 1);
 }
+
+/// 提案の正規化層: 書き方違い (snake↔camel、大小) は同じキーに落ちる。
+/// Claude の typo で最も多いのがこれで、token 層だけでは 1 件も救えていなかった。
+#[test]
+fn norm_key_folds_case_and_separators() {
+    assert_eq!(norm_key("cmd_read"), "cmdread");
+    assert_eq!(norm_key("CmdRead"), "cmdread");
+    assert_eq!(norm_key("cmdRead"), "cmdread");
+    assert_eq!(norm_key("TextMatcher"), "textmatcher");
+    assert_ne!(norm_key("cmd_read"), norm_key("cmd_reads"));
+}
+
+/// 打ち切り付き編集距離: 1〜2 文字の typo だけを救い、遠い名前は拾わない (提案のノイズ防止)。
+#[test]
+fn edit_within_accepts_only_small_typos() {
+    assert!(edit_within("cmdread", "cmdread", 1));
+    assert!(edit_within("cmdreed", "cmdread", 1), "1 文字置換");
+    assert!(edit_within("runindexiner", "runindexinner", 1), "1 文字欠落");
+    assert!(!edit_within("cmdreed", "cmdread", 0));
+    assert!(!edit_within("cmdread", "cmdwrite", 2), "遠い名前を拾うと提案が濁る");
+    assert!(!edit_within("ab", "abcdef", 2), "長さ差での早期棄却");
+}
+
+/// 正規化層の配点: 完全一致 > typo > 部分名。短い名前ほど typo 許容を狭める (ノイズ抑制)。
+#[test]
+fn suggest_score_norm_ranks_spelling_over_substring() {
+    assert_eq!(suggest_score_norm("cmdread", "cmdread"), 6, "書き方違いだけ = 最優先");
+    assert_eq!(suggest_score_norm("cmdreed", "cmdread"), 5, "1 文字 typo");
+    assert_eq!(suggest_score_norm("readtext", "readtextfile"), 2, "部分名");
+    assert_eq!(suggest_score_norm("cmdread", "totallyunrelated"), 0);
+    // 綴り一致は部分一致 (最大 2 + token 層) より必ず上 = 正解が候補の山に埋もれない
+    assert!(suggest_score_norm("cmdreed", "cmdread") > suggest_score_norm("readtext", "readtextfile") + 2);
+    assert_eq!(suggest_score_norm("abcd", "abce"), 5, "短い名前でも 1 文字違いは救う");
+    assert_eq!(suggest_score_norm("cmdrefs", "cmdread"), 0, "短い名前の 2 文字違いは別 symbol とみなす");
+}
+
+/// `text` の一致判定: 既定は OR (1 本に畳む)、`--and` は全語が同じ行に要る。
+#[test]
+fn text_matcher_or_and_modes() {
+    let terms = vec!["lock".to_string(), "db".to_string()];
+    let or = TextMatcher::new(&terms, false, false).unwrap();
+    assert_eq!(or.0.len(), 1, "OR は 1 本の regex に畳む (速い)");
+    assert!(or.hit("just a lock"));
+    assert!(or.hit("just a DB"), "大小無視");
+    assert!(!or.hit("neither"));
+
+    let and = TextMatcher::new(&terms, false, true).unwrap();
+    assert_eq!(and.0.len(), 2);
+    assert!(and.hit("lock the db"));
+    assert!(!and.hit("just a lock"), "片方だけの行は AND では落ちる");
+
+    // -e: 語を正規表現として扱う。AND と併用できる。
+    let re = TextMatcher::new(&["fn cmd_\\w+".to_string(), "pub".to_string()], true, true).unwrap();
+    assert!(re.hit("pub fn cmd_read(args: &[String]) {"));
+    assert!(!re.hit("fn cmd_read(args: &[String]) {"));
+}
+
+/// `<path>:<from>-<to>` の解釈: `:` の後ろだけを見るので file 名の `-` と衝突しない。
+/// 逆順は黙って直す (打ち間違いで「0 行」を返すより有用)。
+#[test]
+fn split_path_range_parses_line_ranges() {
+    assert_eq!(split_path_range("src/a.rs:10-20"), Some(("src/a.rs", 10, 20)));
+    assert_eq!(split_path_range("bench/vs-ra.sh:1-5"), Some(("bench/vs-ra.sh", 1, 5)), "file 名の - と衝突しない");
+    assert_eq!(split_path_range("src/a.rs:20-10"), Some(("src/a.rs", 10, 20)), "逆順は直す");
+    assert_eq!(split_path_range("src/a.rs:10"), None, "単一行は従来の path:line 経路へ");
+    assert_eq!(split_path_range("src/a.rs:0-5"), None, "1-indexed なので 0 は無効");
+    assert_eq!(split_path_range("Engine::run"), None, "symbol 名を範囲と誤読しない");
+}
+
+/// 修飾名の分解: kenning 自身が出す `Type::method` を、そのまま次のコマンドに渡せるようにする鍵。
+#[test]
+fn split_qualified_splits_type_and_method() {
+    assert_eq!(split_qualified("Engine::open_readonly"), ("open_readonly", Some("Engine")));
+    assert_eq!(split_qualified("a::b::c"), ("c", Some("b")), "直近の親を container にする");
+    assert_eq!(split_qualified("cmd_read"), ("cmd_read", None));
+    assert_eq!(split_qualified("::x"), ("::x", None), "壊れた形は素の名前として扱う");
+    assert_eq!(split_qualified("x::"), ("x::", None));
+}
+
+/// bake が RA に渡す config は **立っているキーだけ**書く (空キーで RA の既定を潰さない)。
+/// RUSTFLAGS はユーザー入力なので JSON として壊れない形に逃がす。
+#[test]
+fn ra_config_writes_only_the_keys_that_are_set() {
+    assert_eq!(ra_config(true, ""), r#"{"cargo": {"features": "all"}}"#);
+    assert_eq!(
+        ra_config(false, "--cfg tokio_unstable"),
+        r#"{"cargo": {"extraEnv": {"RUSTFLAGS": "--cfg tokio_unstable"}}}"#
+    );
+    assert_eq!(
+        ra_config(true, "--cfg a"),
+        r#"{"cargo": {"features": "all", "extraEnv": {"RUSTFLAGS": "--cfg a"}}}"#
+    );
+    assert!(ra_config(false, "--cfg x=\"y\"").contains(r#"x=\"y\""#), "引用符を escape する");
+}

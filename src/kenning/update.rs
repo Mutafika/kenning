@@ -253,7 +253,10 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
                 rel_path: String::new(), // update は syn 再解決 (rel_path/col は使わない)
                 name: name.clone(),
                 qualifier: if qual_s.is_empty() { None } else { Some(qual_s) },
-                is_method: num(er.get("is_method")) == 1,
+                is_method: num(er.get("is_method")) >= M_RECV,
+                self_recv: num(er.get("is_method")) == M_SELF,
+                as_value: num(er.get("res")) == R_VALUE, // 値渡し参照は再解決後も候補どまり
+                in_macro: num(er.get("res")) == R_MACRO,  // 字句走査由来も同じく候補どまり
                 line: num(er.get("line")),
                 col: 0,
             };
@@ -325,7 +328,7 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
             if let Some(Value::Number(p)) = peak_mb {
                 ins = ins.set("bake_peak_mb", p as u32);
             }
-            if b > 0 && upd >= 20 {
+            if b > 0 && upd >= SCIP_STALE_FILES {
                 eprintln!("# SCIP facts が古くなってきた (bake 後 {upd} ファイル変更) → `kenning bake` 推奨");
             }
         }
@@ -376,6 +379,21 @@ pub(crate) fn read_meta(db: &Database) -> Option<(String, u32)> {
     let e = meta_t.all().find().ok()?.into_iter().next()?;
     let er = meta_t.entity(e);
     Some((txt(er.get("root")), num(er.get("built_at"))))
+}
+
+/// SCIP facts の鮮度: bake 済みなら「bake 後に変更されたファイル数」。未 bake なら None。
+/// stderr の bake 推奨は流れるので、refs のように **0 件が嘘になり得る** 出力では stdout にも出す。
+pub(crate) fn scip_stale_files(db: &Database) -> Option<u32> {
+    let meta_t = db.get_table("meta")?;
+    let e = meta_t.all().find().ok()?.into_iter().next()?;
+    let er = meta_t.entity(e);
+    match (er.get("baked_at"), er.get("upd_since_bake")) {
+        (Some(Value::Number(b)), u) if b > 0 => Some(match u {
+            Some(Value::Number(n)) => n as u32,
+            _ => 0,
+        }),
+        _ => None,
+    }
 }
 
 /// meta を「鮮度判定に使える形」で読む → Ok((root, built_at, ver)) / Err(確認できない理由)。

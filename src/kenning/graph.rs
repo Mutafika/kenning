@@ -52,8 +52,13 @@ pub fn cmd_across(args: &[String]) {
         let (Some(file_t), Some(sym_t), Some(call_t)) = (db.get_table("file"), db.get_table("sym"), db.get_table("call")) else {
             return (out, syms, true);
         };
-        let defs = sym_t.where_eq("name", name.as_str()).find().unwrap_or_default();
-        let name_calls = call_t.where_eq("callee", name.as_str()).count().unwrap_or(0);
+        // 修飾名 (`Engine::open_readonly`) でも通す: bare name で引いて container で絞る。
+        let (bare, cont) = split_qualified(&name);
+        let mut defs = sym_t.where_eq("name", bare).find().unwrap_or_default();
+        if let Some(c) = cont {
+            defs.retain(|&e| txt(sym_t.entity(e).get("container")) == c);
+        }
+        let name_calls = call_t.where_eq("callee", bare).count().unwrap_or(0);
         if defs.is_empty() && name_calls == 0 {
             return (out, syms, true);
         }
@@ -178,14 +183,14 @@ pub fn cmd_refs(args: &[String]) {
     let paths = file_paths(&file_t);
 
     if ref_t.all().count().unwrap() == 0 {
-        println!("# ref table が空 = SCIP 無しで index された。`index <dir> --scip <f>` で正確 refs が使える。");
+        println!("# ref table が空 = SCIP 無しで index された → refs は常に 0。`kenning bake` で精密化、今すぐなら `callers {name}` / `find {name}`。");
         return;
     }
+    // SCIP は bake 時点のスナップショット。古いまま「0 refs」を返すと **静かな偽陰性** になるので、
+    // 出力の最後で必ず言う (stderr の bake 推奨は見落とされる前提)。
+    let stale = scip_stale_files(&db).filter(|u| *u >= SCIP_STALE_FILES);
 
-    let mut defs = sym_t.where_eq("name", name).find().unwrap();
-    if let Some(c) = container {
-        defs.retain(|&e| txt(sym_t.entity(e).get("container")) == c);
-    }
+    let defs = defs_of(&sym_t, name, container);
     if defs.is_empty() {
         println!("# \"{name}\" の定義が index に無い。");
         suggest_similar(&sym_t, &paths, name);
@@ -209,9 +214,11 @@ pub fn cmd_refs(args: &[String]) {
         return;
     }
 
+    let mut total_refs = 0usize;
     for &d in &defs {
         println!("{}", fmt_sym(&sym_t, &paths, d));
         let refs = ref_t.where_eq("symbol_sym", Value::Ref(d)).find().unwrap();
+        total_refs += refs.len();
         let mut rows: Vec<(String, u32, u32)> = refs
             .iter()
             .map(|&r| {
@@ -230,6 +237,11 @@ pub fn cmd_refs(args: &[String]) {
     }
     // refs は SCIP 確定のみ = 精密だが cfg 非活性/未解析域は落ちる。superset が要るなら find/grep。
     println!("# SCIP 確定参照のみ (誤りなし)。cfg 非活性/未解析域は含まない → superset は `find {name}` / grep。");
+    match (stale, total_refs) {
+        (Some(u), _) => println!("# ⚠ SCIP は bake 後 {u} ファイル変更で古い → 欠落/0 件は偽陰性の可能性。`kenning bake` で焼き直すか `callers {name}` (syn 層は常に最新) で確認を。"),
+        (None, 0) => println!("# 0 件 = 本当に未参照 か SCIP 未カバー (macro/cfg)。`callers {name}` で候補も含めて確認を。"),
+        _ => {}
+    }
 }
 
 // ─────────────────────────── 多段 graph (推移的 callers / 呼び出し経路) ───────────────────────────
@@ -259,13 +271,69 @@ pub(crate) fn suggest_score(tokens: &[&str], lname: &str, ldn: &str) -> u32 {
     score
 }
 
+/// 比較用の正規化キー: 小文字 + 区切り (`_` / 記号) 除去。`CmdRead` / `cmdRead` / `cmd_read` が
+/// 同じキーになる。token 分割だけでは snake↔camel の取り違えを 1 件も救えなかったので足した層。
+pub(crate) fn norm_key(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
+/// 編集距離 (Levenshtein) が `max` 以下か。長さ差で早期棄却 + 行の最小値が `max` を超えたら打ち切り
+/// なので、全 symbol に回しても実質定数時間 (`cmd_reed` → `cmd_read` のような 1 文字違いを救う)。
+pub(crate) fn edit_within(a: &str, b: &str, max: usize) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    if a.len().abs_diff(b.len()) > max {
+        return false;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        let mut row_min = cur[0];
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            row_min = row_min.min(cur[j]);
+        }
+        if row_min > max {
+            return false; // この行から先は縮まない
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()] <= max
+}
+
+/// 正規化キー同士の近さ (token 層に上乗せする点)。完全一致 (書き方違いだけ) を最優先、
+/// 次に typo、最後に包含。**綴りがほぼ一致する名前は、部分一致の山より必ず上に出す** —
+/// 同点だと `run_index_iner` の 1 位が (名前順で) `index` になり、正解が埋もれた。
+/// typo 許容は短い名前ほど狭い (`cmd_refs` のような別 symbol を候補に混ぜないため)。
+pub(crate) fn suggest_score_norm(qkey: &str, dkey: &str) -> u32 {
+    if qkey.is_empty() || dkey.is_empty() {
+        return 0;
+    }
+    if qkey == dkey {
+        return 6; // CmdRead / cmdread → cmd_read (区切りと大小だけの違い)
+    }
+    let max = if qkey.len() <= 8 { 1 } else { 2 };
+    if edit_within(qkey, dkey, max) {
+        return 5; // cmd_reed → cmd_read
+    }
+    let (long, short) = if qkey.len() >= dkey.len() { (qkey, dkey) } else { (dkey, qkey) };
+    if short.len() >= SUGGEST_MIN_TOKEN && long.contains(short) {
+        return 2; // 部分名 (readtextfile ⊃ readtext)
+    }
+    0
+}
+
 pub(crate) fn suggest_similar(sym_t: &Table, paths: &HashMap<EntityId, String>, name: &str) {
     let lname = name.to_lowercase();
     let tokens = suggest_tokens(&lname);
+    let qkey = norm_key(name);
     let mut best: HashMap<String, (u32, EntityId)> = HashMap::new(); // name → (score, 代表 eid)
     for e in sym_t.all().find().unwrap() {
         let dn = txt(sym_t.entity(e).get("name"));
-        let score = suggest_score(&tokens, &lname, &dn.to_lowercase());
+        let ldn = dn.to_lowercase();
+        // token 層 (部分名) + 正規化層 (書き方違い / typo) の合算。片方が 0 でも他方で救う。
+        let score = suggest_score(&tokens, &lname, &ldn) + suggest_score_norm(&qkey, &norm_key(&dn));
         if score > 0 {
             let slot = best.entry(dn).or_insert((0, e));
             if score > slot.0 { *slot = (score, e); }
@@ -287,8 +355,23 @@ pub(crate) fn suggest_similar(sym_t: &Table, paths: &HashMap<EntityId, String>, 
     }
 }
 
-/// name[+container] → 定義 eid 群 (callers/refs/impact/path 共通、DRY)。
+/// `Type::method` / `mod::name` を (name, container) に割る。Rust の symbol 名に `::` は無いので誤爆しない。
+/// **kenning 自身の出力が修飾名を出す** (提案の `Engine::open_readonly`、callers の `IndexLock::acquire`) のに
+/// それを次のコマンドに渡すと「無い。近い名前: Engine::open_readonly」と自己矛盾していたので、入口で受ける。
+/// `a::b::c` は直近の親を container にする (`b`)。
+pub(crate) fn split_qualified(s: &str) -> (&str, Option<&str>) {
+    match s.rsplit_once("::") {
+        Some((c, n)) if !c.is_empty() && !n.is_empty() => (n, Some(c.rsplit("::").next().unwrap_or(c))),
+        _ => (s, None),
+    }
+}
+
+/// name[+container] → 定義 eid 群 (def/read/callers/callees/refs/impact/tests/path 共通、DRY)。
+/// container 未指定なら `Type::method` 形を分解して受ける (出力 → 次のコマンドの往復を閉じる)。
 pub(crate) fn defs_of(sym_t: &Table, name: &str, container: Option<&str>) -> Vec<EntityId> {
+    // 名前は常に分解する (`read C::dup C` のように両方来ても壊れない)。container は明示が優先。
+    let (name, parsed) = split_qualified(name);
+    let container = container.or(parsed);
     let mut defs = sym_t.where_eq("name", name).find().unwrap();
     if let Some(c) = container {
         defs.retain(|&e| txt(sym_t.entity(e).get("container")) == c);
@@ -296,20 +379,140 @@ pub(crate) fn defs_of(sym_t: &Table, name: &str, container: Option<&str>) -> Vec
     defs
 }
 
-/// 逆方向 BFS: 起点 = 全定義。depth 別に確定 caller を層状に集める (impact / tests 共用)。
-/// 返り値 [depth1 の層, depth2 の層, …] (起点は含まない)。
-pub(crate) fn caller_bfs(call_t: &Table, defs: &[EntityId]) -> Vec<Vec<EntityId>> {
+/// 推移的に到達不能な定義 (= 消せる候補) を **保守的な規則の反復**で求める。
+///
+/// 前向き到達性 (root から辿って着かない物 = dead) は理屈は正しいが、**call graph の解決率に
+/// 直結する**: 未解決 edge があるとそこで伝播が止まり、生きている物まで dead に見える
+/// (enchudb は bake 済み・解決率 41.7% でも 354 件の過大報告になった)。
+///
+/// そこで逆向きの保守規則を反復する: 「live な定義からの流入が 1 本も無い非 root」を落とし、
+/// 落ちた物からの流入を無効化して、また落とす — 収束するまで。流入は **確定 edge だけでなく
+/// 名前一致 (未解決の候補) も数える**ので、解決できなかった呼び出しは「生きている証拠」として
+/// 効く。1 段しか見ない `callers:0` と違い、鎖や相互再帰の dead な塊もまとめて出る
+/// (enchudb で「消す → 再実行 → また 1 件」を 3 周した実例への対処)。
+/// root = pub / #[test] / trait 実装 / `main` / no_mangle 等の外向き属性 / item 直下マクロからの参照。
+pub(crate) fn dead_by_elimination(call_t: &Table, sym_t: &Table) -> HashSet<EntityId> {
+    // 名前 → その名前を持つ全定義 (未解決の呼び出しは「その名前の定義すべてへの流入」として数える)。
+    let mut by_name: HashMap<String, Vec<EntityId>> = HashMap::new();
+    let all_syms = sym_t.all().find().unwrap_or_default();
+    for &e in &all_syms {
+        by_name.entry(txt(sym_t.entity(e).get("name"))).or_default().push(e);
+    }
+    // call 表を 1 パスして「誰から誰へ」を作る (node ごとに query すると repo 規模で効く)。
+    // caller 無し (item 直下のマクロ) は永久 root 扱い = そこからの流入は常に live。
+    let mut inbound: HashMap<EntityId, Vec<Option<EntityId>>> = HashMap::new(); // 流入先 → 流入元 (None = item 直下)
+    let rows = call_t.all().find();
+    for c in rows.unwrap_or_default() {
+        let er = call_t.entity(c);
+        let from = match er.get("caller") {
+            Some(Value::Ref(f)) => Some(f),
+            _ => None,
+        };
+        match er.get("callee_sym") {
+            Some(Value::Ref(t)) => inbound.entry(t).or_default().push(from),
+            _ => {
+                for &t in by_name.get(&txt(er.get("callee"))).map(|v| v.as_slice()).unwrap_or(&[]) {
+                    inbound.entry(t).or_default().push(from);
+                }
+            }
+        }
+    }
+    // cfg で分岐した同名定義 (`#[cfg(unix)] fn f` と `#[cfg(not(unix))] fn f`) は、**syn は両方**
+    // 読むが SCIP は活性側しか知らないため、非活性側に流入が付かず必ず dead に見える。
+    // 索引が cfg-blind であることの副作用なので、cfg 属性を持つ同名多重定義は候補から外す。
+    let cfg_twin: HashSet<EntityId> = all_syms
+        .iter()
+        .copied()
+        .filter(|&e| {
+            let er = sym_t.entity(e);
+            txt(er.get("attrs")).contains("cfg(")
+                && by_name.get(&txt(er.get("name"))).is_some_and(|v| v.len() > 1)
+        })
+        .collect();
+    let mut dead: HashSet<EntityId> = HashSet::new();
+    loop {
+        let mut newly = Vec::new();
+        for &e in &all_syms {
+            if dead.contains(&e) || cfg_twin.contains(&e) || is_live_root(sym_t, e) {
+                continue;
+            }
+            let alive_in = inbound
+                .get(&e)
+                .map(|v| v.iter().any(|f| match f {
+                    None => true,                              // item 直下からの参照 = 常に live
+                    Some(f) => *f != e && !dead.contains(f),   // 自己再帰は生存の根拠にしない
+                }))
+                .unwrap_or(false);
+            if !alive_in {
+                newly.push(e);
+            }
+        }
+        if newly.is_empty() {
+            break;
+        }
+        dead.extend(newly);
+    }
+    dead
+}
+
+/// 到達性の起点になる定義か。外から呼ばれ得る = call 表に現れなくても生きている物。
+pub(crate) fn is_live_root(sym_t: &Table, e: EntityId) -> bool {
+    let er = sym_t.entity(e);
+    let kind = num(er.get("kind"));
+    if kind != K_FN && kind != K_METHOD {
+        return true; // 型 / 定数は「呼ばれる」物ではない。call graph からは死活を判定できないので触らない
+    }
+    if num(er.get("vis")) == V_PUB || num(er.get("is_test")) == 1 || num(er.get("trait_impl")) == 1 {
+        return true; // 外部 crate / テストランナー / trait dispatch から入ってくる
+    }
+    if txt(er.get("name")) == "main" {
+        return true; // エントリポイント
+    }
+    let a = txt(er.get("attrs")).to_lowercase();
+    ["no_mangle", "export_name", "proc_macro", "wasm_bindgen", "ctor", "used"].iter().any(|k| a.contains(k))
+}
+
+/// s を **確定させずに参照している** caller。値渡し (`map(s)`) と受け手不明の method 呼び
+/// (`x.s()`) は callee_sym を持たない (誤確定を避けて候補どまりにしている) ので名前で引く。
+/// 名前が一意な定義を指す時だけ辿る — 同名が複数あると誰への参照か決まらないため。
+/// これが無いと「変えると壊れる範囲」に穴が空く (`sig_text` の impact が 0 sym と出ていた。実際は 45)。
+pub(crate) fn value_ref_callers(call_t: &Table, sym_t: &Table, s: EntityId) -> Vec<EntityId> {
+    let name = txt(sym_t.entity(s).get("name"));
+    if name.is_empty() || sym_t.where_eq("name", name.as_str()).count().unwrap_or(0) != 1 {
+        return Vec::new();
+    }
+    call_t
+        .where_eq("callee", name.as_str())
+        .find()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|&c| matches!(num(call_t.entity(c).get("res")), R_VALUE | R_METHOD))
+        .map(|c| ref_of(call_t.entity(c).get("caller")))
+        .collect()
+}
+
+/// 逆方向 BFS: 起点 = 全定義。depth 別に caller を層状に集める (impact / tests 共用)。
+/// `follow_value` で値渡し参照の edge も辿る (既定 on — 影響範囲の問いは**見落としの方が危険**)。
+/// 返り値 ([depth1 の層, depth2 の層, …], 値参照 edge で初めて到達した sym 数)。起点は含まない。
+pub(crate) fn caller_bfs(call_t: &Table, sym_t: &Table, defs: &[EntityId], follow_value: bool) -> (Vec<Vec<EntityId>>, usize) {
     let mut depth: HashMap<EntityId, u32> = defs.iter().map(|&d| (d, 0)).collect();
     let mut frontier: Vec<EntityId> = defs.to_vec();
     let mut by_depth: Vec<Vec<EntityId>> = Vec::new();
+    let mut n_via_value = 0usize;
     let mut d = 0u32;
     while !frontier.is_empty() && d < 64 {
         let mut next = Vec::new();
         for &s in &frontier {
-            for caller in direct_callers(call_t, s) {
+            let confirmed = direct_callers(call_t, s);
+            let n_conf = confirmed.len();
+            let via: Vec<EntityId> = if follow_value { value_ref_callers(call_t, sym_t, s) } else { Vec::new() };
+            for (i, caller) in confirmed.into_iter().chain(via).enumerate() {
                 if let std::collections::hash_map::Entry::Vacant(e) = depth.entry(caller) {
                     e.insert(d + 1);
                     next.push(caller);
+                    if i >= n_conf {
+                        n_via_value += 1; // 確定 edge でなく値参照で初めて届いた
+                    }
                 }
             }
         }
@@ -319,7 +522,7 @@ pub(crate) fn caller_bfs(call_t: &Table, defs: &[EntityId]) -> Vec<Vec<EntityId>
         frontier = next;
         d += 1;
     }
-    by_depth
+    (by_depth, n_via_value)
 }
 
 /// s を確定 edge で呼ぶ直接 caller の sym eid 群 (逆方向)。
@@ -362,17 +565,21 @@ pub(crate) fn print_sym_layer(sym_t: &Table, paths: &HashMap<EntityId, String>, 
     }
 }
 
-/// `impact <name> [container]` — 推移的 callers (逆方向 BFS)。「これを変えると壊れる範囲」。
+/// `impact <name> [container] [--confirmed-only]` — 推移的 callers (逆方向 BFS)。
+/// 「これを変えると壊れる範囲」= **見落としの方が危険**な問いなので、既定では値渡し参照
+/// (`map(f)`、名前が一意な時だけ) も辿る。確定 edge だけ見たい時は `--confirmed-only`。
 pub fn cmd_impact(args: &[String]) {
-    let o = parse_opts(args);
+    let follow_value = !args.iter().any(|a| a == "--confirmed-only");
+    let rest: Vec<String> = args.iter().filter(|a| *a != "--confirmed-only").cloned().collect();
+    let o = parse_opts(&rest);
     let Some(name) = o.pos.first() else {
-        eprintln!("usage: kenning impact <name> [container] [--db P] [--limit N]");
+        eprintln!("usage: kenning impact <name> [container] [--confirmed-only] [--db P] [--limit N]");
         return;
     };
-    run_impact(&o.db, name, o.pos.get(1).map(String::as_str), o.limit);
+    run_impact(&o.db, name, o.pos.get(1).map(String::as_str), o.limit, follow_value);
 }
 
-pub(crate) fn run_impact(db_path: &str, name: &str, container: Option<&str>, limit: usize) {
+pub(crate) fn run_impact(db_path: &str, name: &str, container: Option<&str>, limit: usize, follow_value: bool) {
     let Some(db) = open_ro(db_path) else { return };
     let file_t = db.get_table("file").unwrap();
     let sym_t = db.get_table("sym").unwrap();
@@ -385,7 +592,7 @@ pub(crate) fn run_impact(db_path: &str, name: &str, container: Option<&str>, lim
         suggest_similar(&sym_t, &paths, name);
         return;
     }
-    let by_depth = caller_bfs(&call_t, &defs);
+    let (by_depth, via_value) = caller_bfs(&call_t, &sym_t, &defs, follow_value);
     for &def in &defs {
         println!("{}", fmt_sym(&sym_t, &paths, def));
     }
@@ -394,24 +601,31 @@ pub(crate) fn run_impact(db_path: &str, name: &str, container: Option<&str>, lim
         println!("  depth {} ({} sym){}:", i + 1, layer.len(), if i == 0 { " = 直接 callers" } else { "" });
         print_sym_layer(&sym_t, &paths, layer, limit, "    ");
     }
-    println!("# 推移的 callers: {total} sym (確定 edge のみ = 影響の下界。候補/未解決 edge は未算入 → `callers` で確認)");
+    let via = match (follow_value, via_value) {
+        (false, _) => " (確定 edge のみ = 影響の下界。候補/未解決 edge は未算入 → `callers` で確認)".to_string(),
+        (true, 0) => " (確定 edge のみで到達。名前一致どまりの候補 edge は未算入 → `callers` で確認)".to_string(),
+        (true, n) => format!(" (うち {n} sym は値渡し参照 `map(f)` 経由 = 確定 edge ではない。確定だけなら `--confirmed-only`)"),
+    };
+    println!("# 推移的 callers: {total} sym{via}");
 }
 
 /// `tests <name> [container]` — この sym を (推移的に) 呼ぶテスト = impact ∩ is_test。
 /// 「これを変えたらどのテストを回すか」を 1 コマンドで。
 pub fn cmd_tests(args: &[String]) {
-    let o = parse_opts(args);
+    let follow_value = !args.iter().any(|a| a == "--confirmed-only");
+    let rest: Vec<String> = args.iter().filter(|a| *a != "--confirmed-only").cloned().collect();
+    let o = parse_opts(&rest);
     let Some(name) = o.pos.first() else {
-        eprintln!("usage: kenning tests <name> [container] [--db P] [--limit N]");
+        eprintln!("usage: kenning tests <name> [container] [--confirmed-only] [--db P] [--limit N]");
         return;
     };
-    run_tests(&o.db, name, o.pos.get(1).map(String::as_str), o.limit);
+    run_tests(&o.db, name, o.pos.get(1).map(String::as_str), o.limit, follow_value);
 }
 
 /// `cargo test -- <filter...>` のヒントに載せる最大テスト数 (多すぎたら cargo test 全部が早い)。
 pub(crate) const TESTS_HINT_MAX: usize = 8;
 
-pub(crate) fn run_tests(db_path: &str, name: &str, container: Option<&str>, limit: usize) {
+pub(crate) fn run_tests(db_path: &str, name: &str, container: Option<&str>, limit: usize, follow_value: bool) {
     let Some(db) = open_ro(db_path) else { return };
     let file_t = db.get_table("file").unwrap();
     let sym_t = db.get_table("sym").unwrap();
@@ -429,7 +643,8 @@ pub(crate) fn run_tests(db_path: &str, name: &str, container: Option<&str>, limi
     }
     // BFS 全層から is_test=1 だけ拾う (depth = 起点からの呼び出し距離)。
     let mut tests: Vec<(u32, EntityId)> = Vec::new();
-    for (i, layer) in caller_bfs(&call_t, &defs).iter().enumerate() {
+    let (layers, via_value) = caller_bfs(&call_t, &sym_t, &defs, follow_value);
+    for (i, layer) in layers.iter().enumerate() {
         for &e in layer {
             if num(sym_t.entity(e).get("is_test")) == 1 {
                 tests.push((i as u32 + 1, e));
@@ -437,7 +652,7 @@ pub(crate) fn run_tests(db_path: &str, name: &str, container: Option<&str>, limi
         }
     }
     if tests.is_empty() {
-        println!("# {name} に届くテストなし (確定 edge のみ。候補 edge の見逃しは `callers {name}` の⚠で確認)");
+        println!("# {name} に届くテストなし ({}。候補 edge の見逃しは `callers {name}` の⚠で確認)", if follow_value { "確定 edge + 値渡し参照" } else { "確定 edge のみ" });
         return;
     }
     tests.sort_by_key(|&(d, e)| {
@@ -450,7 +665,12 @@ pub(crate) fn run_tests(db_path: &str, name: &str, container: Option<&str>, limi
     if tests.len() > limit {
         println!("  … (+{} 件省略、--limit で全部)", tests.len() - limit);
     }
-    println!("# {name} に届くテスト: {} 件 (確定 edge のみ = 下界)", tests.len());
+    let how = match (follow_value, via_value) {
+        (false, _) => "確定 edge のみ = 下界".to_string(),
+        (true, 0) => "確定 edge のみで到達 = 下界".to_string(),
+        (true, n) => format!("経路に値渡し参照 {n} sym を含む。確定だけなら `--confirmed-only`"),
+    };
+    println!("# {name} に届くテスト: {} 件 ({how})", tests.len());
     // そのまま貼れる実行ヒント (libtest は複数 filter を OR で受ける)。
     let names: Vec<String> = tests.iter().map(|&(_, e)| txt(sym_t.entity(e).get("name"))).collect::<HashSet<_>>().into_iter().collect();
     if names.len() <= TESTS_HINT_MAX {
@@ -528,7 +748,11 @@ pub(crate) fn run_path(db_path: &str, from: &str, to: &str) {
 }
 
 /// sym eid → "Container::name" (経路の compact ラベル)。
+/// eid 0 = caller 無し = **関数の外 (item 直下のマクロ引数など)**。空欄で出すと読めないので明示する。
 pub(crate) fn sym_qual(sym_t: &Table, eid: EntityId) -> String {
+    if eid == 0 {
+        return "(item 直下)".to_string();
+    }
     let er = sym_t.entity(eid);
     let ct = txt(er.get("container"));
     let nm = txt(er.get("name"));

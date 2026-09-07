@@ -661,17 +661,14 @@ pub fn cmd_bench(args: &[String]) {
         .get_table("meta")
         .and_then(|t| t.all().find().unwrap().into_iter().next().map(|e| matches!(t.entity(e).get("baked_at"), Some(Value::Number(b)) if b > 0)))
         .unwrap_or(false);
-    let resolved: usize = [R_UNIQUE, R_QUALIFIED]
-        .iter()
-        .map(|&r| call_t.where_eq("res", r).count().unwrap())
-        .sum();
-    let n_call = call_t.all().count().unwrap();
+    let rs = ResolveStats::of(&call_t);
     println!(
-        "corpus `{}` — {} files / {} call-sites / 解決率 {:.1}% / {}\n",
+        "corpus `{}` — {} files / {} call-sites (うち repo 内 {}) / repo 内確定率 {:.1}% / {}\n",
         root,
         files.len(),
-        n_call,
-        if n_call > 0 { resolved as f64 * 100.0 / n_call as f64 } else { 0.0 },
+        rs.total,
+        rs.local(),
+        rs.local_pct(),
         if baked { "**baked (SCIP)**" } else { "syn-only (未 bake)" }
     );
 

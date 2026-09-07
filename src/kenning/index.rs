@@ -59,6 +59,10 @@ pub(crate) fn index_locked(dir: &str, path: &str, scip_path: Option<&str>, reuse
         eprintln!("# 待った index がこの repo の現行版 → 再利用 (焼き直し省略)");
         return false;
     }
+    // full 再 index は SCIP facts を落とす (syn 層だけの db になる)。以前 bake 済みだと
+    // `impact` / `callers` の精度が **黙って** 下がるので、焼き直しを促す。
+    // (INDEX_VER を上げた日に自分で踏んだ穴: impact が 44 sym → 5 sym に落ちて原因が分からなくなる)
+    let was_baked = scip_path.is_none() && was_baked_before(path);
     sweep_leftovers(path); // lock を握っている = 他に作成中の process は居ない = 残骸と断定できる
     let tmp = tmp_db_path(path);
     let mut cap_mult = 1u32;
@@ -78,7 +82,12 @@ pub(crate) fn index_locked(dir: &str, path: &str, scip_path: Option<&str>, reuse
                 .unwrap_or_else(|| "<non-string panic>".into())
         };
         match r {
-            Ok(placed) => return placed,
+            Ok(placed) => {
+                if placed && was_baked {
+                    eprintln!("# ⚠ 再 index で SCIP facts が落ちた (以前は bake 済み) → 精密モードは `kenning bake` で焼き直しを");
+                }
+                return placed;
+            }
             Err(e) if cap_mult < 64 => {
                 cap_mult *= 4;
                 eprintln!("# index 失敗 ({}) → capacity {cap_mult}x で再試行", msg_of(e));
@@ -90,6 +99,11 @@ pub(crate) fn index_locked(dir: &str, path: &str, scip_path: Option<&str>, reuse
             }
         }
     }
+}
+
+/// この db が (再 index の前に) bake 済みだったか。meta の baked_at を見るだけ。
+pub(crate) fn was_baked_before(path: &str) -> bool {
+    Database::open_readonly(path).ok().and_then(|db| scip_stale_files(&db)).is_some()
 }
 
 /// 同じ db への full index を process 間で直列化する flock (`<db>.index.lock`)。
@@ -256,12 +270,14 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         .number("vis")
         .number("is_async")
         .number("is_test")
+        .number("trait_impl")
         .ref_to("file", "file")
         .tag("module")
         .tag("crate_")
         .tag("container")
         .tag("symbol") // SCIP グローバル一意 symbol (無指定なら "")。cross-file 同一性の鍵
         .tag("sig") // fn/method のシグネチャ 1 行 (hover 相当。他 kind は "")
+        .tag("attrs") // 正規化済み属性 (`allow(dead_code) inline`)。facet `attr:` の材料
         .tag("doc") // doc コメント 1 行目 (無ければ ""。def/outline で sig と並べて出す)
         .number("line")
         .number("end_line") // item 終端行 (`read` の切り出し下端。旧 index は 0 = 開始行のみ)
@@ -269,10 +285,12 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         .build()
         .unwrap();
     db.table("call")
-        .ref_to("caller", "sym")
+        // **列順に意味がある**: enchudb の `.all()` は先頭列の index を走査するので、値が無い行は
+        // 全走査から消える。item 直下の参照 (caller 無し) を落とさないよう、常に値がある callee を先頭に。
         .tag("callee")            // 単純名 (text fallback / 表示用)
+        .ref_to("caller", "sym")  // 呼び出し元 sym (item 直下は未 set)
         .ref_to("callee_sym", "sym") // 解決先 sym (未解決なら未 set = Null)
-        .number("res")            // 信頼度 (R_UNRESOLVED..R_AMBIG)
+        .number("res")            // 信頼度 (R_UNRESOLVED..R_EXTERNAL)
         .tag("qual")              // 修飾 (Type::/mod::。無ければ "")。増分の再解決用に永続化
         .number("is_method")      // x.f() 形式か。同上
         .ref_to("file", "file")
@@ -368,27 +386,43 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
 
     // ── pass2: callee を解決して call を挿入。SCIP があれば位置 join、無ければ syn ヒューリ ──
     let t2 = Instant::now();
-    let n_call = acc.pending.len() as u64;
-    let mut res_counts = [0u64; 4]; // [unresolved, unique, qualified, ambiguous]
+    // 値渡し参照のうち定義表に無い名前 (= 局所変数) は記録しないので、pending より少なくなる。
+    let n_call = acc.pending.iter().filter(|cs| !(cs.as_value || cs.in_macro) || acc.defs.contains_key(&cs.name)).count() as u64;
+    let mut res_counts = [0u64; RES_NAMES.len()]; // [unresolved, unique, qualified, ambiguous, value-ref]
     let mut scip_ws = 0u64; // SCIP occurrence が workspace 定義に確定
     let mut scip_external = 0u64; // SCIP は symbol を知ってるが自 index 外 (std/dep)
     let mut syn_recovered = 0u64; // SCIP 沈黙 (no-occ) を syn ヒューリで拾った数
     let diag = std::env::var_os("KENNING_DIAG_NOOCC").is_some();
     let mut d_nodoc = 0u64; // no-occ かつ SCIP に doc 自体が無い (test-helper/例外ファイル)
     let mut d_indoc = 0u64; // no-occ だが doc はある = 位置ズレ (macro/closure 等)
-    let mut d_indoc_method = 0u64; // うち method 呼び (x.f())
+    let mut d_indoc_method = 0u64;
+    let mut d_sameline = 0u64; // 同じ行に occurrence はある = 列の対応ズレ (join の取りこぼし) // うち method 呼び (x.f())
     let mut d_samples: Vec<String> = Vec::new();
     for cs in &acc.pending {
-        let (target, res) = if let Some(scip) = &acc.scip {
+        if (cs.as_value || cs.in_macro) && !acc.defs.contains_key(&cs.name) {
+            continue; // 定義表に無い名前 = 局所変数 / 外部。call 表をノイズで膨らませない
+        }
+        let (target, res) = if cs.in_macro {
+            (None, R_MACRO) // 字句走査の当て推量 → SCIP があっても確定させない
+        } else if cs.as_value {
+            // 値として渡しただけ = 呼ぶのは渡した先。SCIP が参照を知っていても **call として確定させない**
+            // (「確実 = 誤りなし」を守る)。使われているかは候補として見える。
+            (None, R_VALUE)
+        } else if let Some(scip) = &acc.scip {
             match scip.symbol_at(&cs.rel_path, cs.line, cs.col) {
                 Some(sym) => match acc.sym_by_symbol.get(sym) {
+                    Some(&AMBIGUOUS_SYMBOL) => {
+                        // symbol がターゲット間で衝突 → どの定義か決められない。syn の規準に落とす。
+                        let (t, r) = resolve_call(cs, &acc.defs);
+                        (t, r)
+                    }
                     Some(&eid) => {
                         scip_ws += 1;
                         (Some(eid), R_UNIQUE) // workspace の定義に確定
                     }
                     None => {
                         scip_external += 1;
-                        (None, R_UNRESOLVED) // std/dep/macro (SCIP は知ってるが自 index に無い)
+                        (None, R_EXTERNAL) // std/dep/macro (SCIP は知ってるが自 index に無い)
                     }
                 },
                 // SCIP がこの位置に occurrence を出さない = 主に cfg 非活性コード
@@ -398,6 +432,12 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
                     if diag {
                         if scip.has_doc(&cs.rel_path) {
                             d_indoc += 1;
+                            // 同じ行に occurrence はあるか = RA がこの行を見てはいるか。
+                            // 実測では **別トークン** の occurrence (assert_eq / Ok / Some) だけがあり、
+                            // method の解決が無い = RA の型推論がその body に届いていない形が多い。
+                            if (0..COL_PROBE).any(|c| scip.symbol_at(&cs.rel_path, cs.line, c).is_some()) {
+                                d_sameline += 1;
+                            }
                             if cs.is_method {
                                 d_indoc_method += 1;
                             }
@@ -429,8 +469,8 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
     }
     if diag {
         eprintln!(
-            "[DIAG] no-occ 内訳: doc欠落={} / doc有り(位置ズレ)={} (うち method={}, path/fn={}) | syn 回収={}",
-            d_nodoc, d_indoc, d_indoc_method, d_indoc - d_indoc_method, syn_recovered
+            "[DIAG] no-occ 内訳: doc欠落={} / doc有り={} (うち method={}, path/fn={}, 同一行に別 occ あり={}) | syn 回収={}",
+            d_nodoc, d_indoc, d_indoc_method, d_indoc - d_indoc_method, d_sameline, syn_recovered
         );
         eprintln!("[DIAG] doc有り no-occ サンプル:");
         for s in &d_samples {
@@ -440,7 +480,11 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
     let resolve_el = t2.elapsed();
     let resolved = res_counts[R_UNIQUE as usize] + res_counts[R_QUALIFIED as usize];
 
-    let pct = if n_call > 0 { resolved as f64 * 100.0 / n_call as f64 } else { 0.0 };
+    // 率の分母は **外部呼び出しを除いた repo 内 call-site**。std/dep への呼び出しは index に
+    // 定義が無く解決不能なので、混ぜると corpus の外部依存率を精度として報告してしまう。
+    let n_ext = res_counts[R_EXTERNAL as usize];
+    let n_local = n_call - n_ext;
+    let pct = pct_of(resolved as usize, n_local as usize);
     if !quiet() {
         eprintln!(
             "indexed: {} files (+{} text) / {} symbols / {} call-sites (parse {:?} + resolve {:?}, {} parse-skip)",
@@ -448,23 +492,24 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         );
         if acc.scip.is_some() {
             eprintln!(
-                "resolve[SCIP]: {} / {} 解決 ({pct:.1}%) = SCIP確定 {} + syn回収 {} (cfg非活性/SCIP沈黙を best-effort) — external/std {} (SCIP識別), 未解決 {}",
+                "resolve[SCIP]: repo 内 {} 件中 {} 件確定 ({pct:.1}%) = SCIP確定 {} + syn回収 {} (cfg非活性/SCIP沈黙を best-effort) — 外部/std {} (うち SCIP識別 {}), 未解決 {}",
+                n_local,
                 resolved,
-                n_call,
                 scip_ws,
                 syn_recovered,
+                n_ext,
                 scip_external,
-                res_counts[R_UNRESOLVED as usize] - scip_external,
+                res_counts[R_UNRESOLVED as usize],
             );
         } else {
             eprintln!(
-                "resolve[syn]: {} / {} call-sites 解決 ({pct:.1}%) — unique {} / qualified {} / ambiguous {} / external {}",
+                "resolve[syn]: repo 内 {} 件中 {} 件確定 ({pct:.1}%) — unique {} / qualified {} / ambiguous {} / 外部 {}",
+                n_local,
                 resolved,
-                n_call,
                 res_counts[R_UNIQUE as usize],
                 res_counts[R_QUALIFIED as usize],
                 res_counts[R_AMBIG as usize],
-                res_counts[R_UNRESOLVED as usize],
+                res_counts[R_EXTERNAL as usize],
             );
         }
     }
@@ -478,6 +523,7 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         for o in &scip.occ {
             let Some(&file_eid) = acc.file_by_rel.get(&o.rel_path) else { continue };
             match acc.sym_by_symbol.get(&o.symbol) {
+                Some(&AMBIGUOUS_SYMBOL) => {} // 衝突した symbol の参照はどの定義の物か決められない → 記録しない
                 Some(&sym_eid) => {
                     ref_t
                         .insert()

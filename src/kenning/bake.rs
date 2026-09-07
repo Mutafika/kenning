@@ -247,10 +247,18 @@ pub fn run_bake(dir: &str) {
     let n_src = rust_files(&bake_s).count(); // 「薄い SCIP」判定は bake 対象の規模と比べる
     let mut peak_mb = 0u64;
     let mut baked = false;
+    // repo が RUSTFLAGS で custom cfg を要求する形 (tokio の `--cfg tokio_unstable` など) は
+    // Cargo.toml に現れないので当てられない。**repo 側の事情は repo を知っている人が渡す** —
+    // 渡された分だけ RA に注入する (実測: tokio で確定 11,235 → 12,332、59.2% → 65.0%)。
+    let rustflags = std::env::var("KENNING_BAKE_RUSTFLAGS").unwrap_or_default();
+    if !rustflags.is_empty() {
+        eprintln!("# bake: RUSTFLAGS={rustflags} を RA に注入 (KENNING_BAKE_RUSTFLAGS)");
+    }
     for attempt in 0..2 {
         let all = use_all && attempt == 0;
-        if all {
-            std::fs::write(&cfg_path, r#"{"cargo": {"features": "all"}}"#).unwrap();
+        // features=all も RUSTFLAGS も無い時だけ config を書かない (= RA の既定で焚く)。
+        if all || !rustflags.is_empty() {
+            std::fs::write(&cfg_path, ra_config(all, &rustflags)).unwrap();
         }
         eprintln!(
             "# bake: rust-analyzer scip {} (features={}) — peak ~{:.1}GB / 数十秒〜数分 (上限 {timeout}s)、常駐なし",
@@ -265,7 +273,7 @@ pub fn run_bake(dir: &str) {
             std::process::Command::new(&ra)
         };
         cmd.args(["scip", &bake_s, "--output", &scip_path]);
-        if all {
+        if all || !rustflags.is_empty() {
             cmd.args(["--config-path", &cfg_path]);
         }
         cmd.current_dir(&bake_s);
@@ -353,4 +361,34 @@ pub fn run_bake(dir: &str) {
             }
         }
     eprintln!("# 精密 facts 有効: refs / callers が RA 同等精度に (`kenning refs <name>`)");
+}
+
+/// RA の `--config-path` に渡す JSON。features=all と RUSTFLAGS を必要な分だけ載せる
+/// (空のキーを書くと RA 側の既定を上書きしてしまうので、立っている物だけ書く)。
+pub(crate) fn ra_config(all: bool, rustflags: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if all {
+        parts.push(r#""features": "all""#.to_string());
+    }
+    if !rustflags.is_empty() {
+        parts.push(format!(r#""extraEnv": {{"RUSTFLAGS": {}}}"#, json_str(rustflags)));
+    }
+    format!(r#"{{"cargo": {{{}}}}}"#, parts.join(", "))
+}
+
+/// JSON 文字列リテラル化 (RUSTFLAGS に " や \ が入っても config を壊さない)。
+pub(crate) fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

@@ -77,31 +77,49 @@ enchudb-oplog = { path = "../enchudb/crates/enchudb-oplog" }
 
 ```
 kenning def     <name>              definition + signature + first doc line (hover)
+                                    (<name> also takes the qualified `Type::method` form, so a name
+                                    kenning prints can be pasted straight back as an argument)
 kenning read    <name> [container] [crate:X] [path:S] [--all]
                                     the definition body itself (def + file-read in one step);
                                     narrow same-named symbols, or --all to print every one
 kenning read    <path>:<line>       the item enclosing that line (grep -n → sed, in one step)
+kenning read    <path>:<from>-<to>  a line range (`sed -n 'A,Bp'`), headed by the definitions /
+                                    headings the range spans
 kenning read    <file>#<heading>    one .md heading / .toml [table] / .yml key section
 kenning find    <substr>            fuzzy discovery over symbol names *and* file names
                                     (the `find -name '*x*'` half, so "where is that file" stays here)
-kenning text    <term>... [-e] [path:S]
+kenning text    <term>... [-e] [--and] [--files] [path:S]
                                     full-text search over every text file, annotated with
                                     context (.rs: enclosing symbol, .md: heading path, .toml:
-                                    table). Several terms = OR, -e = regex, path: = dir filter
+                                    table). Several terms = OR by default, --and = every term on
+                                    the line (`grep X | grep Y`), -e = regex, --files = per-file
+                                    hit counts (`rg -c`, for triaging a wide term), path: = dir filter
 kenning callers <name> [container]  who-calls: confirmed ∪ unresolved candidates, with positions
 kenning callees <name> [container]  outgoing calls
 kenning edges                       all cross-file call edges, aggregated (from\tto\tcount TSV)
 kenning refs    <name> [container]  find-all-references (needs bake; includes type refs, read/write)
 kenning impls   <trait|type>        go-to-implementation, both directions
-kenning impact  <name> [container]  transitive callers = blast radius of a change (reverse BFS)
+kenning impact  <name> [container] [--confirmed-only]
+                                    transitive callers = blast radius (reverse BFS). Value
+                                    references (map(f)) are followed by default — for a blast
+                                    radius, a miss is worse than a maybe
 kenning tests   <name> [container]  tests that reach this symbol = impact ∩ is_test
 kenning path    <from> <to>         one call path from A to B (forward BFS)
 kenning across  <name>              cross-repo precise references over every indexed repo
-kenning search  kind:method vis:pub container:Engine   faceted equality-AND
+kenning search  kind:method vis:pub container:Engine path:engine.rs   faceted equality-AND
+kenning search  reachable:0         definitions unreachable from live roots (pub / #[test] / trait
+                                    impls / main / item-level macro args) = deletion candidates.
+                                    Finds dead chains and mutually-recursive dead clusters in one pass
+kenning search  attr:<substr>       attribute substring (deprecated / allow(dead_code) / serde / cfg)
+kenning search  kind:fn callers:0 namecalls:0 test:0   the one-hop version (in-degree 0). definitions nothing calls (deletion
+                                    candidates). callers = confirmed edges, namecalls = name matches.
+                                    Add traitimpl:0 for methods — trait impls are called through the trait.
+                                    Names that appear textually outside their definition are dropped
+                                    automatically (DSL macros etc.); --no-lexical keeps them
 kenning outline <path|dir>          file structure without reading the file; a directory maps
                                     the files under it (symbol count / loc), `.` maps the repo
 kenning bake                        run rust-analyzer once, ingest SCIP → RA-grade precision
-kenning stats                       index size + resolution rate
+kenning stats   [path:<substr>]     index size + resolution breakdown; path: narrows to a subtree
 kenning cache   [ls|prune]          list / prune auto-derived indexes (missing repo, old format,
                                     --older-than D, --dry-run)
 kenning --version                   version
@@ -123,14 +141,23 @@ wrong:
 | `KENNING_NO_IGNORE=1` | index gitignored `.rs` too (repos whose build generates sources) |
 | `KENNING_BAKE_TIMEOUT=<sec>` | cap one rust-analyzer run (default 900). On timeout `bake` kills the process group, falls back to default features, and remembers that choice per repo |
 | `KENNING_BAKE_DEFAULT_FEATURES=1` | skip `features = "all"` from the start |
+| `KENNING_BAKE_RUSTFLAGS=<flags>` | extra `RUSTFLAGS` for the rust-analyzer run — for repos whose code is behind a custom cfg that never appears in `Cargo.toml` (`--cfg tokio_unstable` moves tokio from 59.2 % to 65.0 %) |
 | `KENNING_RA=<path>` | rust-analyzer binary to use for `bake` |
 
 ## Design points
 
-- **Honest completeness.** `callers` returns three labeled sets: *confirmed* (reverse lookup
+- **Honest completeness.** Calls inside macros that do not parse as Rust (`proptest!` and friends) are
+  recovered lexically and labeled `[macro-token]` — candidates only, never promoted to confirmed.
+  A function passed *as a value* (`map(f)` / `any(f)`) shows up as a
+  `[value-ref]` candidate — the call happens wherever it was handed to, so it is never promoted to
+  confirmed, but "is this still used?" is answerable. `callers` returns three labeled sets: *confirmed* (reverse lookup
   of resolved edges — no false positives), *candidates* (same-name call-sites not yet
   resolved — check these), and *resolved-to-other*. The union is grep-complete, the labels
   tell you which rows you can trust blindly. The tool never guesses.
+- **A method call with an unknown receiver is never confirmed.** syn cannot know the type of
+  `x` in `x.f()`, so even a repo-unique method name stays a located `[method-name]` candidate.
+  Only `self.f()` (receiver = the enclosing impl type) and whatever SCIP answers get confirmed.
+  Without that line, `.next()` / `.len()` show up as "confirmed callers" of your same-named method.
 - **cfg-blind recovery.** rust-analyzer only analyzes the active cfg configuration, so SCIP
   is silent inside `#[cfg(...)]` branches that are off. `syn` sees every branch. Where SCIP
   is silent, resolution falls back to a conservative syn resolver — kenning finds impls
@@ -140,7 +167,11 @@ wrong:
   never get. What that buys varies by crate, and we print it rather than assume it: on tokio's
   workspace it is marginal today (8,934 SCIP-confirmed edges with `all` vs 8,853 with default),
   while on enchudb `features = "all"` stalls past the timeout and `bake` falls back to default
-  features. Resolution rates are printed, not hidden.
+  features. Resolution rates are printed, not hidden — but **the denominator excludes external
+  calls**: a call into std or a dependency has no definition in the index and is structurally
+  unresolvable, so mixing it in reports the corpus's external-dependency ratio as if it were
+  precision (47 % of tokio's call-sites are external). `stats` prints the breakdown too
+  (external / same-name-ambiguous / value-ref / macro-token).
 - **The index is a derived artifact.** It lives in `~/.cache/kenning/`, never in your
   repo, keyed by repo root. Delete it any time; it rebuilds on the next question.
 - **Cross-repo.** SCIP symbols are globally unique (crate + version), so `across` joins
@@ -187,7 +218,7 @@ repo — before it, that was the one claim here with no measurement under it.
 
 **Head-to-head vs rust-analyzer** ([bench/VS-RA.md](bench/VS-RA.md), `./bench/vs-ra.sh`):
 time and memory to go from cold to "can answer who-calls" — RA (`analysis-stats`, its own bench
-tool): 18.9 s / 3.1 GB on enchudb, vs kenning syn index: 0.29 s / 130 MB, zero resident after.
+tool): 18.9 s / 3.1 GB on enchudb, vs kenning syn index: 0.30 s / 136 MB, zero resident after.
 Precision trade and feature-scope caveats are written next to the table.
 
 **Head-to-head vs CodeQL** ([bench/VS-CODEQL.md](bench/VS-CODEQL.md), `./bench/vs-codeql.sh`):
@@ -212,23 +243,29 @@ twice. The order of magnitude is the claim, not the third decimal.
 
 **Head-to-head vs ast-grep** (structural search; same questions, inside the agent suite):
 its structural matches equal kenning's confirmed ∪ candidate sets almost exactly
-(tokio `sleep` 152 = 105+47, `registration` 89 = 89+0) — an independent cross-validation that
+(tokio `sleep` 152 → 106+50, `registration` 89 → 98+0 — kenning is *ahead* by the calls written
+inside macro arguments, which tree-sitter's three patterns cannot reach; the confirmed side is
+SCIP/rust-analyzer-backed) — an independent cross-validation that
 call-site detection is complete. The differences: median 146–460 ms per question (repo walk, three
 call-shape patterns the user must enumerate) vs 7–20 ms (indexed), and no name resolution —
 it cannot say *which* definition a call belongs to, and has no impact/path/faceted/cross-repo.
 
-- Index build (syn layer, cold): enchudb 256 files / 4,099 symbols / 37,022 call-sites in
-  **0.29 s**; tokio 722 files / 7,156 symbols / 28,834 call-sites in **0.53 s**.
+- Index build (syn layer, cold): enchudb 256 files / 4,093 symbols / 44,140 call-sites in
+  **0.30 s**; tokio 722 files / 7,156 symbols / 38,218 call-sites in **0.34 s**.
 - Incremental update after a small edit: **~6 ms**. The per-query freshness check (a dir-gated
   stat-walk) costs 1–5 ms; a whole `callers` query, process start included, is 7–20 ms
   (bench medians: kenning 7.1, ripgrep 12.1, enchudb 17.3, tokio 19.8 ms — `rg` answering the
   same questions takes 9.2–22.9 ms, so the speed is a tie and the difference is what comes back).
 - `bake`: one rust-analyzer batch run, then **zero** resident memory. Measured: ripgrep 7 s /
-  1.1 GB, tokio 28 s / 2.0 GB, enchudb 46 s / 2.3 GB. Resolution rate before → after:
-  tokio 18.3 % → 35.5 %, ripgrep 26.7 % → 48.7 % (both `features = "all"`), enchudb
-  27.5 % → 43.2 % — enchudb bakes with *default* features because `features = "all"` stalls
-  past the timeout there, exactly the fallback the cap exists for. The unresolved remainder is
-  dominated by std/external-crate calls, which are still listed as labeled candidates.
+  1.1 GB, tokio 28 s / 2.0 GB, enchudb 46 s / 2.3 GB. **In-repo confirmation rate** (calls into
+  std / dependency crates are excluded from the denominator — see below) before → after:
+  tokio 15.5 % → 59.2 %, ripgrep 23.9 % → 91.5 % (both `features = "all"`), enchudb
+  18.1 % → 80.1 % — enchudb bakes with *default* features because `features = "all"` stalls
+  past the timeout there, exactly the fallback the cap exists for. The syn layer starts low
+  because it refuses to confirm a method call whose receiver type it cannot know (`x.f()`);
+  name-only confirmation would list `.next()` as a caller of your own same-named method.
+  What it drops stays as a located candidate. kenning itself, mostly free functions, reads
+  82.0 % → 82.1 % — baking barely moves it, which is how you check the syn layer is not inflating.
 
 ## Deliberate trade-offs — what we don't do, and what it cost
 
@@ -238,7 +275,7 @@ Every number above was bought by *not* doing something. The full ledger:
 |---|---|---|
 | Type inference (`x.f()` receivers) | 0.3–0.5 s builds, ~6 ms incremental updates, cfg-blind coverage | syn-only resolution stays at 15–28 %; precision requires `bake` (one 7–46 s / 1.1–2.3 GB RA run) |
 | Hover / completion / diagnostics | zero-resident, no LSP protocol | not a human editor; agents use `cargo check` for types |
-| Macro expansion | per-file parse speed | calls and impls born inside macros are invisible to every layer |
+| Macro expansion | per-file parse speed | calls and impls born **of expansion** stay invisible (calls/refs written as macro arguments — `println!("{}", f())`, `criterion_group!(g, f)` — are recorded, inside a function body or at item level) |
 | Resident server / file watcher | 0 RAM, zero ops, works over SSH | a 1–5 ms stat-walk on every query (7–20 ms for the whole CLI round trip); warm-µs numbers only apply in-process |
 | Serving SCIP as-is (we position-join against live source instead) | answers always point at today's code | stale bakes shed precise facts (we hit `refs → 0` live in the Glean matchup; `upd_since_bake` warns) |
 | Guessing (no fabricated resolution) | zero false positives in the confirmed set | agents still eyeball the *candidates* bucket |

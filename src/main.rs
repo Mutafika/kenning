@@ -121,26 +121,31 @@ const USAGE: &str = concat!(
      update <dir> [db] | update <db>  変更分だけ増分 re-index (dir 省略で index の root)\n  \
      bake   [dir]                     rust-analyzer scip を焚いて精密 facts を焼き込む\n  \
      \u{0020}                              (空きメモリゲート + 直列 lock、常駐なし)\n\n\
-     探索 (共通 flag: --db <path> / --limit <n>):\n  \
+     探索 (共通 flag: --db <path> / --limit <n>。<name> は Type::method 形でも可):\n  \
      def <name>                       名前の定義位置 (exact, path:line)\n  \
      read <name> [container] [crate:X] [path:S] [--all]  定義本体 (def + Read の 1 手化)。同名は絞るか --all\n  \
      read <path>:<line>               その行を囲む item の本体 (非 Rust は見出し配下)\n  \
+     read <path>:<from>-<to>          行範囲 (sed -n 'A,Bp' の代わり)。跨ぐ定義 / 見出しを列挙\n  \
      read <file>#<見出し>              md の見出し / toml の [table] / yaml のキー配下\n  \
      find <substr>                    名前の部分一致 (発見用、大小無視)\n  \
-     text <term>... [-e] [path:S]     全文検索 + どの関数内かの注釈 (grep superset)。複数語 OR、-e 正規表現\n  \
+     text <term>... [-e] [--and] [--files] [path:S]  全文検索 + どの関数内かの注釈 (grep superset)\n  \
+     \u{0020}                              複数語 OR / --and で全語 AND、-e 正規表現、--files で file 別件数\n  \
      callers <name> [container]       精密 who-calls (確実 ∪ 未確定候補を位置付きで)\n  \
      callees <name> [container]       X が呼ぶ先 (outgoing、callers の鏡)\n  \
      edges                            全 cross-file call edge の集計 TSV (from TAB to TAB count)\n  \
      refs <name> [container]          正確 find-all-refs (要 --scip index、読み書き型も)\n  \
-     impact <name> [container]        推移的 callers = 変えると壊れる範囲 (逆 BFS)\n  \
+     impact <name> [container] [--confirmed-only]  推移的 callers = 変えると壊れる範囲 (逆 BFS)\n  \
+     \u{0020}                              既定は値渡し参照 (map(f)) も辿る — 見落としの方が危険なので\n  \
      tests <name> [container]         これに届くテスト = impact ∩ is_test (回す物の特定)\n  \
      impls <trait|type>               go-to-implementation (trait↔型)\n  \
      across <name>                    全 repo 横断: 全 repo db で定義/利用 + repo 跨ぎ精密参照\n  \
      path <from> <to>                 from→to の呼び出し経路 1 本 (前方 BFS)\n  \
      search <facet...>                faceted AND。例: kind:method vis:pub container:Engine\n  \
-     \u{0020}                              facet= name: kind: vis: async: test: crate: container: module:\n  \
+     \u{0020}                              facet= name: kind: vis: async: test: crate: container: module: path:\n  \
+     \u{0020}                                     attr: calls: callers: namecalls: traitimpl: reachable:\n  \
+     \u{0020}                              reachable:0 = live root から届かない定義 = 消せる候補 (dead な塊ごと)\n  \
      outline <path|dir>               ファイルの symbol / 見出し一覧、dir なら配下 file の地図 (末尾一致可)\n  \
-     stats                            規模と名前解決率\n  \
+     stats [path:<substr>]            規模と解決の内訳 (repo 内確定率。path: で dir 別)\n  \
      cache  [ls|prune] [--older-than D] [--dry-run]  自動 db の棚卸し / 掃除 (root 消失・旧版)\n  \
      bench  [quality|agent|micro|all] 再現可能ベンチ (--n/--nq/--seed、markdown 出力)\n\n\
      `--version` / `help`"

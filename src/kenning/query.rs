@@ -141,6 +141,11 @@ pub(crate) fn parse_opts(args: &[String]) -> Opts {
         match args[i].as_str() {
             "--db" => { i += 1; if let Some(v) = args.get(i) { db = Some(v.clone()); } }
             "--limit" => { i += 1; if let Some(v) = args.get(i) { limit = v.parse().unwrap_or(50); } }
+            // `-x` を黙って位置引数 (= 検索語 / 名前) にすると、typo した flag が「効いたように見えて
+            // 効いていない」結果を返す (search は未知 facet を警告するのにここだけ素通りだった)。
+            other if other.starts_with('-') && other.len() > 1 && !other[1..].starts_with(|c: char| c.is_ascii_digit()) => {
+                eprintln!("# 無視: 未知 flag \"{other}\" (共通 --db/--limit、text -e/--and/--files、read --all)。語として検索するなら `text -e` で正規表現に");
+            }
             other => pos.push(other.to_string()),
         }
         i += 1;
@@ -269,6 +274,7 @@ pub fn cmd_def(args: &[String]) {
 ///   か `--all` で全部出す (同名 symbol で grep に戻る最大の原因だったので、絞り方を増やした)
 /// - `read <path>:<line>` — その行を囲む item の本体 (`grep -n "fn X"` → `sed -n` の代わり)。
 ///   非 Rust ならその行を含む見出し / [table] 配下
+/// - `read <path>:<from>-<to>` — 行範囲 (`sed -n 'A,Bp'` の代わり)。跨ぐ定義 / 見出しを頭に列挙する
 /// - `read <file.md>#<見出し>` — 見出し配下 (toml は `[table]`、yaml はキー)。CHANGELOG を awk で切る代わり
 ///
 /// Read tool と違い「その item の範囲だけ」なので token も節約。範囲は index 済みの
@@ -278,9 +284,13 @@ pub fn cmd_read(args: &[String]) {
     let rest: Vec<String> = args.iter().filter(|a| *a != "--all").cloned().collect();
     let o = parse_opts(&rest);
     let Some(first) = o.pos.first() else {
-        eprintln!("usage: kenning read <name> [container] [crate:X] [path:S] [--all] | read <path>:<line> | read <file>#<見出し>  [--db P]");
+        eprintln!("usage: kenning read <name> [container] [crate:X] [path:S] [--all] | read <path>:<line> | read <path>:<from>-<to> | read <file>#<見出し>  [--db P]");
         return;
     };
+    if let Some((p, a, b)) = split_path_range(first) {
+        run_read_range(&o.db, p, a, b);
+        return;
+    }
     if let Some((p, l)) = split_path_line(first) {
         run_read_at(&o.db, p, l);
         return;
@@ -309,6 +319,16 @@ pub fn cmd_read(args: &[String]) {
         }
     }
     run_read(&o.db, first, container, crate_f, path_f, all, o.limit);
+}
+
+/// `<path>:<from>-<to>` 形か。範囲 read (`sed -n 'A,Bp'` の代わり) の入口。
+/// file 名に `-` があっても壊れない (`:` の後ろだけを見る)。逆順で書かれたら黙って直す。
+pub(crate) fn split_path_range(s: &str) -> Option<(&str, usize, usize)> {
+    let (p, r) = s.rsplit_once(':')?;
+    let (a, b) = r.split_once('-')?;
+    let n = |v: &str| v.parse::<usize>().ok().filter(|&n| n > 0);
+    let (a, b) = (n(a)?, n(b)?);
+    looks_like_path(p).then_some((p, a.min(b), a.max(b)))
 }
 
 /// `<path>:<line>` 形か (末尾が数字で、前半が path らしい)。symbol 名に `:` は無いので衝突しない。
@@ -358,8 +378,70 @@ pub(crate) fn print_lines(path: &str, lines: &[&str], s: usize, e: usize) {
         println!("{:>5}\t{l}", i + 1);
     }
     if shown_end < e {
-        println!("# … 長大なので {READ_MAX_LINES} 行で打ち切り (+{} 行)。続き: Read {path} offset={}", e - shown_end, shown_end + 1);
+        // 続きも kenning で読める (範囲 read があるので Read tool に投げ直さなくていい)。
+        println!("# … 長大なので {READ_MAX_LINES} 行で打ち切り (+{} 行)。続き: `read {path}:{}-{e}`", e - shown_end, shown_end + 1);
     }
+}
+
+/// `read <path>:<from>-<to>` — 行範囲をそのまま (`sed -n 'A,Bp'` の代わり)。
+/// 隣接する複数 item をまとめて見たい時に `read <path>:<line>` (1 item) では足りないので置いた。
+/// ただの切り出しなら sed と同じなので、**範囲が跨ぐ定義 / 見出しを頭に列挙**する
+/// (「今どこを読んでいるか」が 1 行で分かる = 追いの outline を 1 回消す)。
+pub(crate) fn run_read_range(db_path: &str, path_arg: &str, from: usize, to: usize) {
+    let Some(db) = open_ro(db_path) else { return };
+    let file_t = db.get_table("file").unwrap();
+    let sym_t = db.get_table("sym").unwrap();
+    let paths = file_paths(&file_t);
+    let Some(fe) = find_file(&file_t, &paths, path_arg) else {
+        println!("# file not found: {path_arg}");
+        return;
+    };
+    let path = paths[&fe].clone();
+    let lang = num(file_t.entity(fe).get("lang"));
+    let Ok(src) = std::fs::read_to_string(&path) else {
+        println!("# source を読めない: {path}");
+        return;
+    };
+    let lines: Vec<&str> = src.lines().collect();
+    if from > lines.len() {
+        println!("# {path}:{from}-{to} は file の外 ({} 行しかない)", lines.len());
+        return;
+    }
+    let to = to.min(lines.len());
+    // 範囲が触れる物の列挙: Rust は定義 (行が重なる sym)、非 Rust は見出し (範囲内で始まる物 + 頭を囲む物)。
+    let covered: Vec<String> = if lang == LANG_RUST {
+        let mut v: Vec<(usize, String)> = sym_t
+            .all()
+            .where_ref("file", fe)
+            .find()
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| {
+                let er = sym_t.entity(e);
+                let (s0, e0) = (num(er.get("line")) as usize, num(er.get("end_line")) as usize);
+                (s0 <= to && from <= e0.max(s0)).then(|| (s0, sym_qual(&sym_t, e)))
+            })
+            .filter(|(_, q)| !q.is_empty())
+            .collect();
+        v.sort();
+        v.into_iter().map(|(_, q)| q).collect()
+    } else {
+        let cs = text_containers(lang, &src);
+        let head = cs.partition_point(|(l, _)| (*l as usize) <= from);
+        cs.iter()
+            .enumerate()
+            .filter(|(i, (l, _))| (*i + 1 == head) || ((*l as usize) > from && (*l as usize) <= to))
+            .map(|(_, (_, name))| name.clone())
+            .collect()
+    };
+    let n = to + 1 - from;
+    let what = match covered.len() {
+        0 => String::new(),
+        k if k <= 6 => format!(" — {}", covered.join(", ")),
+        k => format!(" — {}, …+{}", covered[..6].join(", "), k - 6),
+    };
+    println!("{path}:{from}	{n} 行 ({from}-{to}){what}");
+    print_lines(&path, &lines, from, to);
 }
 
 /// `read <path>:<line>` — その行を囲む item (Rust) / 見出し配下 (非 Rust)。囲む物が無ければ前後 20 行。
@@ -568,18 +650,27 @@ pub(crate) fn print_file_hits(file_t: &Table, paths: &HashMap<EntityId, String>,
 
 /// `search kind:fn vis:pub crate:… container:… async:1 …` — faceted 等値 AND。
 pub fn cmd_search(args: &[String]) {
-    let o = parse_opts(args);
+    let lexical = !args.iter().any(|a| a == "--no-lexical");
+    let o = parse_opts(&args.iter().filter(|a| *a != "--no-lexical").cloned().collect::<Vec<_>>());
     if o.pos.is_empty() {
-        eprintln!("usage: kenning search <facet...>  例: kind:method vis:pub calls:unwrap");
+        eprintln!("usage: kenning search <facet...> [--no-lexical]  例: kind:method vis:pub calls:unwrap");
         eprintln!("  facet: name: kind:(fn|method|struct|enum|trait|const) vis:(pub|crate|restricted|priv)");
-        eprintln!("         async:(0|1) test:(0|1) crate: container: module:");
+        eprintln!("         async:(0|1) test:(0|1) traitimpl:(0|1) crate: container: module: path:(部分一致)");
+        eprintln!("         attr:<substr>  属性の部分一致 (deprecated / allow(dead_code) / serde / cfg(...))");
+        eprintln!("         reachable:(0|1)  live root (pub/test/trait 実装/main/item マクロ) からの到達可能性");
+        eprintln!("         callers:<n> namecalls:<n>  (被呼び出し数。`callers:0 namecalls:0` = 未使用候補)");
         eprintln!("         calls:<name>  (本体で <name> を呼ぶ sym に絞る = grep 不可の edge×facet AND)");
         return;
     }
-    run_search(&o.db, &o.pos, o.limit, false);
+    run_search_opt(&o.db, &o.pos, o.limit, false, lexical);
 }
 
 pub(crate) fn run_search(db_path: &str, facets: &[String], limit: usize, with_sig: bool) {
+    run_search_opt(db_path, facets, limit, with_sig, true)
+}
+
+/// `lexical` = 未使用候補を字句照合で裏取りするか (`--no-lexical` で切る)。
+pub(crate) fn run_search_opt(db_path: &str, facets: &[String], limit: usize, with_sig: bool, lexical: bool) {
     let Some(db) = open_ro(db_path) else { return };
     let file_t = db.get_table("file").unwrap();
     let sym_t = db.get_table("sym").unwrap();
@@ -589,13 +680,27 @@ pub(crate) fn run_search(db_path: &str, facets: &[String], limit: usize, with_si
     let mut q = sym_t.all();
     let mut applied: Vec<String> = Vec::new();
     let mut calls_filters: Vec<String> = Vec::new(); // calls:X = 本体で X を呼ぶ sym に絞る (edge facet)
+    // 被呼び出し数の facet。`callers:0 namecalls:0` = 誰からも呼ばれていない = 未使用候補を 1 手で。
+    let (mut want_callers, mut want_namecalls): (Option<usize>, Option<usize>) = (None, None);
+    let mut want_reachable: Option<bool> = None;
+    let mut path_filters: Vec<String> = Vec::new(); // path:X = 定義 file の部分一致 (複数は OR)
+    let mut attr_filters: Vec<String> = Vec::new(); // attr:X = 属性文字列の部分一致 (複数は AND)
     for f in facets {
         let Some((k, v)) = f.split_once(':') else {
             eprintln!("# 無視: \"{f}\" (key:value 形式で)");
             continue;
         };
         match k {
-            "name" => { q = q.where_eq("name", v); applied.push(format!("name={v}")); }
+            // name:Type::method も受ける (def の入口。container facet が別に来ていればそちらが優先)。
+            "name" => {
+                let (n, c) = split_qualified(v);
+                q = q.where_eq("name", n);
+                applied.push(format!("name={n}"));
+                if let Some(c) = c.filter(|_| !facets.iter().any(|f| f.starts_with("container:"))) {
+                    q = q.where_eq("container", c);
+                    applied.push(format!("container={c}"));
+                }
+            }
             "kind" => match kind_code(v) {
                 Some(c) => { q = q.where_eq("kind", c); applied.push(format!("kind={v}")); }
                 None => eprintln!("# 無視: 未知 kind \"{v}\" (fn/method/struct/enum/trait/const)"),
@@ -606,14 +711,83 @@ pub(crate) fn run_search(db_path: &str, facets: &[String], limit: usize, with_si
             },
             "async" => { q = q.where_eq("is_async", bool01(v)); applied.push(format!("async={v}")); }
             "test" => { q = q.where_eq("is_test", bool01(v)); applied.push(format!("test={v}")); }
+            // trait 実装の method は trait 経由で呼ばれるので `callers:0` が構造的に真になる。
+            // `traitimpl:0` で外すと「本当に誰も使っていない候補」だけが残る。
+            "traitimpl" => { q = q.where_eq("trait_impl", bool01(v)); applied.push(format!("traitimpl={v}")); }
+            // 属性の部分一致 (`attr:deprecated` / `attr:allow(dead_code)` / `attr:serde`)。
+            // 特定属性を特別扱いしないので、廃止予定 API の利用調査にも dead 判定の裏取りにも効く。
+            "attr" => { attr_filters.push(v.to_lowercase()); applied.push(format!("attr~{v}")); }
+            // 到達可能性 (live root からの前向き伝播)。`reachable:0` = 消せる候補の本命。
+            // 入次数 0 (`callers:0`) と違い、鎖や相互再帰で繋がった dead な塊も 1 パスで出る。
+            "reachable" => { want_reachable = Some(bool01(v) == 1); applied.push(format!("reachable={v}")); }
             "crate" => { q = q.where_eq("crate_", v); applied.push(format!("crate={v}")); }
             "container" => { q = q.where_eq("container", v); applied.push(format!("container={v}")); }
             "module" => { q = q.where_eq("module", v); applied.push(format!("module={v}")); }
             "calls" => { calls_filters.push(v.to_string()); applied.push(format!("calls={v}")); }
-            _ => eprintln!("# 無視: 未知 facet key \"{k}\""),
+            // path: は text / read と同じ「file path の部分一致」。ここだけ無いと
+            // 「graph.rs の pub fn」が 1 手で出せず grep + search の 2 手になっていた。
+            "path" | "file" => { path_filters.push(v.to_string()); applied.push(format!("path={v}")); }
+            // 逆向きの edge facet: 「何本の呼び出しに指されているか」。
+            // callers = 確実 (callee_sym 逆引き、誤りなし) / namecalls = 名前一致 (未解決の候補込み)。
+            // 両方 0 = 名前ごと誰も呼んでいない → 消せる候補。callers だけ 0 は「未解決の呼び出しかも」。
+            "callers" | "namecalls" => match v.parse::<usize>() {
+                Ok(n) => {
+                    if k == "callers" { want_callers = Some(n) } else { want_namecalls = Some(n) }
+                    applied.push(format!("{k}={n}"));
+                }
+                Err(_) => eprintln!("# 無視: {k}:\"{v}\" は数値で (例: {k}:0)"),
+            },
+            _ => eprintln!("# 無視: 未知 facet key \"{k}\" (name/kind/vis/async/test/crate/container/module/calls/path)"),
         }
     }
     let mut hits = q.find().unwrap();
+    for f in &attr_filters {
+        hits.retain(|&e| txt(sym_t.entity(e).get("attrs")).to_lowercase().contains(f.as_str()));
+    }
+    if !path_filters.is_empty() {
+        hits.retain(|&e| {
+            let p = paths.get(&ref_of(sym_t.entity(e).get("file"))).cloned().unwrap_or_default();
+            path_filters.iter().any(|f| p.contains(f.as_str()))
+        });
+    }
+    let mut dead_set: HashSet<EntityId> = HashSet::new();
+    if let Some(want) = want_reachable {
+        dead_set = dead_by_elimination(&call_t, &sym_t);
+        hits.retain(|e| dead_set.contains(e) != want);
+    }
+    // 被呼び出し数で絞る。列は自動 index 済みなので 1 sym あたり等値 count の 2 発で済む
+    // (全 call を舐めない)。267 sym の repo で数 ms。
+    if want_callers.is_some() || want_namecalls.is_some() {
+        hits.retain(|&e| {
+            if let Some(n) = want_callers
+                && call_t.where_eq("callee_sym", Value::Ref(e)).count().unwrap_or(0) != n
+            {
+                return false;
+            }
+            if let Some(n) = want_namecalls {
+                let name = txt(sym_t.entity(e).get("name"));
+                if call_t.where_eq("callee", name.as_str()).count().unwrap_or(0) != n {
+                    return false;
+                }
+            }
+            true
+        });
+    }
+    // 「未使用候補」(callers:0 かつ namecalls:0) は **消す判断**に使われるので、call 表だけを根拠に
+    // しない。定義以外に名前が 1 度でも字句として現れる物は落とす — parse できない DSL マクロや
+    // 展開後に名前が合成される経路など、call 表に載らない使われ方をここで拾う (安全側に倒す)。
+    // 候補は数十件なので、全名前を 1 本の regex に畳んで corpus を 1 回走査するだけで済む。
+    let unused_query = want_reachable == Some(false) || (want_callers == Some(0) && want_namecalls == Some(0));
+    if lexical && unused_query && !hits.is_empty() {
+        let before = hits.len();
+        let used = names_used_lexically(&paths, &sym_t, &hits, &dead_set);
+        hits.retain(|e| !used.contains(&txt(sym_t.entity(*e).get("name"))));
+        let dropped = before - hits.len();
+        if dropped > 0 {
+            applied.push(format!("字句照合で -{dropped}"));
+            println!("# 字句照合で {dropped} 件除外 (定義以外に名前が出現 — コメント/文字列も含むので安全側に倒している)。除外分も見るなら `--no-lexical`");
+        }
+    }
     // edge facet: 本体が X を呼ぶ sym だけ残す (grep には表現できない sym facet × call edge の AND)。
     for cn in &calls_filters {
         let callers: HashSet<EntityId> = call_t
@@ -626,6 +800,10 @@ pub(crate) fn run_search(db_path: &str, facets: &[String], limit: usize, with_si
         hits.retain(|e| callers.contains(e));
     }
     println!("# {} symbols  [{}]", hits.len(), applied.join(" "));
+    if want_callers == Some(0) || want_namecalls == Some(0) || want_reachable == Some(false) {
+        println!("# 呼ばれていない = この index の中での話。pub は外部 crate から、trait impl の method は動的に呼ばれ得る (test:0 で #[test] を除ける)");
+        println!("# const / struct / enum は呼び出し edge を持たないので常に 0 → `kind:fn` / `kind:method` と併用する");
+    }
     // name 等値で 0 件 = typo の可能性 → callers と同じ救済 (`def` の主な失敗はこれ)。
     // 他 facet で 0 になった場合は名前自体は在るので黙る (嘘の「無い」を出さない)。
     if hits.is_empty()
@@ -655,11 +833,10 @@ pub(crate) fn run_callers(db_path: &str, name: &str, container: Option<&str>, li
     let call_t = db.get_table("call").unwrap();
     let paths = file_paths(&file_t);
 
-    let mut defs = sym_t.where_eq("name", name).find().unwrap();
-    if let Some(c) = container {
-        defs.retain(|&e| txt(sym_t.entity(e).get("container")) == c);
-    }
-    let name_total = call_t.where_eq("callee", name).count().unwrap();
+    let defs = defs_of(&sym_t, name, container);
+    // 修飾名で来た時は call 側 (callee は bare name) を bare で数える。
+    let bare = split_qualified(name).0;
+    let name_total = call_t.where_eq("callee", bare).count().unwrap();
     if defs.is_empty() {
         println!("# \"{name}\" の定義が index に無い。名前一致の call = {name_total} 件 (外部/未解決)");
         suggest_similar(&sym_t, &paths, name);
@@ -697,10 +874,8 @@ pub(crate) fn run_callers(db_path: &str, name: &str, container: Option<&str>, li
         let er = call_t.entity(c);
         let p = paths.get(&ref_of(er.get("file"))).cloned().unwrap_or_default();
         let ln = num(er.get("line"));
-        let cr = sym_t.entity(ref_of(er.get("caller")));
-        let ct = txt(cr.get("container"));
-        let nm = txt(cr.get("name"));
-        let cq = if ct.is_empty() { nm } else { format!("{ct}::{nm}") };
+        // caller 未 set = 関数の外 (item 直下のマクロ引数など)。空欄で出すと読めないので明示。
+        let cq = sym_qual(&sym_t, ref_of(er.get("caller")));
         (p, ln, cq)
     };
 
@@ -752,6 +927,46 @@ pub(crate) fn run_callers(db_path: &str, name: &str, container: Option<&str>, li
         "# 名前一致 {name_total} = 確実 {precise_sum} + 候補未確定 {} + 別の同名 sym に確定 {other}",
         cand.len()
     );
+    // 0 件で終わる trait 実装 method は「使われていない」ではなく **trait 経由で呼ばれる** だけ。
+    // 何も言わずに 0 を返すと、呼び出し側を grep で探し回るか、消してよいと誤読される
+    // (enchudb では 17 method がこの形)。
+    if name_total == 0 && other == 0 {
+        for &d in &defs {
+            if num(sym_t.entity(d).get("trait_impl")) != 1 {
+                continue;
+            }
+            let ct = txt(sym_t.entity(d).get("container"));
+            let traits = traits_implemented_at(&db, &sym_t, d);
+            let list = if traits.is_empty() { "?".to_string() } else { traits.join(" / ") };
+            println!("# {ct}::{bare} は trait 実装 → 呼び出しは trait 経由なので名前が現れない (0 件 ≠ 未使用)。");
+            println!("# この file が {ct} に実装している trait: {list}");
+            match traits.first() {
+                Some(t) => println!("# 次: `callers {bare}` (同名 method 全体) / `impls {t}` (兄弟実装)"),
+                None => println!("# 次: `callers {bare}` (同名 method 全体)"),
+            }
+            break;
+        }
+    }
+}
+
+/// `def` が属する impl block の trait 名 (同 file・同 型 の impl edge から引く)。
+/// 行範囲は持っていないので file + type_name の一致まで。複数あれば全部返す (嘘をつかない)。
+pub(crate) fn traits_implemented_at(db: &Database, sym_t: &Table, def: EntityId) -> Vec<String> {
+    let Some(impl_t) = db.get_table("impl") else { return Vec::new() };
+    let er = sym_t.entity(def);
+    let (file, ct) = (ref_of(er.get("file")), txt(er.get("container")));
+    let mut v: Vec<String> = impl_t
+        .where_eq("type_name", ct.as_str())
+        .find()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|&e| ref_of(impl_t.entity(e).get("file")) == file)
+        .map(|e| txt(impl_t.entity(e).get("trait_name")))
+        .filter(|t| !t.is_empty())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// `edges` — 解決済み call edge をファイル間で集計して一括出力。
@@ -900,7 +1115,18 @@ pub(crate) fn run_impls(db_path: &str, name: &str, limit: usize) {
     let as_trait = impl_t.where_eq("trait_name", name).find().unwrap();
     let as_type = impl_t.where_eq("type_name", name).find().unwrap();
     if as_trait.is_empty() && as_type.is_empty() {
-        println!("# \"{name}\" の impl 関係が index に無い (trait/型でない、or impl が外部・cfg 非活性)。");
+        // 「名前自体が無い」と「型は在るが trait 実装が無い (inherent impl だけ)」は別物。
+        // 混ぜると、実在する型を調べに来た Claude が grep に戻る。
+        let sym_t = db.get_table("sym").unwrap();
+        let defs = sym_t.where_eq("name", name).find().unwrap();
+        if defs.is_empty() {
+            println!("# \"{name}\" という定義が index に無い。");
+            suggest_similar(&sym_t, &paths, name);
+        } else {
+            println!("# \"{name}\" は定義済みだが trait 実装が無い (inherent impl のみ、or impl が外部・cfg 非活性)。");
+            println!("{}", fmt_sym(&sym_t, &paths, defs[0]));
+            println!("# メソッド一覧は `search container:{name}`、使われ方は `callers {name}` / `refs {name}`。");
+        }
         return;
     }
     if !as_trait.is_empty() {
@@ -913,26 +1139,30 @@ pub(crate) fn run_impls(db_path: &str, name: &str, limit: usize) {
     }
 }
 
-/// `text <term>... [-e] [path:S]` — 全文検索 (コメント/文字列も) + **enclosing symbol 注釈**。
+/// `text <term>... [-e] [--and] [--files] [path:S]` — 全文検索 (コメント/文字列も) + **enclosing symbol 注釈**。
 /// grep superset with structure: どの関数の中のヒットかが 1 行で分かる = 追い Read を 1 個消す。
 /// 検索対象は index 済みファイル (live に読む = 常に最新)。大小無視。
-/// 複数語は OR (`grep -E "a|b"` の代わり)、`-e` で各語を正規表現として扱う (`grep -E` 相当)、
-/// `path:<substr>` で対象ファイルを絞る (`rg <pat> <dir>` の代わり)。これらが無いと Claude が grep に戻る。
-/// 末尾に `# N 件 / M files` を必ず出す (「何箇所で使われてる?」に数えずに答える)。
+/// 複数語は既定 OR (`grep -E "a|b"`)、`--and` で全語を含む行だけ (`grep X | grep Y` の代わり)、
+/// `-e` で各語を正規表現として扱う (`grep -E` 相当)、`--files` で file 別件数だけ (`rg -c` の代わり
+/// = 広い語の triage)、`path:<substr>` で対象ファイルを絞る (`rg <pat> <dir>`)。
+/// これらが無いと Claude が grep に戻る。末尾に `# N 件 / M files` を必ず出す。
 pub fn cmd_text(args: &[String]) {
-    let regex = args.iter().any(|a| a == "-e" || a == "--regex");
-    let rest: Vec<String> = args.iter().filter(|a| *a != "-e" && *a != "--regex").cloned().collect();
+    let has = |f: &str| args.iter().any(|a| a == f);
+    let (regex, and, files_only) = (has("-e") || has("--regex"), has("--and"), has("--files"));
+    let flags = ["-e", "--regex", "--and", "--files"];
+    let rest: Vec<String> = args.iter().filter(|a| !flags.contains(&a.as_str())).cloned().collect();
     let o = parse_opts(&rest);
     let (path_fs, terms): (Vec<&String>, Vec<&String>) = o.pos.iter().partition(|a| a.starts_with("path:"));
     let path_fs: Vec<&str> = path_fs.iter().map(|a| &a["path:".len()..]).filter(|f| !f.is_empty()).collect();
     let terms: Vec<String> = terms.into_iter().cloned().collect();
     if terms.is_empty() {
-        eprintln!("usage: kenning text <term>... [-e] [path:<substr>] [--db P] [--limit N]");
-        eprintln!("  複数語は OR。-e で正規表現 (大小無視、区別するなら (?-i)Foo)。path: で対象ファイルを絞る (複数は OR)");
+        eprintln!("usage: kenning text <term>... [-e] [--and] [--files] [path:<substr>] [--db P] [--limit N]");
+        eprintln!("  複数語は既定 OR、--and で全語を含む行だけ。-e で正規表現 (大小無視、区別するなら (?-i)Foo)。");
+        eprintln!("  --files で file 別件数だけ (広い語の triage)。path: で対象ファイルを絞る (複数は OR)");
         return;
     }
-    let needle = terms.join(" | ");
-    let Some(m) = TextMatcher::new(&terms, regex) else { return };
+    let needle = terms.join(if and { " & " } else { " | " });
+    let Some(m) = TextMatcher::new(&terms, regex, and) else { return };
     let Some(db) = open_ro(&o.db) else { return };
     let file_t = db.get_table("file").unwrap();
     let sym_t = db.get_table("sym").unwrap();
@@ -962,12 +1192,25 @@ pub fn cmd_text(args: &[String]) {
     let mut shown = 0usize;
     let mut total = 0usize;
     let mut n_files = 0usize;
+    let mut per_file: Vec<(usize, String)> = Vec::new(); // --files 用 (件数, path)
     // 読みが支配的 (tokio 770 files で逐次 11ms) なので thread で撒き、hit した file の本文だけ持ち帰る。
     // 注釈と出力は main thread で path 順 (決定的)。
     let srcs = par_map(&files, |(path, _, _)| std::fs::read_to_string(path).ok().filter(|s| m.hit(s)));
     for ((path, fe, lang), src) in files.iter().zip(srcs) {
         let Some(src) = src else { continue }; // 読めない or file 単位で不一致
-        n_files += 1;
+        // --files: 行注釈も本文整形も要らないので、数えて次の file へ (広い語ほど効く)。
+        if files_only {
+            let n = src.lines().filter(|l| m.hit(l)).count();
+            if n > 0 {
+                n_files += 1;
+                total += n;
+                per_file.push((n, path.clone()));
+            }
+            continue;
+        }
+        // file 単位の hit は AND だと「全語がどこかに在る」= 行 AND の必要条件でしかないので、
+        // 実際に行が当たった file だけ数える (足切り通過数を files に出すと嘘になる)。
+        let mut file_hits = 0usize;
         let syms = syms_by_file.get(fe);
         // 非 Rust は sym を持たないので、本文から container を作る (見出し階層 / [table] / キーパス)。
         let containers = if *lang == LANG_RUST { Vec::new() } else { text_containers(*lang, &src) };
@@ -976,6 +1219,7 @@ pub fn cmd_text(args: &[String]) {
                 continue;
             }
             total += 1;
+            file_hits += 1;
             if shown >= o.limit {
                 continue; // 件数は数え続ける
             }
@@ -1012,9 +1256,25 @@ pub fn cmd_text(args: &[String]) {
                 None => println!("{path}:{ln}\t{text}"),
             }
         }
+        n_files += usize::from(file_hits > 0);
+    }
+    if files_only {
+        // 件数降順 → path 昇順。`rg -c` と違い「どの file を先に読むか」が 1 目で決まる順序。
+        per_file.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        shown = per_file.len().min(o.limit);
+        for (n, p) in per_file.iter().take(o.limit) {
+            println!("{p}\t{n} 件");
+        }
     }
     let scope = if path_fs.is_empty() { String::new() } else { format!(" (path: {} の {} files)", path_fs.join(" | "), files.len()) };
-    if total == 0 {
+    if files_only {
+        if total == 0 {
+            println!("# \"{needle}\" は index 済みファイルに無い{scope}");
+        } else {
+            let more = if per_file.len() > shown { format!(" — 表示 {shown} file、`--limit {}` で全部", per_file.len()) } else { String::new() };
+            println!("# {total} 件 / {} files{scope}{more} — 本文は path: で file を絞って再検索 / `read <path>:<line>`", per_file.len());
+        }
+    } else if total == 0 {
         println!("# \"{needle}\" は index 済みファイルに無い{scope} (.rs + テキスト全般。binary と >1MiB と gitignore 済みは対象外)");
     } else if total > shown {
         println!("# {total} 件 / {n_files} files{scope} — 表示 {shown}、`--limit {total}` で全部");
@@ -1023,26 +1283,145 @@ pub fn cmd_text(args: &[String]) {
     }
 }
 
-/// `text` の一致判定: 語は `regex::escape` して OR、`-e` なら各語をそのまま正規表現として OR。
-/// 1 本の regex に畳んで file 全体 → 行の順で当てる (語ごとに `to_lowercase` で全 file を複製する
-/// より速い: tokio 770 files で 20ms → 10ms 台)。大小無視は `(?i)` 相当、`-e` 側は `(?-i)` で打ち消せる。
-pub(crate) struct TextMatcher(pub(crate) regex::Regex);
+/// `text` の一致判定: 語は `regex::escape`、`-e` なら各語をそのまま正規表現として扱う。
+/// 既定 (OR) は全語を 1 本の regex に畳む (語ごとに全 file を舐めるより速い: tokio 770 files で
+/// 20ms → 10ms 台)。`--and` は語ごとに regex を持ち、全部当たった時だけ hit (`grep X | grep Y` の
+/// 代わり — 畳めないので語数分の走査になる)。大小無視は `(?i)` 相当、`-e` 側は `(?-i)` で打ち消せる。
+/// どちらの mode も判定は「全要素が当たるか」= OR は要素 1 個なので同じ式で書ける。
+pub(crate) struct TextMatcher(pub(crate) Vec<regex::Regex>);
 
 impl TextMatcher {
-    fn new(terms: &[String], regex: bool) -> Option<TextMatcher> {
-        let alts: Vec<String> = terms.iter().map(|t| if regex { format!("(?:{t})") } else { regex::escape(t) }).collect();
-        match regex::RegexBuilder::new(&alts.join("|")).case_insensitive(true).build() {
-            Ok(re) => Some(TextMatcher(re)),
-            Err(e) => {
-                println!("# 正規表現が不正: {}: {e}", terms.join(" | "));
-                None
+    pub(crate) fn new(terms: &[String], regex: bool, and: bool) -> Option<TextMatcher> {
+        let pat = |t: &String| if regex { format!("(?:{t})") } else { regex::escape(t) };
+        let pats: Vec<String> = if and { terms.iter().map(pat).collect() } else { vec![terms.iter().map(pat).collect::<Vec<_>>().join("|")] };
+        let mut res = Vec::with_capacity(pats.len());
+        for p in &pats {
+            match regex::RegexBuilder::new(p).case_insensitive(true).build() {
+                Ok(re) => res.push(re),
+                Err(e) => {
+                    println!("# 正規表現が不正: {}: {e}", terms.join(" | "));
+                    return None;
+                }
             }
         }
+        Some(TextMatcher(res))
     }
-    /// 文字列 (行でもファイル全体でも) に 1 語でも当たるか。
-    fn hit(&self, s: &str) -> bool {
-        self.0.is_match(s)
+    /// 文字列 (行でもファイル全体でも) が条件を満たすか。OR は畳んだ 1 本、AND は全語。
+    /// file 全体に対する hit は AND でも「全語がその file のどこかに在る」= 行 AND の必要条件なので
+    /// 前段の足切りとして正しい (行側で本当の AND を取る)。
+    pub(crate) fn hit(&self, s: &str) -> bool {
+        self.0.iter().all(|r| r.is_match(s))
     }
+}
+
+/// 行から行コメント (`//` 以降) と文字列リテラルの中身を落とす (簡易 — ブロックコメントや
+/// raw string の複雑形は完全ではないが、doc コメントの誤検出を消すには十分)。
+pub(crate) fn strip_comment_and_strings(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let (mut in_str, mut esc, mut prev) = (false, false, '\0');
+    for c in line.chars() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            out.push(' ');
+            prev = c;
+            continue;
+        }
+        if c == '"' {
+            in_str = true;
+            out.push(' ');
+            prev = c;
+            continue;
+        }
+        if c == '/' && prev == '/' {
+            out.pop(); // 直前の '/' も落として行末まで打ち切り
+            break;
+        }
+        out.push(c);
+        prev = c;
+    }
+    out
+}
+
+/// 候補 sym の名前が **定義以外の場所に字句として現れるか** を 1 パスで判定する。
+/// 返り値 = 「現れた = まだ使われている可能性がある」名前の集合。
+/// 定義そのものの行は数えない (定義数だけ差し引く。同じ行に 2 度出る形は「使用あり」に倒す = 安全側)。
+pub(crate) fn names_used_lexically(
+    paths: &HashMap<EntityId, String>,
+    sym_t: &Table,
+    hits: &[EntityId],
+    dead: &HashSet<EntityId>, // 既に dead と判定済みの定義。その本体の中の出現は「使用」に数えない
+) -> HashSet<String> {
+    let mut names: Vec<String> = hits.iter().map(|&e| txt(sym_t.entity(e).get("name"))).filter(|n| !n.is_empty()).collect();
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        return HashSet::new();
+    }
+
+    let pat = format!(r"\b(?:{})\b", names.iter().map(|n| regex::escape(n)).collect::<Vec<_>>().join("|"));
+    let Ok(re) = regex::RegexBuilder::new(&pat).build() else { return HashSet::new() };
+    // dead と判定済みの定義の行範囲 (file path → [(start, end)])。ここでの出現は
+    // 「死んだコードの中で呼ばれているだけ」なので生存の根拠にしない
+    // (これが無いと、dead な関数からしか呼ばれない関数を取り逃す — enchudb の `gallop_ge` が実例)。
+    // 除外する行範囲 = 候補自身の定義本体 ∪ dead 判定済みの定義本体。
+    // 前者は「自分の定義に自分の名前が出るのは当たり前」、後者は「死んだコードの中の呼び出しは
+    // 生存の根拠にならない」(enchudb の `gallop_ge` が実例)。これで残った出現は全部「外からの使用」。
+    let mut dead_ranges: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+    for &d in hits.iter().chain(dead.iter()) {
+        let er = sym_t.entity(d);
+        let Some(p) = paths.get(&ref_of(er.get("file"))) else { continue };
+        let (s0, e0) = (num(er.get("line")), num(er.get("end_line")));
+        dead_ranges.entry(p.clone()).or_default().push((s0, e0.max(s0)));
+    }
+    let files: Vec<String> = paths.values().cloned().collect();
+    let counted = par_map(&files, |p| {
+        let Ok(src) = std::fs::read_to_string(p) else { return HashMap::new() };
+        let ranges = dead_ranges.get(p);
+        let mut local: HashMap<String, usize> = HashMap::new();
+        for (i, raw_line) in src.lines().enumerate() {
+            let ln = i as u32 + 1;
+            if ranges.is_some_and(|rs| rs.iter().any(|(s, e)| ln >= *s && ln <= *e)) {
+                continue; // dead な定義の本体
+            }
+            // コメントと文字列リテラルは **使用の証拠にしない**。doc コメントは API 名を普通に挙げるので、
+            // 数えると本当に dead な物が毎回生き残る (enchudb の `Engine::vocab` が実例)。
+            let line = &strip_comment_and_strings(raw_line);
+            for m in re.find_iter(line) {
+                // `self.vocab` のような **同名フィールドへのアクセス** を method 呼び出しと取り違えない。
+                // (enchudb の `Engine::vocab` は本当に dead なのに、field `self.vocab` が 260 箇所
+                //  出るせいで「使用中」に見えていた)。`.name(` と `.name` を区別する。
+                // 「使用」と数えないのは **束縛・宣言の形**。同名の field / 局所変数は珍しくない
+                // (enchudb の `Engine::vocab` は field `vocab: Vocabulary` と local `let vocab = …` の
+                //  せいで「使用中」に見えていた)。呼び出し `name(` / `.name(` と、値参照は残す。
+                let head = &line[..m.start()];
+                let before = head.chars().next_back();
+                let rest = line[m.end()..].trim_start();
+                let after = rest.chars().next();
+                let is_field_access = before == Some('.') && after != Some('(');
+                let is_binding = after == Some(':') && !rest.starts_with("::");
+                let is_let = head.trim_end().ends_with("let") || head.trim_end().ends_with("mut");
+                if is_field_access || is_binding || is_let {
+                    continue;
+                }
+                *local.entry(m.as_str().to_string()).or_default() += 1;
+            }
+        }
+        local
+    });
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for local in counted {
+        for (k, v) in local {
+            *seen.entry(k).or_default() += v;
+        }
+    }
+    // 定義本体の外に 1 度でも出れば「使われている可能性あり」= 候補から外す (安全側)。
+    seen.into_iter().filter(|(_, c)| *c > 0).map(|(n, _)| n).collect()
 }
 
 /// `outline <path|dir>` — ファイルの symbol 一覧。Read せず構造を掴む (path は末尾一致でも可)。
@@ -1161,18 +1540,42 @@ pub fn cmd_stats(args: &[String]) {
         .filter_map(|t| db.table_eid_usage(t).map(|u| format!("{t} {}%", u.allocated as u64 * 100 / u.capacity.max(1) as u64)))
         .collect();
     println!("capacity: {} (残 eid {})", usage.join(" "), db.remaining_eid_capacity());
-    print!("resolve:");
-    let mut resolved = 0usize;
-    for (r, nm) in RES_NAMES.iter().enumerate() {
-        let c = call_t.where_eq("res", r as u32).count().unwrap();
-        if r == R_UNIQUE as usize || r == R_QUALIFIED as usize {
-            resolved += c;
-        }
-        print!(" {nm}={c}");
+    // bake の有無は **精度そのもの**なのに、今までは capacity 行の `ref x%` から読むしかなかった。
+    // (再 index で SCIP が落ちても気付けず、impact が静かに縮む事故が起きる)
+    let n_ref = db.get_table("ref").map(|t| t.all().count().unwrap_or(0)).unwrap_or(0);
+    match (scip_stale_files(&db), n_ref) {
+        (Some(u), n) if u >= SCIP_STALE_FILES => println!("bake: 済み ({n} refs) だが bake 後 {u} ファイル変更 → `kenning bake` で焼き直しを"),
+        (Some(_), n) => println!("bake: 済み ({n} refs) = refs / callers は rust-analyzer 同等精度"),
+        (None, _) => println!("bake: 無し = syn 層のみ (確実 edge は控えめ)。`kenning bake` で精密化"),
     }
+    // 解決率は **外部呼び出しを分母から外して**出す。std / 依存 crate への呼び出しは index に
+    // 定義が無く構造的に解決不能で、混ぜると「率が低い = 精度が低い」に読めてしまうため
+    // (実際に測れるのは corpus の外部依存率)。精度は repo 内呼び出しの確定率の方。
+    // `stats path:<substr>` — repo の一部だけの確定率 (どこなら確定を信じてよいかが分かる)。
+    let filter = o.pos.iter().find_map(|a| a.strip_prefix("path:").filter(|s| !s.is_empty()));
+    let rs = match filter {
+        Some(needle) => ResolveStats::of_path(&call_t, &file_paths(&file_t), needle),
+        None => ResolveStats::of(&call_t),
+    };
+    if let Some(needle) = filter {
+        println!("(path:{needle} で絞り込み: {} call-sites)", rs.total);
+    }
+    print!("resolve:");
+    for (r, nm) in RES_NAMES.iter().enumerate() {
+        print!(" {nm}={}", rs.counts[r]);
+    }
+    println!();
     println!(
-        " → 解決率 {:.1}%",
-        if n_call > 0 { resolved as f64 * 100.0 / n_call as f64 } else { 0.0 }
+        "  repo 内 {} 件 (外部/std {} を除く) の確定率 {:.1}% — 未確定 {}: 受け手不明の method {} / 同名複数 {} / 値渡し {} / マクロ {} / 未解決 {}",
+        rs.local(),
+        rs.n(R_EXTERNAL),
+        rs.local_pct(),
+        rs.local() - rs.confirmed(),
+        rs.n(R_METHOD),
+        rs.n(R_AMBIG),
+        rs.n(R_VALUE),
+        rs.n(R_MACRO),
+        rs.n(R_UNRESOLVED),
     );
 
     // crate 別の symbol 数 (新しい repo での当たり付け = どこにコードの重心があるか)。

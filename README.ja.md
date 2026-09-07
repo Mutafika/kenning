@@ -78,31 +78,45 @@ enchudb-oplog = { path = "../enchudb/crates/enchudb-oplog" }
 
 ```
 kenning def     <name>              定義 + シグネチャ + doc 1 行目 (hover 相当)
+                                    (<name> は Type::method 形でも可 — 出力の修飾名をそのまま渡せる)
 kenning read    <name> [container] [crate:X] [path:S] [--all]
                                     定義本体をそのまま出力 (def + ファイル読みを 1 手に)。
                                     同名は crate:/path:/container で絞る、--all で全部出す
 kenning read    <path>:<line>       その行を囲む item の本体 (grep -n → sed を 1 手に)
+kenning read    <path>:<from>-<to>  行範囲 (sed -n 'A,Bp' の代わり)。範囲が跨ぐ定義 /
+                                    見出しを頭に列挙する
 kenning read    <file>#<見出し>      .md の見出し / .toml の [table] / .yml のキー配下
 kenning find    <substr>            symbol 名 + ファイル名 (basename) の部分一致 (発見用。
                                     `find -name '*x*'` 相当も兼ねる)
-kenning text    <term>... [-e] [path:S]
+kenning text    <term>... [-e] [--and] [--files] [path:S]
                                     全テキストファイルの全文検索 + 文脈注釈
                                     (.rs=enclosing symbol / .md=見出し階層 / .toml=[table])。
-                                    複数語は OR、-e で正規表現、path: で dir 絞り
+                                    複数語は既定 OR / --and で全語 AND (grep X | grep Y)、
+                                    -e で正規表現、--files で file 別件数だけ (rg -c 相当の
+                                    triage)、path: で dir 絞り
 kenning callers <name> [container]  who-calls: 確実 ∪ 未確定候補を位置付きで
 kenning callees <name> [container]  呼ぶ先 (outgoing)
 kenning edges                       全 cross-file call edge を集計 (from\tto\tcount TSV)
 kenning refs    <name> [container]  find-all-references (要 bake; 型参照・読み書きも)
 kenning impls   <trait|type>        go-to-implementation (双方向)
-kenning impact  <name> [container]  推移的 callers = 変更の影響範囲 (逆 BFS)
+kenning impact  <name> [container] [--confirmed-only]
+                                    推移的 callers = 変更の影響範囲 (逆 BFS)。既定は値渡し参照
+                                    (map(f)) も辿る — 影響範囲は見落としの方が危険なので
 kenning tests   <name> [container]  この symbol に届くテスト = impact ∩ is_test
 kenning path    <from> <to>         A から B への呼び出し経路 1 本 (前方 BFS)
 kenning across  <name>              index 済み全 repo 横断の精密参照
-kenning search  kind:method vis:pub container:Engine   faceted 等値 AND
+kenning search  kind:method vis:pub container:Engine path:engine.rs   faceted 等値 AND
+kenning search  reachable:0         live root (pub / #[test] / trait 実装 / main / item 直下マクロ) から
+                                    到達しない定義 = 消せる候補。鎖・相互再帰の dead な塊も 1 パスで出る
+kenning search  attr:<substr>       属性の部分一致 (deprecated / allow(dead_code) / serde / cfg(...))
+kenning search  kind:fn callers:0 namecalls:0 test:0   1 段だけの版 (入次数 0)。
+                                    callers=確実 / namecalls=名前一致 の被呼び出し数。
+                                    method には traitimpl:0 も付ける (trait 実装は trait 経由で呼ばれる)。
+                                    定義以外に名前が字句として現れる物は自動除外 (--no-lexical で切れる)
 kenning outline <path|dir>          ファイルを読まずに構造把握。dir なら配下 file の地図
                                     (symbol 数 / loc)、`.` で repo の地図
 kenning bake                        rust-analyzer を 1 回走らせ SCIP 取込 → RA 級精度
-kenning stats                       index 規模 + 解決率
+kenning stats   [path:<substr>]     index 規模 + 解決の内訳 (path: で repo の一部だけの率)
 kenning cache   [ls|prune]          自動 db の棚卸し / 掃除 (repo 消失・旧版、--older-than D、
                                     --dry-run)
 kenning --version                   バージョン
@@ -123,6 +137,7 @@ kenning --version                   バージョン
 | `KENNING_NO_IGNORE=1` | gitignore 済みの `.rs` も索引 (生成コードを compile する repo 用) |
 | `KENNING_BAKE_TIMEOUT=<秒>` | rust-analyzer 1 回の上限 (既定 900)。超えたら `bake` は process group ごと kill して default features に退避し、その選択を repo ごとに記憶する |
 | `KENNING_BAKE_DEFAULT_FEATURES=1` | 最初から `features = "all"` を試さない |
+| `KENNING_BAKE_RUSTFLAGS=<flags>` | rust-analyzer 実行時に足す `RUSTFLAGS`。Cargo.toml に現れない custom cfg で囲われた repo 用 (`--cfg tokio_unstable` で tokio は 59.2% → 65.0%) |
 | `KENNING_RA=<path>` | `bake` に使う rust-analyzer binary |
 
 ## 設計の要点
@@ -130,6 +145,13 @@ kenning --version                   バージョン
 - **誠実な完全性。** `callers` は 3 つのラベル付き集合を返す: *確実*（解決済みエッジの
   逆引き — 誤検出なし）、*候補*（未解決の同名 call-site — 要確認）、*別定義に確定*。
   和集合は grep-complete で、ラベルがどの行を無条件に信じてよいか教える。推測は一切しない。
+  parse できない DSL マクロ（`proptest!` 等）の中の呼び出しは `[macro-token]`、
+  関数を**値として渡した参照**（`map(f)` / `any(f)`）は `[value-ref]` ラベルの候補として出る —
+  呼ぶのは渡した先なので確定はしないが、「使われているか」の問いには答えられる。
+- **受け手不明の method は確定させない。** `x.f()` の受け手の型は syn には分からないので、
+  同名 method が repo に 1 つしか無くても確定しない（`[method-name]` 候補として位置付きで出す）。
+  確定するのは `self.f()`（受け手 = 今いる impl の型）と SCIP が答えた分だけ。
+  この線を引かないと `.next()` / `.len()` が自前の同名 method の「確実な呼び元」として並ぶ。
 - **cfg-blind 回収。** rust-analyzer は活性な cfg 構成しか解析しないので、SCIP は off の
   `#[cfg(...)]` ブランチ内で沈黙する。`syn` は全ブランチを見る。SCIP が沈黙する所は
   保守的な syn resolver にフォールバック — kenning は rust-analyzer 自身が取りこぼす
@@ -139,7 +161,11 @@ kenning --version                   バージョン
   効き目は crate 次第で、それを仮定せず出す: tokio の workspace では今や誤差
   （SCIP 確定 edge は all 8,934 / default 8,853）、逆に enchudb では `features = "all"` が
   上限時間を超えて固まり `bake` は default features に退避する。
-  解決率は隠さず表示する。
+  解決率は隠さず表示する。ただし **分母は外部呼び出しを除いた repo 内 call-site**:
+  std / 依存 crate への呼び出しは index に定義が無く構造的に解決不能なので、混ぜると
+  「率が低い = 精度が低い」に見えてしまう（実際に測れるのは corpus の外部依存率。
+  tokio は call-site の 47% が std / dep）。`stats` は内訳（外部 / 同名複数 / 値渡し /
+  マクロ）も一緒に出す。
 - **index は派生物。** `~/.cache/kenning/` に住み、repo の中には入らず、repo root で
   keying。いつ消してもよい — 次の質問で建て直す。
 - **repo 横断。** SCIP symbol は大域的に一意（crate + version）なので、`across` はある
@@ -181,7 +207,7 @@ wall は同オーダー（4 corpus で rg 6.3–16.2 ms vs text 5.0–22.9 ms）
 
 **vs rust-analyzer** ([bench/VS-RA.md](bench/VS-RA.md), `./bench/vs-ra.sh`):
 cold から「who-calls に答えられる」までの時間とメモリ — RA（`analysis-stats`、RA 自身の
-ベンチツール）: enchudb で 18.9 s / 3.1 GB、対して kenning syn index: 0.29 s / 130 MB、
+ベンチツール）: enchudb で 18.9 s / 3.1 GB、対して kenning syn index: 0.30 s / 136 MB、
 以後の常駐ゼロ。精度のトレードと feature スコープの注記は表の隣に明記。
 
 **vs CodeQL** ([bench/VS-CODEQL.md](bench/VS-CODEQL.md), `./bench/vs-codeql.sh`):
@@ -204,22 +230,29 @@ CodeQL / Glean の対決は当時の enchudb スナップショット（175 file
 回し直してはいない（68 分の DB 構築を毎回払う意味がない）。主張は桁であって小数第 3 位ではない。
 
 **vs ast-grep**（構造検索; 同じ質問、agent スイート内）: その構造一致は kenning の
-確実 ∪ 候補 集合とほぼ完全に一致（tokio の `sleep` 152 = 105+47、`registration` 89 = 89+0）—
-call-site 検出が完全であることの独立相互検証。差は: 1 問あたり中央値 146–460 ms（repo walk、
+確実 ∪ 候補 集合とほぼ一致し、**マクロ引数の分だけ kenning が上回る**（tokio の `sleep` 152 → 106+50、
+`registration` 89 → 98+0 — 差は `assert!` / `select!` などの引数内呼び出しで、tree-sitter の
+3 パターンでは届かない。確実側は SCIP = rust-analyzer 裏付き。ただし **SCIP symbol が
+test/example/bench ターゲット間で衝突する場合は確定に使わない**ので、そこは候補に落ちる）—
+call-site 検出の独立相互検証。差は: 1 問あたり中央値 146–460 ms（repo walk、
 ユーザーが列挙する 3 つの call 形パターン）vs 7–20 ms（index 済み）、そして名前解決が
 ない — call が*どの*定義に属すか言えず、impact/path/faceted/cross-repo も無い。
 
-- index 構築（syn 層、cold）: enchudb 256 files / 4,099 symbols / 37,022 call-sites を **0.29 s**、
-  tokio 722 files / 7,156 symbols / 28,834 call-sites を **0.53 s**。
+- index 構築（syn 層、cold）: enchudb 256 files / 4,093 symbols / 44,140 call-sites を **0.30 s**、
+  tokio 722 files / 7,156 symbols / 38,218 call-sites を **0.34 s**。
 - 小編集後の増分 update: **~6 ms**。クエリごとの鮮度チェック（dir ゲート付き stat-walk）は
   1–5 ms、`callers` 1 本の全体（プロセス起動込み）は 7–20 ms（ベンチ中央値: kenning 7.1、
   ripgrep 12.1、enchudb 17.3、tokio 19.8 ms。同じ問いを `rg` で引くと 9.2–22.9 ms なので
   速さは互角 — 差は返ってくる中身）。
 - `bake`: rust-analyzer のバッチ 1 回、その後 **常駐ゼロ**。実測は ripgrep 7 s / 1.1 GB、
-  tokio 28 s / 2.0 GB、enchudb 46 s / 2.3 GB。解決率の前→後: tokio 18.3% → 35.5%、
-  ripgrep 26.7% → 48.7%（ここまで features=all）、enchudb 27.5% → 43.2% — enchudb は
-  features=all が上限時間を超えて固まるため *default* features で焼く（上限が存在する理由そのもの）。
-  残る未解決は std / 外部 crate の call が主で、これらもラベル付き候補として列挙される。
+  tokio 28 s / 2.0 GB、enchudb 46 s / 2.3 GB。**repo 内確定率**（分母から std / 依存 crate への
+  呼び出しを外した率。後述）の前→後: tokio 15.5% → 59.2%、ripgrep 23.9% → 91.5%
+  （ここまで features=all）、enchudb 18.1% → 80.1% — enchudb は features=all が上限時間を
+  超えて固まるため *default* features で焼く（上限が存在する理由そのもの）。
+  syn 層が低いのは受け手の型が分からない method 呼び（`x.f()`）を**確定させない**ため
+  （名前一致だけで確定すると `.next()` が自前の同名 method の呼び元として並ぶ）。
+  落とした分は位置付きの候補として残る。free fn 主体の kenning 自身は 82.0% → 82.1% で、
+  bake しても動かない = syn 層が水増ししていない事の確認になる。
 
 ## 設計の取引 — やらないこと、とその代償
 
@@ -229,7 +262,7 @@ call-site 検出が完全であることの独立相互検証。差は: 1 問あ
 |---|---|---|
 | 型推論（`x.f()` の受け手） | 0.3–0.5 s 構築、~6 ms 増分、cfg 全ブランチ被覆 | syn のみの解決は 15–28% 止まり；精密は `bake`（7–46 s / 1.1–2.3 GB の RA 1 回）が要る |
 | hover / 補完 / 診断 | 常駐ゼロ、LSP プロトコル不要 | 人間のエディタにはならない；型はエージェントが `cargo check` で得る |
-| マクロ展開 | per-file の parse 速度 | マクロ内で生まれる call / impl はどの層からも見えない |
+| マクロ展開 | per-file の parse 速度 | **展開後に**生まれる call / impl は見えない (`println!("{}", f())` / `criterion_group!(g, f)` のように引数として書かれた呼び出し・参照は関数の中でも item 直下でも拾う) |
 | 常駐サーバ / file watcher | RAM 0、運用ゼロ、SSH 先で動く | 毎クエリ 1–5 ms の stat-walk（CLI 往復まで含めて 7–20 ms）；warm-µs の数字は in-process のみ |
 | SCIP の as-is serve（代わりに live source へ位置 join） | 答えが常に今のコードを指す | 古い bake は精密 facts を落とす（Glean 戦で `refs → 0` を実地で踏んだ；`upd_since_bake` が警告） |
 | 推測（解決の偽装をしない） | 確実集合に誤検出ゼロ | エージェントは*候補*バケットの目視が残る |
