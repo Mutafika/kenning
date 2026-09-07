@@ -29,12 +29,16 @@ repository = "https://github.com/Mutafika/kenning"
 # issue #259 / PR #260 で修正、rw open は ~1ms に (`kenning update` が内訳を stderr に出す)。
 # 0.26.5 (#255, writer open の eager cylinder build 撤去) は kenning の db 形状には効かず (update 無変更
 # 100→91ms、誤差内)、0.26.2〜0.26.4 / 0.26.6 は docs・migrate・Windows・sync transport で無関係。
-# 残る固定費は drop の persist_schema ~18ms (無変更でも sidecar を fsync、enchudb 側の別件) と
+# 残る固定費だった drop の persist_schema ~18ms は 0.26.8 で解消 (下記)。他は
 # 鮮度判定 + 増分 update の walk × 2 (~9ms ずつ)。update_inner の全ファイル hash 照合 25〜30ms は kenning 側で
 # mtime 絞り込みに変えて walk + stat の 9ms に (読むのは mtime が新しい既知 file と新規 file だけ)。
 # 実測 (tokio 725 files, med): 編集直後の query 123ms (0.26.6 + 全件 hash) → 48ms、update 無変更 91 → 55ms。
-enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.7" }
-enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.7" }
+# 0.26.7 → 0.26.8 (2026-09-07): format 不変・breaking なし (公開 API は追加のみ)。#261 — drop の
+# persist_schema が sidecar (schema / tables / eidmap / vocabmap) を無変更でも fsync していたのを、
+# 書く直前に現行 file と読み比べて同一なら skip に変更。enchudb 側実測で rw open (書込なし) 18.2 → 1.1ms。
+# kenning 実測 (enchudb corpus 297 files, med): 編集直後の query 29.4 → 20.3ms、無変更 query も同幅。
+enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.8" }
+enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.8" }
 # indexer = syn で Rust ソースをパースして symbol/call fact を抽出。
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
