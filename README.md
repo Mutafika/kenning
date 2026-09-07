@@ -22,7 +22,7 @@ kenning callers finish_with_oplog     # that's it — the index builds itself on
 
 AI coding agents explore code with `grep` + reading whole files. That works, but it burns
 tokens: *"what breaks if I change X?"* becomes a recursive chain of greps and reads —
-hundreds of tool calls for a single question (1,384 on enchudb, measured below). kenning's
+hundreds of tool calls for a single question (1,151 on enchudb, measured below). kenning's
 `impact` answers it from a pre-baked graph in one reply: **13–84× fewer bytes** across the
 benchmark corpora, and the deeper the question the wider the gap.
 
@@ -42,8 +42,8 @@ down to a single local binary:
    faceted conjunctions (`kind:method vis:pub container:Engine calls:unwrap`) are bucket
    intersections, not scans.
 
-The index is self-maintaining: stale files are detected on every query (a 1–5 ms stat-walk)
-and re-indexed incrementally (~6 ms for a small edit), so answers are never silently stale.
+The index is self-maintaining: stale files are detected on every query (a 0.8–4.4 ms stat-walk)
+and re-indexed incrementally (5–21 ms for a one-file edit), so answers are never silently stale.
 
 ## Install
 
@@ -184,15 +184,15 @@ Run it yourself: `./bench/corpus.sh && ./bench/run.sh` — pinned corpora (tokio
 fixed random seed, methodology self-described next to every table. Full output:
 [bench/RESULTS.md](bench/RESULTS.md).
 
-| Suite | tokio (722 files) | ripgrep (100 files) | enchudb (256 files) | What it measures |
+| Suite | tokio (722 files) | ripgrep (100 files) | enchudb (258 files) | What it measures |
 |---|---|---|---|---|
-| **agent** — bytes to answer "who calls X?" | **4.1×** less, 15 calls → 1 | **1.7×** less, 3 calls → 1 | **12.2×** less, 52 calls → 1 | 20 fixed questions, grep-route modeled *optimistically* (lower bound) vs actual `callers` output |
-| **beyond** — "what breaks if I change X?" (`impact`) | **48×**, 325 calls → 1 | **13×**, 75 calls → 1 | **84×**, 1,384 calls → 1 | transitive-caller BFS: grep route = the manual grep+read recursion an agent actually performs |
-| **quality** — grep noise on 100 random symbols | median 43 % | median 33 % | median 33 % | share of `\bname\(` hits that are defs/comments/strings/other symbols — rows an agent reads for nothing |
-| **micro** — warm query latency | 125 ns – 5 µs | 166 ns – 2 µs | 166 ns – 4.2 µs | faceted counts, def lookup, precise reverse-edge callers |
+| **agent** — bytes to answer "who calls X?" | **3.6×** less, 17 calls → 1 | **1.4×** less, 3 calls → 1 | **10.0×** less, 46 calls → 1 | 20 fixed questions, grep-route modeled *optimistically* (lower bound) vs actual `callers` output |
+| **beyond** — "what breaks if I change X?" (`impact`) | **43×**, 327 calls → 1 | **33×**, 12 calls → 1 | **84×**, 1,151 calls → 1 | transitive-caller BFS: grep route = the manual grep+read recursion an agent actually performs |
+| **quality** — grep noise on 100 random symbols | median 33 % | median 33 % | median 33 % | share of `\bname\(` hits that are defs/comments/strings/other symbols — rows an agent reads for nothing |
+| **micro** — warm query latency | 83 ns – 3.9 µs | 125 ns – 1.4 µs | 125 ns – 2.9 µs | faceted counts, def lookup, precise reverse-edge callers |
 
 The same suite also measures the other non-search queries: `impls` (go-to-implementation)
-10.6–23.6×, `outline` (structure without reading the file) 8–26× on source files (tokio's 143 KB
+10.6–23.6×, `outline` (structure without reading the file) 5–30× on source files (tokio's 143 KB
 CHANGELOG compresses 30×; ripgrep's `raw.csv` test data hits 1,000×+, which says more about CSV
 than about kenning), `def` (hover: location + signature + doc line) 6.2–9.2×. Faceted queries
 have no grep equivalent at all — they run in µs and are reported as a capability, not a ratio.
@@ -201,17 +201,17 @@ Note the pattern:
 but transitive impact is 13×, because the grep route multiplies per BFS hop.
 
 The spread is the honest story: the advantage scales with how widely symbols are called.
-ripgrep — small and famously well-factored — is the floor (1.7×, median symbol called from
-3 sites); enchudb's hot symbols (52 sites) show 12.2×. Worst cases are where grep drowns
-hardest: `len` in enchudb = 1,187 grep hits → 689 name-matching call-sites, of which 69 are
-confirmed callers of the local `len`.
+ripgrep — small and famously well-factored — is the floor (1.4×, median symbol called from
+3 sites); enchudb's hot symbols (46 sites) show 10.0×. Worst cases are where grep drowns
+hardest: `len` in enchudb = 1,185 grep hits → 1,223 name-matching call-sites, of which 122 are
+confirmed callers.
 
 **Text search vs `rg`** (the `text` suite, same run): 20 high-frequency terms per corpus, the
 same word handed to both engines. Hit counts are **identical on 64 of 80** questions, and every
 difference falls under one of two documented rules — kenning does not index generated lock files
 or anything over 1 MiB (13 questions where it reports fewer), and `rg` stops at the first NUL byte
 while kenning reads the file whole (3 questions on ripgrep's `sherlock-nul.txt`, where kenning
-reports more). Wall clock is the same order: rg 6.3–16.2 ms vs text 5.0–22.9 ms across the four
+reports more). Wall clock is the same order: rg 7.0–15.7 ms vs text 4.9–22.0 ms across the four
 corpora, with every kenning row additionally carrying its enclosing function, heading path or
 TOML table. This is the suite behind the claim that you can stop reaching for grep inside a Rust
 repo — before it, that was the one claim here with no measurement under it.
@@ -243,29 +243,31 @@ twice. The order of magnitude is the claim, not the third decimal.
 
 **Head-to-head vs ast-grep** (structural search; same questions, inside the agent suite):
 its structural matches equal kenning's confirmed ∪ candidate sets almost exactly
-(tokio `sleep` 152 → 106+50, `registration` 89 → 98+0 — kenning is *ahead* by the calls written
+(tokio `sleep` 152 → 106+89, `registration` 89 → 79+19 — kenning is *ahead* by the calls written
 inside macro arguments, which tree-sitter's three patterns cannot reach; the confirmed side is
 SCIP/rust-analyzer-backed) — an independent cross-validation that
-call-site detection is complete. The differences: median 146–460 ms per question (repo walk, three
-call-shape patterns the user must enumerate) vs 7–20 ms (indexed), and no name resolution —
+call-site detection is complete. The differences: median 54–303 ms per question (repo walk, three
+call-shape patterns the user must enumerate) vs 5–12 ms (indexed), and no name resolution —
 it cannot say *which* definition a call belongs to, and has no impact/path/faceted/cross-repo.
 
-- Index build (syn layer, cold): enchudb 256 files / 4,093 symbols / 44,140 call-sites in
-  **0.30 s**; tokio 722 files / 7,156 symbols / 38,218 call-sites in **0.34 s**.
-- Incremental update after a small edit: **~6 ms**. The per-query freshness check (a dir-gated
-  stat-walk) costs 1–5 ms; a whole `callers` query, process start included, is 7–20 ms
-  (bench medians: kenning 7.1, ripgrep 12.1, enchudb 17.3, tokio 19.8 ms — `rg` answering the
-  same questions takes 9.2–22.9 ms, so the speed is a tie and the difference is what comes back).
+- Index build (syn layer, cold, measured 2026-09-08): enchudb 258 files / 4,110 symbols / 44,382 call-sites in
+  **0.29 s**; tokio 722 files / 7,156 symbols / 38,216 call-sites in **0.33 s**.
+- Incremental update after a one-file edit: **5–21 ms** (median: 4.8 on kenning's 31 files and
+  enchudb's 297, 12.6 on ripgrep's 207, 20.8 on tokio's 770). The per-query freshness check (a
+  dir-gated stat-walk) costs 0.8–4.4 ms; a whole `callers` query, process start included, is
+  5–12 ms (bench medians: kenning 4.9, ripgrep 7.7, tokio 10.2, enchudb 11.7 ms — `rg` answering
+  the same questions takes 7.5–15.6 ms, so the speed is a tie and the difference is what comes back).
 - `bake`: one rust-analyzer batch run, then **zero** resident memory. Measured: ripgrep 7 s /
   1.1 GB, tokio 28 s / 2.0 GB, enchudb 46 s / 2.3 GB. **In-repo confirmation rate** (calls into
   std / dependency crates are excluded from the denominator — see below) before → after:
-  tokio 15.5 % → 59.2 %, ripgrep 23.9 % → 91.5 % (both `features = "all"`), enchudb
-  18.1 % → 80.1 % — enchudb bakes with *default* features because `features = "all"` stalls
+  tokio 15.5 % → 59.1 %, ripgrep 23.9 % → 90.4 % (both `features = "all"`), enchudb
+  18.1 % → 80.2 % — enchudb bakes with *default* features because `features = "all"` stalls
   past the timeout there, exactly the fallback the cap exists for. The syn layer starts low
   because it refuses to confirm a method call whose receiver type it cannot know (`x.f()`);
   name-only confirmation would list `.next()` as a caller of your own same-named method.
   What it drops stays as a located candidate. kenning itself, mostly free functions, reads
-  82.0 % → 82.1 % — baking barely moves it, which is how you check the syn layer is not inflating.
+  81.9 % syn-only and 86.9 % baked — only five points of headroom, because a non-inflating syn
+  layer already resolves most of what this repo is made of (`self.f()` and free functions).
 
 ## Deliberate trade-offs — what we don't do, and what it cost
 
@@ -273,10 +275,10 @@ Every number above was bought by *not* doing something. The full ledger:
 
 | We don't do | What it bought | What it costs (measured / observed) |
 |---|---|---|
-| Type inference (`x.f()` receivers) | 0.3–0.5 s builds, ~6 ms incremental updates, cfg-blind coverage | syn-only resolution stays at 15–28 %; precision requires `bake` (one 7–46 s / 1.1–2.3 GB RA run) |
+| Type inference (`x.f()` receivers) | 0.3 s builds, 5–21 ms incremental updates, cfg-blind coverage | syn-only resolution stays at 15–28 %; precision requires `bake` (one 7–46 s / 1.1–2.3 GB RA run) |
 | Hover / completion / diagnostics | zero-resident, no LSP protocol | not a human editor; agents use `cargo check` for types |
 | Macro expansion | per-file parse speed | calls and impls born **of expansion** stay invisible (calls/refs written as macro arguments — `println!("{}", f())`, `criterion_group!(g, f)` — are recorded, inside a function body or at item level) |
-| Resident server / file watcher | 0 RAM, zero ops, works over SSH | a 1–5 ms stat-walk on every query (7–20 ms for the whole CLI round trip); warm-µs numbers only apply in-process |
+| Resident server / file watcher | 0 RAM, zero ops, works over SSH | a 0.8–4.4 ms stat-walk on every query (5–12 ms for the whole CLI round trip); warm-µs numbers only apply in-process |
 | Serving SCIP as-is (we position-join against live source instead) | answers always point at today's code | stale bakes shed precise facts (we hit `refs → 0` live in the Glean matchup; `upd_since_bake` warns) |
 | Guessing (no fabricated resolution) | zero false positives in the confirmed set | agents still eyeball the *candidates* bucket |
 | A general query language (Angle/QL) | zero learning curve, µs answers | arbitrary relational questions (taint tracking) stay CodeQL's territory |

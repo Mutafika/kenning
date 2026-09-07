@@ -117,7 +117,7 @@ repo が RUSTFLAGS 前提の custom cfg を要る場合 (tokio の `--cfg tokio_
 - **精度は食わせた SCIP の feature 網羅に依存 (GIGO)。** 確定 facts は rust-analyzer のもの。
 - **`stats` の率は「repo 内呼び出しのうち確定できた割合」。** std / 依存 crate への呼び出しは
   index に定義が無く構造的に解決不能なので分母から外す (混ぜると corpus の外部依存率になる —
-  tokio は call-site の 47% が外部)。実測: bake 済みで tokio 59.2% / ripgrep 91.5% / enchudb 80.1%、
+  tokio は call-site の 47% が外部)。実測: bake 済みで tokio 59.1% / ripgrep 90.4% / enchudb 80.2%、
   syn 層のみだと 15〜24% (受け手不明の method を確定させない分)。`stats path:<substr>` で
   repo の一部だけの率も出る (どこなら確定を信じてよいかが分かる)。
 - **hover / 補完 / 診断 / 式の型推論は無い** (人間のエディタ用機能。Claude は Read + `cargo check` で足りる)。
