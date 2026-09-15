@@ -207,7 +207,7 @@ wall は同オーダー（4 corpus で rg 7.0–15.7 ms vs text 4.9–22.0 ms）
 
 **vs rust-analyzer** ([bench/VS-RA.md](bench/VS-RA.md), `./bench/vs-ra.sh`):
 cold から「who-calls に答えられる」までの時間とメモリ — RA（`analysis-stats`、RA 自身の
-ベンチツール）: enchudb で 18.9 s / 3.1 GB、対して kenning syn index: 0.30 s / 136 MB、
+ベンチツール）: enchudb で 18.9 s / 3.1 GB、対して kenning syn index: 0.30 s / 118 MB、
 以後の常駐ゼロ。精度のトレードと feature スコープの注記は表の隣に明記。
 
 **vs CodeQL** ([bench/VS-CODEQL.md](bench/VS-CODEQL.md), `./bench/vs-codeql.sh`):

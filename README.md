@@ -218,7 +218,7 @@ repo — before it, that was the one claim here with no measurement under it.
 
 **Head-to-head vs rust-analyzer** ([bench/VS-RA.md](bench/VS-RA.md), `./bench/vs-ra.sh`):
 time and memory to go from cold to "can answer who-calls" — RA (`analysis-stats`, its own bench
-tool): 18.9 s / 3.1 GB on enchudb, vs kenning syn index: 0.30 s / 136 MB, zero resident after.
+tool): 18.9 s / 3.1 GB on enchudb, vs kenning syn index: 0.30 s / 118 MB, zero resident after.
 Precision trade and feature-scope caveats are written next to the table.
 
 **Head-to-head vs CodeQL** ([bench/VS-CODEQL.md](bench/VS-CODEQL.md), `./bench/vs-codeql.sh`):
