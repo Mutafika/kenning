@@ -37,8 +37,20 @@ repository = "https://github.com/Mutafika/kenning"
 # persist_schema が sidecar (schema / tables / eidmap / vocabmap) を無変更でも fsync していたのを、
 # 書く直前に現行 file と読み比べて同一なら skip に変更。enchudb 側実測で rw open (書込なし) 18.2 → 1.1ms。
 # kenning 実測 (enchudb corpus 297 files, med): 編集直後の query 29.4 → 20.3ms、無変更 query も同幅。
-enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.8" }
-enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.8" }
+# 0.26.8 → 0.26.11 (2026-09-15): format 不変・breaking なし (公開 API は追加のみ)。効くのは
+# 0.26.10 (#270) — HimoStore の値→eid 逆索引 (LockFreeCylinder) を書き込みのたびに維持していたのを、
+# 読み手が最初に pull した時点で組む方式に変更。kenning の index は「書くだけで pull しない」bulk load
+# なので、育てた索引は誰にも使われないまま drop で捨てられていた。実測 (同一機で交互 A/B):
+#   full index の peak RSS  tokio 158 → 133MB / enchudb corpus 139 → 118MB / ripgrep 71 → 59MB (-15%)
+#   scip 取込 (tokio 29,809 refs)  peak RSS 371 → 331MB、wall med 2.25 → 1.70s
+#   wall は index 単体では差が出ない (~0.9s、機械ノイズの方が大きい)。効くのはメモリ。
+# 0.26.9 (#264) は build phase の tie に *_by_id を足した API 対称性の変更。名前 lookup は報告者実測で
+# 全体の 0.115% なので kenning 側を書き換える理由は無い (性能目的で移行すると逆に損をする)。
+# 0.26.11 (#276) は page size が違う機械の間で db が可搬でなかった修正 (16KiB 機で焼いた segment を
+# 4KiB 機が開けない)。kenning の db は機械ごとの derived cache なので影響は薄いが、~/.cache/kenning を
+# 別機へ配る使い方では効く。
+enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.11" }
+enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.11" }
 # indexer = syn で Rust ソースをパースして symbol/call fact を抽出。
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
