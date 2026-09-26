@@ -49,8 +49,18 @@ repository = "https://github.com/Mutafika/kenning"
 # 0.26.11 (#276) は page size が違う機械の間で db が可搬でなかった修正 (16KiB 機で焼いた segment を
 # 4KiB 機が開けない)。kenning の db は機械ごとの derived cache なので影響は薄いが、~/.cache/kenning を
 # 別機へ配る使い方では効く。
-enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.11" }
-enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.26.11" }
+# 0.26.11 → 0.27.0 (2026-09-27): minor。live query (クエリ購読) と 64 bit 列 (BigInt) が主役で、どちらも
+# kenning は使わない (購読は process 内メモリだけ = 1 query 1 process の CLI では張っても差分を受け取る前に
+# 終わる)。API breaking (get / LivePred / translate_remote_vid の値が u64、enum に Number64 / Num64 / BigInt、
+# where_gt / where_range が Into<Value>) は kenning の使用範囲に掛からず、コード変更なしで check / test / clippy 緑。
+# format は 64 bit 列を define しない限り v10 のまま → 既存 db はそのまま開け、再 index / 再 bake 不要。
+# 上げる理由は今後の修正が 0.27 系に載るため (追従コストを溜めない)。値 ≥ 2^20 の索引が SparseRuns に
+# なった (#296/#297、u32 列にも効く) が、該当は file 表の hash 列だけで行数 = file 数なので効きは誤差。
+# 実測 (同一機で交互 A/B、load avg 58 なので wall は不問): full index の peak RSS 不変 (tokio 133 /
+# enchudb corpus 135 / ripgrep 60MB)、callers / impact / search reachable:0 / text の出力は旧版と完全一致。
+# 0.26.12 (Android の flock) / 0.26.13 (test のみ) / 0.26.14 (sync 配布の brick 修正) は kenning と無関係。
+enchudb ={ git = "https://github.com/Mutafika/enchudb", tag = "v0.27.0" }
+enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.27.0" }
 # indexer = syn で Rust ソースをパースして symbol/call fact を抽出。
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
