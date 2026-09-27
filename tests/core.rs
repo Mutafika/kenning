@@ -1451,3 +1451,20 @@ fn changes_flags_a_duplicate_definition_that_steals_resolution() {
     assert!(out.contains("other.rs:2\tcallers\tenc: callers 1 → 0"), "重複で確定を失ったのが出ない:\n{out}");
     assert!(out.contains("同名の定義が増えた"), "原因 (同名の定義の追加) が出ない:\n{out}");
 }
+
+/// 起点と今の間に bake が入ると確定の精度が違う → 確定 callers 数の差はコードの変化ではないので出さない。
+/// (テストでは bake できないので、起点 snapshot の bake 時刻を書き換えて「間に bake が入った」を作る)
+#[test]
+fn changes_suppresses_caller_diffs_across_a_bake() {
+    let (dir, db) = changes_fixture();
+    let cdir = PathBuf::from(format!("{}.changes", db.display()));
+    let token = std::fs::read_to_string(cdir.join("cursor-c")).unwrap();
+    let snap = cdir.join(format!("{}.tsv", token.trim()));
+    let body = std::fs::read_to_string(&snap).unwrap();
+    assert!(body.lines().nth(1) == Some("# baked_at 0"), "2 行目に bake 時刻が無い:\n{body}");
+    std::fs::write(&snap, body.replacen("# baked_at 0", "# baked_at 1700000000", 1)).unwrap();
+    let out = edit_and_changes(&dir, &db, &CHG_BASE.replace("    helper(1);\n", ""), "c");
+    assert!(out.contains("bake が入った"), "精度が変わった注記が無い:\n{out}");
+    assert!(!out.contains("\tcallers\t"), "精度差を含む callers を出した:\n{out}");
+    assert!(out.contains("\tdead\thelper"), "callers 以外は出るはず:\n{out}");
+}

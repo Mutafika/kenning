@@ -841,3 +841,22 @@ fn parse_load1_reads_macos_and_linux_formats() {
     assert_eq!(parse_load1("0.52 0.58 0.59 3/900 12345\n"), Some(0.52));
     assert_eq!(parse_load1(""), None);
 }
+
+/// `sf snap list --json` から id / label / contentDigest を拾う (label の escape を解く、欠けた digest は空)。
+#[test]
+fn parse_sinfo_snaps_reads_id_label_digest_in_order() {
+    let json = r#"[
+  { "id": "snap_aaa111", "projectId": "proj_x", "label": "RA \"比較\" + fix",
+    "moduleVersions": { "kenning": "0.16.3" }, "parentId": null, "contentDigest": "d1" },
+  { "id": "snap_bbb222", "projectId": "proj_x", "label": "second", "parentId": null }
+]"#;
+    let v = parse_sinfo_snaps(json);
+    assert_eq!(v.len(), 2);
+    assert_eq!(v[0], SinfoSnap { id: "snap_aaa111".into(), label: "RA \"比較\" + fix".into(), digest: "d1".into() });
+    assert_eq!(v[1], SinfoSnap { id: "snap_bbb222".into(), label: "second".into(), digest: "".into() }, "次の object の digest を拾ってはいけない");
+    assert_eq!(pick_sinfo_snap(&v, "").map(|s| s.id.as_str()), Some("snap_aaa111"), "無指定 = 最新");
+    assert_eq!(pick_sinfo_snap(&v, "second").map(|s| s.id.as_str()), Some("snap_bbb222"), "label");
+    assert_eq!(pick_sinfo_snap(&v, "bbb").map(|s| s.id.as_str()), Some("snap_bbb222"), "短縮 id");
+    assert_eq!(pick_sinfo_snap(&v, "snap_aaa111").map(|s| s.id.as_str()), Some("snap_aaa111"), "完全 id");
+    assert!(pick_sinfo_snap(&v, "zzz").is_none());
+}

@@ -21,7 +21,9 @@ pub(crate) const CURSOR_TTL_DAYS: u64 = 7;
 const SNAP_EXT: &str = "tsv";
 /// snapshot の形式 (key の振り方を含む)。変えたら上げる — 旧形式の snapshot と比べると key がずれて
 /// 偽の差分になるので、読まずに捨てる (git ref の cache は焼き直し、token は「無い」扱い)。
-const SNAP_HEADER: &str = "# kenning-changes snapshot v2";
+const SNAP_HEADER: &str = "# kenning-changes snapshot v3";
+/// 2 行目: 採取時点の bake 時刻 (0 = syn 層だけ)。間に bake が入った 2 つは精度が違う。
+const BAKED_PREFIX: &str = "# baked_at ";
 const CURSOR_PREFIX: &str = "cursor-";
 
 /// fn / method 1 件分の観測。
@@ -179,8 +181,8 @@ fn assign_keys(mut rows: Vec<(String, SnapRow)>) -> Snapshot {
     snap
 }
 
-pub(crate) fn write_snapshot(path: &Path, snap: &Snapshot) -> std::io::Result<()> {
-    let mut s = format!("{SNAP_HEADER}\n");
+pub(crate) fn write_snapshot(path: &Path, snap: &Snapshot, baked_at: u32) -> std::io::Result<()> {
+    let mut s = format!("{SNAP_HEADER}\n{BAKED_PREFIX}{baked_at}\n");
     for (k, r) in snap {
         s += &format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\n", k.replace(['\n', '\r'], " ").replace('\t', "\u{1f}"),cell(&r.qual), cell(&r.path), r.line, cell(&r.sig), r.dead as u8, r.callers);
     }
@@ -190,12 +192,14 @@ pub(crate) fn write_snapshot(path: &Path, snap: &Snapshot) -> std::io::Result<()
     std::fs::rename(&tmp, path)
 }
 
-pub(crate) fn read_snapshot(path: &Path) -> Option<Snapshot> {
+/// 戻り値 = (snapshot, 採取時点の bake 時刻)。
+pub(crate) fn read_snapshot(path: &Path) -> Option<(Snapshot, u32)> {
     let body = std::fs::read_to_string(path).ok()?;
     let mut lines = body.lines();
     if lines.next() != Some(SNAP_HEADER) {
         return None;
     }
+    let baked_at: u32 = lines.next()?.strip_prefix(BAKED_PREFIX)?.parse().ok()?;
     let mut snap = Snapshot::new();
     for line in lines {
         // key 自体が tab 区切り 4 要素なので、key 内の tab は \x1f で退避してある。
@@ -215,7 +219,7 @@ pub(crate) fn read_snapshot(path: &Path) -> Option<Snapshot> {
             },
         );
     }
-    Some(snap)
+    Some((snap, baked_at))
 }
 
 /// 2 つの snapshot の差分。`sites` = 今の「名前 → 呼び出し位置」(壊れた参照の検出用)。
@@ -328,11 +332,6 @@ fn prune_snapshots(dir: &Path) {
     }
 }
 
-/// git ref の snapshot の置き場 (commit は不変なので commit hash で cache、最新 CHANGES_KEEP 個)。
-fn git_snap_dir(db: &str) -> PathBuf {
-    changes_dir(db).join("git")
-}
-
 fn git(root: &str, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new("git").arg("-C").arg(root).args(args).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -368,29 +367,127 @@ fn snapshot_of_tree(src: &Path, shown: &str) -> Option<(Snapshot, CallSites)> {
     Some((snap, sites))
 }
 
+/// 過去の tree (git の commit / sinfo の snap) を `materialize` で使い捨て dir に書き出し、syn 層で
+/// snapshot を採る。中身が不変な物だけを `key` で `<db>.changes/<sub>/` に cache (最新 CHANGES_KEEP 個)。
+fn cached_tree_snapshot(db: &str, root: &str, sub: &str, key: &str, what: &str, materialize: impl FnOnce(&Path) -> bool) -> Result<Snapshot, String> {
+    let dir = changes_dir(db).join(sub);
+    let cached = dir.join(format!("{key}.{SNAP_EXT}"));
+    if let Some((s, _)) = read_snapshot(&cached) {
+        return Ok(s);
+    }
+    let tree = scratch_dir("tree");
+    std::fs::create_dir_all(&tree).map_err(|e| e.to_string())?;
+    let snap = if materialize(&tree) { snapshot_of_tree(&tree, root).map(|(s, _)| s) } else { None };
+    let _ = std::fs::remove_dir_all(&tree);
+    let snap = snap.ok_or_else(|| format!("{what} の tree を書き出せない / index できない"))?;
+    if std::fs::create_dir_all(&dir).is_ok() && write_snapshot(&cached, &snap, 0).is_ok() {
+        prune_by_mtime(&dir, CHANGES_KEEP);
+    }
+    Ok(snap)
+}
+
 /// `<ref>` 時点の tree の snapshot (commit hash で cache)。戻り値 = (snapshot, 解決した commit)。
 fn git_ref_snapshot(db: &str, root: &str, gitref: &str) -> Result<(Snapshot, String), String> {
     let commit = git(root, &["rev-parse", "--verify", "--quiet", &format!("{gitref}^{{commit}}")])
         .ok_or_else(|| format!("\"{gitref}\" は token でも git ref でもない ({root} で rev-parse できない)"))?;
-    let dir = git_snap_dir(db);
-    let cached = dir.join(format!("{commit}.{SNAP_EXT}"));
-    if let Some(s) = read_snapshot(&cached) {
-        return Ok((s, commit));
-    }
-    let tree = scratch_dir("tree");
-    std::fs::create_dir_all(&tree).map_err(|e| e.to_string())?;
+    let what = format!("{gitref} ({})", &commit[..commit.len().min(12)]);
     // git archive = tracked file だけ (ignore 済みの生成物は最初から入らない)。repo の状態には触らない。
-    let archived = std::process::Command::new("sh")
-        .arg("-c").arg("git -C \"$1\" archive --format=tar \"$2\" | tar -x -C \"$3\"")
-        .arg("sh").arg(root).arg(&commit).arg(&tree)
-        .status().map(|s| s.success()).unwrap_or(false);
-    let snap = if archived { snapshot_of_tree(&tree, root).map(|(s, _)| s) } else { None };
-    let _ = std::fs::remove_dir_all(&tree);
-    let snap = snap.ok_or_else(|| format!("{gitref} ({}) の tree を index できない", &commit[..commit.len().min(12)]))?;
-    if std::fs::create_dir_all(&dir).is_ok() && write_snapshot(&cached, &snap).is_ok() {
-        prune_by_mtime(&dir, CHANGES_KEEP);
-    }
+    let snap = cached_tree_snapshot(db, root, "git", &commit, &what, |tree| {
+        std::process::Command::new("sh")
+            .arg("-c").arg("git -C \"$1\" archive --format=tar \"$2\" | tar -x -C \"$3\"")
+            .arg("sh").arg(root).arg(&commit).arg(tree)
+            .status().map(|s| s.success()).unwrap_or(false)
+    })?;
     Ok((snap, commit))
+}
+
+/// sinfo の snap 1 件 (`sf snap list --json` から要る所だけ)。
+#[derive(Debug, PartialEq)]
+pub(crate) struct SinfoSnap {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) digest: String,
+}
+
+/// JSON 文字列値を `"key": "…"` の形で `from` 以降から 1 つ拾う (escape を解く)。依存を足さないための最小実装。
+fn json_str_field(s: &str, key: &str, from: usize) -> Option<(String, usize)> {
+    let pat = format!("\"{key}\": \"");
+    let start = s[from..].find(&pat)? + from + pat.len();
+    let mut out = String::new();
+    let mut it = s[start..].char_indices();
+    while let Some((i, c)) = it.next() {
+        match c {
+            '"' => return Some((out, start + i + 1)),
+            '\\' => match it.next().map(|(_, e)| e) {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(e) => out.push(e),
+                None => return None,
+            },
+            c => out.push(c),
+        }
+    }
+    None
+}
+
+/// `sf snap list --json` の出力 (新しい順) から id / label / contentDigest を拾う。
+pub(crate) fn parse_sinfo_snaps(json: &str) -> Vec<SinfoSnap> {
+    let mut v = Vec::new();
+    let mut pos = 0;
+    while let Some((id, after_id)) = json_str_field(json, "id", pos) {
+        let next = json[after_id..].find("\"id\": \"").map(|i| i + after_id).unwrap_or(json.len());
+        let obj = &json[..next];
+        let label = json_str_field(obj, "label", after_id).map(|x| x.0).unwrap_or_default();
+        let digest = json_str_field(obj, "contentDigest", after_id).map(|x| x.0).unwrap_or_default();
+        v.push(SinfoSnap { id, label, digest });
+        pos = next;
+    }
+    v
+}
+
+/// `spec` = 空なら最新、そうでなければ id / id の前方一致 (短縮) / label の完全一致。
+pub(crate) fn pick_sinfo_snap<'a>(snaps: &'a [SinfoSnap], spec: &str) -> Option<&'a SinfoSnap> {
+    if spec.is_empty() {
+        return snaps.first();
+    }
+    snaps.iter().find(|s| s.id == spec || s.label == spec).or_else(|| {
+        let short = spec.strip_prefix("snap_").unwrap_or(spec);
+        snaps.iter().find(|s| s.id.strip_prefix("snap_").is_some_and(|i| i.starts_with(short)))
+    })
+}
+
+/// sinfo の snap (= build として整合する module の組) 時点の snapshot。`sf write snap` で書き出す
+/// (project には触らない)。cache の鍵は contentDigest。戻り値 = (snapshot, 見出し用の名前)。
+fn sinfo_snap_snapshot(db: &str, root: &str, spec: &str) -> Result<(Snapshot, String), String> {
+    if !Path::new(root).join(".sinfo").is_dir() {
+        return Err(format!("{root} は sinfo の project ではない (.sinfo が無い)"));
+    }
+    let out = std::process::Command::new("sf").args(["snap", "list", "--json", "-n", "200"]).current_dir(root).output()
+        .map_err(|e| format!("sf を起動できない: {e}"))?;
+    let snaps = parse_sinfo_snaps(&String::from_utf8_lossy(&out.stdout));
+    let snap = pick_sinfo_snap(&snaps, spec).ok_or_else(|| {
+        if spec.is_empty() { "snap が 1 つも無い".to_string() } else { format!("snap \"{spec}\" が見つからない (id / 短縮 id / label)") }
+    })?;
+    let short = snap.id.strip_prefix("snap_").unwrap_or(&snap.id);
+    let name = format!("snap {} ({})", snap.label, &short[..short.len().min(8)]);
+    let key = if snap.digest.is_empty() { snap.id.clone() } else { snap.digest.clone() };
+    let s = cached_tree_snapshot(db, root, "sinfo", &key, &name, |tree| {
+        std::process::Command::new("sf").args(["write", "snap", &snap.id, "--dest"]).arg(tree).current_dir(root)
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|st| st.success()).unwrap_or(false)
+    })?;
+    Ok((s, name))
+}
+
+/// 今の index の bake 時刻 (0 = 未 bake)。snapshot 同士の精度が揃っているかの判定に使う。
+fn baked_at_of(db: &Database) -> u32 {
+    db.get_table("meta")
+        .and_then(|t| t.all().find().ok()?.into_iter().next())
+        .and_then(|e| match db.get_table("meta")?.entity(e).get("baked_at") {
+            Some(Value::Number(n)) => Some(n as u32), // num() は欠損を u32::MAX にするので使わない
+            _ => None,
+        })
+        .unwrap_or(0)
 }
 
 /// `dir` 直下の snapshot を新しい順に `keep` 個だけ残す。
@@ -407,7 +504,7 @@ fn prune_by_mtime(dir: &Path, keep: usize) {
     }
 }
 
-/// `changes [--since <token|git ref> | --cursor <name>] [--json]`
+/// `changes [--since <token|git ref|snap[:<id|label>]> | --cursor <name>] [--json] [--all]`
 pub fn cmd_changes(args: &[String]) {
     let (mut since, mut cursor, mut as_json, mut all) = (None::<String>, None::<String>, false, false);
     let mut rest = Vec::new();
@@ -446,22 +543,23 @@ pub fn cmd_changes(args: &[String]) {
         (None, Some(f)) => std::fs::read_to_string(f).ok().map(|s| s.trim().to_string()),
         (None, None) => None,
     };
-    // --since は token (その snapshot が在る) を先に見て、無ければ git ref として解く。
-    let mut git_commit: Option<String> = None;
+    let root = read_meta(&db).map(|m| m.0).unwrap_or_default();
+    // 起点: token (その snapshot が在る) → sinfo の snap (`snap` / `snap:<id|label>`) → git ref の順に解く。
     let base = match &base_token {
         Some(t) if valid_name(t) && dir.join(format!("{t}.{SNAP_EXT}")).exists() => {
-            read_snapshot(&dir.join(format!("{t}.{SNAP_EXT}"))).or_else(|| missing_snapshot(t))
+            read_snapshot(&dir.join(format!("{t}.{SNAP_EXT}"))).map(|(s, b)| Base::Stored(s, b)).or_else(|| missing_snapshot(t))
         }
         Some(t) if since.is_some() && !looks_like_token(t) => {
-            let Some(root) = read_meta(&db).map(|m| m.0).filter(|r| !r.is_empty()) else {
-                eprintln!("# この index は root を知らない (旧版) → git ref を解けない。kenning index で焼き直しを");
+            if root.is_empty() {
+                eprintln!("# この index は root を知らない (旧版) → ref を解けない。kenning index で焼き直しを");
                 std::process::exit(2);
+            }
+            let r = match t.strip_prefix("snap:").or(if t == "snap" { Some("") } else { None }) {
+                Some(spec) => sinfo_snap_snapshot(&o.db, &root, spec),
+                None => git_ref_snapshot(&o.db, &root, t).map(|(s, c)| (s, format!("{t} ({})", &c[..c.len().min(12)]))),
             };
-            match git_ref_snapshot(&o.db, &root, t) {
-                Ok((snap, c)) => {
-                    git_commit = Some(c);
-                    Some(snap)
-                }
+            match r {
+                Ok((snap, label)) => Some(Base::Tree(snap, label)),
                 Err(e) => {
                     eprintln!("# {e}");
                     std::process::exit(2);
@@ -472,26 +570,25 @@ pub fn cmd_changes(args: &[String]) {
         None => None,
     };
 
-    // git ref 側は syn 層だけで焼く。今の db が bake 済みなら SCIP で確定した分だけ callers / dead が
-    // 食い違うので、作業ツリー側も syn 層で焼き直して揃える (揃えないと偽の差分が出る)。
-    let (now, sites) = match &git_commit {
-        Some(_) if scip_stale_files(&db).is_some() => {
-            let root = read_meta(&db).map(|m| m.0).unwrap_or_default();
+    // 過去の tree は syn 層だけで焼く。今の db が bake 済みなら SCIP で確定した分だけ callers / dead が
+    // 食い違うので、作業ツリー側も syn 層で焼き直して揃える (揃えないと偽の差分が出る)。状態は持たない。
+    if let Some(Base::Tree(base, label)) = &base {
+        let (now, sites) = if scip_stale_files(&db).is_some() {
             snapshot_of_tree(Path::new(&root), &root).unwrap_or_else(|| {
                 eprintln!("# 作業ツリーを syn 層で index できない");
                 std::process::exit(2);
             })
-        }
-        _ => take_snapshot(&db),
-    };
-    if let (Some(c), Some(base)) = (&git_commit, &base) {
+        } else {
+            take_snapshot(&db)
+        };
         let changes = diff_snapshots(base, &now, &sites);
-        let label = format!("{} ({})", base_token.as_deref().unwrap_or(""), &c[..c.len().min(12)]);
-        print_changes(&changes, &label, None, o.limit, as_json, all);
+        print_changes(&changes, label, None, o.limit, as_json, all);
         return;
     }
+    let (now, sites) = take_snapshot(&db);
+    let now_baked = baked_at_of(&db);
     let token = new_token();
-    if let Err(e) = write_snapshot(&dir.join(format!("{token}.{SNAP_EXT}")), &now) {
+    if let Err(e) = write_snapshot(&dir.join(format!("{token}.{SNAP_EXT}")), &now, now_baked) {
         eprintln!("# snapshot を書けない: {e}");
         std::process::exit(2);
     }
@@ -500,7 +597,7 @@ pub fn cmd_changes(args: &[String]) {
     }
     prune_snapshots(&dir);
 
-    let Some(base) = base else {
+    let Some(Base::Stored(base, base_baked)) = base else {
         if as_json {
             println!("{{\"kind\":\"token\",\"token\":{},\"since\":null}}", json_str(&token));
         } else {
@@ -509,12 +606,26 @@ pub fn cmd_changes(args: &[String]) {
         }
         return;
     };
-    let changes = diff_snapshots(&base, &now, &sites);
+    let mut changes = diff_snapshots(&base, &now, &sites);
+    // 間に bake が入った (焼き直し / 自動 bake) 2 つは確定の精度が違う → 確定 callers 数の差は
+    // コードの変化ではなく精度の差を含むので出さない (関数 1 つ変えていなくても一斉に動く)。
+    if base_baked != now_baked {
+        changes.retain(|c| !matches!(c, Change::Callers { .. }));
+        if !as_json {
+            println!("# 起点から今までに bake が入った (精度が変わった) → callers の増減は省略。dead / revived も精度差を含み得る");
+        }
+    }
     print_changes(&changes, base_token.as_deref().unwrap_or(""), Some(&token), o.limit, as_json, all);
 }
 
+/// 起点。Stored = 自分で採った snapshot (採取時の bake 時刻付き)、Tree = 過去の tree を syn 層で焼いた物。
+enum Base {
+    Stored(Snapshot, u32),
+    Tree(Snapshot, String),
+}
+
 /// 起点の snapshot が読めない時。黙って baseline 扱いにしない (「差分なし」と読まれてしまう)。
-fn missing_snapshot(t: &str) -> Option<Snapshot> {
+fn missing_snapshot(t: &str) -> Option<Base> {
     eprintln!("# ⚠ snapshot {t} が無い (prune 済み・別 db の token・旧形式)。今の状態を新しい baseline にした");
     None
 }
