@@ -1,12 +1,13 @@
 //! `changes` — 前回の snapshot からの**意味的な差分** (壊れた参照 / シグネチャ変更 / 新しく dead /
-//! 復活 / 呼び元数の増減)。読み手を選ばない: 既定は `path:line<TAB>種類<TAB>詳細` (人間・Claude・
+//! 復活 / 呼び元数の増減 — 行は `--all` の時だけ)。読み手を選ばない: 既定は `path:line<TAB>種類<TAB>詳細` (人間・Claude・
 //! エディタ)、`--json` で NDJSON (CI・スクリプト)。
 //!
 //! snapshot は db の隣 `<db>.changes/<token>.tsv` に置く (db 本体の schema は触らない = INDEX_VER 不変、
 //! `cache prune` は prefix で一緒に回収する)。key は eid ではなく `crate / module / kind / Container::name`
 //! なので、full 再 index を挟んでも比べられる。対象は fn / method だけ (call edge を持つのはこれだけ)。
 //!
-//! 起点の渡し方は 2 つ: `--since <token>` (呼び手が token を持つ) と `--cursor <name>` (名前付きで
+//! 起点の渡し方は 3 つ: `--since <git ref>` (状態なし、`HEAD` = commit していない作業の差分)、
+//! `--since <token>` (呼び手が token を持つ)、 `--cursor <name>` (名前付きで
 //! kenning 側が token を進める = hook のように状態を持てない呼び手向け)。どちらも無ければ baseline を
 //! 作って token だけ返す。
 
@@ -18,6 +19,9 @@ pub(crate) const CHANGES_KEEP: usize = 8;
 /// cursor が snapshot を pin したまま溜まり続けないように)。
 pub(crate) const CURSOR_TTL_DAYS: u64 = 7;
 const SNAP_EXT: &str = "tsv";
+/// snapshot の形式 (key の振り方を含む)。変えたら上げる — 旧形式の snapshot と比べると key がずれて
+/// 偽の差分になるので、読まずに捨てる (git ref の cache は焼き直し、token は「無い」扱い)。
+const SNAP_HEADER: &str = "# kenning-changes snapshot v2";
 const CURSOR_PREFIX: &str = "cursor-";
 
 /// fn / method 1 件分の観測。
@@ -33,6 +37,8 @@ pub(crate) struct SnapRow {
 
 /// key → 観測。BTreeMap = 出力順が決定的。
 pub(crate) type Snapshot = std::collections::BTreeMap<String, SnapRow>;
+/// 名前 → 呼び出し位置 (path, line)。消えた定義の呼び出しが残っているかを見る。
+pub(crate) type CallSites = HashMap<String, Vec<(String, u32)>>;
 
 /// 差分 1 件。`kind` の並び = 深刻な順 (出力もこの順)。
 #[derive(Debug, PartialEq)]
@@ -90,23 +96,6 @@ impl Change {
     }
 }
 
-pub(crate) fn json_str(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    o.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            '\t' => o.push_str("\\t"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
-        }
-    }
-    o.push('"');
-    o
-}
-
 /// TSV の 1 セルに入れられる形 (tab / 改行を潰す)。
 fn cell(s: &str) -> String {
     s.replace(['\t', '\n', '\r'], " ")
@@ -114,7 +103,7 @@ fn cell(s: &str) -> String {
 
 /// 今の index から snapshot を採る。dead は `search reachable:0` と同じ判定 (字句照合込み = 安全側)。
 /// 同時に「名前 → 呼び出し位置」も返す (消えた定義の呼び出しが残っているかを見るため)。
-pub(crate) fn take_snapshot(db: &Database) -> (Snapshot, HashMap<String, Vec<(String, u32)>>) {
+pub(crate) fn take_snapshot(db: &Database) -> (Snapshot, CallSites) {
     let file_t = db.get_table("file").unwrap();
     let sym_t = db.get_table("sym").unwrap();
     let call_t = db.get_table("call").unwrap();
@@ -129,7 +118,7 @@ pub(crate) fn take_snapshot(db: &Database) -> (Snapshot, HashMap<String, Vec<(St
 
     // call 表を 1 パス: 確定 callers 数 (callee_sym 逆引き) と、名前 → 呼び出し位置。
     let mut callers: HashMap<EntityId, u32> = HashMap::new();
-    let mut sites: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+    let mut sites = CallSites::new();
     for c in call_t.all().find().unwrap_or_default() {
         let er = call_t.entity(c);
         if let Some(Value::Ref(t)) = er.get("callee_sym") {
@@ -142,48 +131,53 @@ pub(crate) fn take_snapshot(db: &Database) -> (Snapshot, HashMap<String, Vec<(St
         v.sort();
     }
 
-    let mut snap = Snapshot::new();
+    let mut rows: Vec<(String, SnapRow)> = Vec::new();
     for kind in [K_FN, K_METHOD] {
         for e in sym_t.where_eq("kind", kind).find().unwrap_or_default() {
             let er = sym_t.entity(e);
             let qual = sym_qual(&sym_t, e);
             let base = format!("{}\t{}\t{}\t{qual}", txt(er.get("crate_")), txt(er.get("module")), kind_name(kind));
-            let row = SnapRow {
+            rows.push((base, SnapRow {
                 qual,
                 path: paths.get(&ref_of(er.get("file"))).cloned().unwrap_or_default(),
                 line: num(er.get("line")),
                 sig: txt(er.get("sig")),
                 dead: dead.contains(&e),
                 callers: callers.get(&e).copied().unwrap_or(0),
-            };
-            insert_unique(&mut snap, base, row);
+            }));
         }
     }
-    (snap, sites)
+    (assign_keys(rows), sites)
 }
 
-/// 同じ key の定義 (cfg 分岐の双子など) は `#2`, `#3` を振って両方残す。path:line 順に振り直すので、
-/// 挿入順 (eid 順) に依らず同じ repo からは同じ key が出る。
-fn insert_unique(snap: &mut Snapshot, base: String, row: SnapRow) {
-    let mut group: Vec<SnapRow> = vec![row];
-    let mut n = 1;
-    loop {
-        let k = if n == 1 { base.clone() } else { format!("{base}#{n}") };
-        match snap.remove(&k) {
-            Some(r) => group.push(r),
-            None => break,
-        }
-        n += 1;
+/// key を振る。名前が一意なら key に path を含めない (file を移しても同じ定義として追える)。
+/// 衝突した時 (tests/*.rs ごとの `tmp()`、cfg 分岐の双子) だけ path で区別し、同じ file 内の重複は
+/// 行順の通し番号で。**全体の通し番号にはしない** — path 順で間に file が 1 つ入るだけで番号がずれ、
+/// 別 file の同名同士を突き合わせて偽の sig を出す (enchudb の作業ツリーで実際に 3 件出た)。
+fn assign_keys(mut rows: Vec<(String, SnapRow)>) -> Snapshot {
+    rows.sort_by(|a, b| (&a.0, &a.1.path, a.1.line).cmp(&(&b.0, &b.1.path, b.1.line)));
+    let mut n_base: HashMap<String, usize> = HashMap::new();
+    for (b, _) in &rows {
+        *n_base.entry(b.clone()).or_default() += 1;
     }
-    group.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
-    for (i, r) in group.into_iter().enumerate() {
-        let k = if i == 0 { base.clone() } else { format!("{base}#{}", i + 1) };
-        snap.insert(k, r);
+    let mut snap = Snapshot::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for (base, row) in rows {
+        let key = if n_base[&base] == 1 {
+            base
+        } else {
+            let k = format!("{base}\t@{}", row.path);
+            let i = seen.entry(k.clone()).or_default();
+            *i += 1;
+            if *i == 1 { k } else { format!("{k}#{i}") }
+        };
+        snap.insert(key, row);
     }
+    snap
 }
 
 pub(crate) fn write_snapshot(path: &Path, snap: &Snapshot) -> std::io::Result<()> {
-    let mut s = String::new();
+    let mut s = format!("{SNAP_HEADER}\n");
     for (k, r) in snap {
         s += &format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\n", k.replace(['\n', '\r'], " ").replace('\t', "\u{1f}"),cell(&r.qual), cell(&r.path), r.line, cell(&r.sig), r.dead as u8, r.callers);
     }
@@ -195,8 +189,12 @@ pub(crate) fn write_snapshot(path: &Path, snap: &Snapshot) -> std::io::Result<()
 
 pub(crate) fn read_snapshot(path: &Path) -> Option<Snapshot> {
     let body = std::fs::read_to_string(path).ok()?;
+    let mut lines = body.lines();
+    if lines.next() != Some(SNAP_HEADER) {
+        return None;
+    }
     let mut snap = Snapshot::new();
-    for line in body.lines() {
+    for line in lines {
         // key 自体が tab 区切り 4 要素なので、key 内の tab は \x1f で退避してある。
         let f: Vec<&str> = line.split('\t').collect();
         if f.len() != 7 {
@@ -218,7 +216,7 @@ pub(crate) fn read_snapshot(path: &Path) -> Option<Snapshot> {
 }
 
 /// 2 つの snapshot の差分。`sites` = 今の「名前 → 呼び出し位置」(壊れた参照の検出用)。
-pub(crate) fn diff_snapshots(old: &Snapshot, new: &Snapshot, sites: &HashMap<String, Vec<(String, u32)>>) -> Vec<Change> {
+pub(crate) fn diff_snapshots(old: &Snapshot, new: &Snapshot, sites: &CallSites) -> Vec<Change> {
     let bare = |q: &str| q.rsplit("::").next().unwrap_or(q).to_string();
     let live_names: HashSet<String> = new.values().map(|r| bare(&r.qual)).collect();
     let mut out = Vec::new();
@@ -305,9 +303,88 @@ fn prune_snapshots(dir: &Path) {
     }
 }
 
-/// `changes [--since <token> | --cursor <name>] [--json]`
+/// git ref の snapshot の置き場 (commit は不変なので commit hash で cache、最新 CHANGES_KEEP 個)。
+fn git_snap_dir(db: &str) -> PathBuf {
+    changes_dir(db).join("git")
+}
+
+fn git(root: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git").arg("-C").arg(root).args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// 使い捨ての場所 (OS の temp)。**cache の下には置かない** — `<db>.changes/.ignore` が親から効いて
+/// 中身が丸ごと index 対象外になる。
+fn scratch_dir(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("kenning-changes-{tag}-{}-{}", std::process::id(), new_token()))
+}
+
+/// `src` を syn 層だけで使い捨て db に index して snapshot を採る。表示用 path は `src` → `shown` に読み替える。
+/// 別 process で焼く (index の進捗出力と panic 捕捉を本体の経路に任せ、stdout を汚さない)。
+fn snapshot_of_tree(src: &Path, shown: &str) -> Option<(Snapshot, CallSites)> {
+    let db = scratch_dir("db");
+    let exe = std::env::current_exe().ok()?;
+    let ok = std::process::Command::new(exe)
+        .arg("index").arg(src).arg(&db)
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status().ok()?.success();
+    let r = if ok { Database::open_readonly(&db.to_string_lossy()).ok().map(|d| take_snapshot(&d)) } else { None };
+    let _ = std::fs::remove_dir_all(&db);
+    let _ = std::fs::remove_file(format!("{}.index.lock", db.display()));
+    let (mut snap, mut sites) = r?;
+    let from = abs_dir(&src.to_string_lossy());
+    let fix = |p: &mut String| if let Some(rest) = p.strip_prefix(from.as_str()) { *p = format!("{shown}{rest}") };
+    for r in snap.values_mut() {
+        fix(&mut r.path);
+    }
+    for v in sites.values_mut() {
+        v.iter_mut().for_each(|(p, _)| fix(p));
+    }
+    Some((snap, sites))
+}
+
+/// `<ref>` 時点の tree の snapshot (commit hash で cache)。戻り値 = (snapshot, 解決した commit)。
+fn git_ref_snapshot(db: &str, root: &str, gitref: &str) -> Result<(Snapshot, String), String> {
+    let commit = git(root, &["rev-parse", "--verify", "--quiet", &format!("{gitref}^{{commit}}")])
+        .ok_or_else(|| format!("\"{gitref}\" は token でも git ref でもない ({root} で rev-parse できない)"))?;
+    let dir = git_snap_dir(db);
+    let cached = dir.join(format!("{commit}.{SNAP_EXT}"));
+    if let Some(s) = read_snapshot(&cached) {
+        return Ok((s, commit));
+    }
+    let tree = scratch_dir("tree");
+    std::fs::create_dir_all(&tree).map_err(|e| e.to_string())?;
+    // git archive = tracked file だけ (ignore 済みの生成物は最初から入らない)。repo の状態には触らない。
+    let archived = std::process::Command::new("sh")
+        .arg("-c").arg("git -C \"$1\" archive --format=tar \"$2\" | tar -x -C \"$3\"")
+        .arg("sh").arg(root).arg(&commit).arg(&tree)
+        .status().map(|s| s.success()).unwrap_or(false);
+    let snap = if archived { snapshot_of_tree(&tree, root).map(|(s, _)| s) } else { None };
+    let _ = std::fs::remove_dir_all(&tree);
+    let snap = snap.ok_or_else(|| format!("{gitref} ({}) の tree を index できない", &commit[..commit.len().min(12)]))?;
+    if std::fs::create_dir_all(&dir).is_ok() && write_snapshot(&cached, &snap).is_ok() {
+        prune_by_mtime(&dir, CHANGES_KEEP);
+    }
+    Ok((snap, commit))
+}
+
+/// `dir` 直下の snapshot を新しい順に `keep` 個だけ残す。
+fn prune_by_mtime(dir: &Path, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut v: Vec<(SystemTime, PathBuf)> = rd
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == SNAP_EXT))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, p) in v.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// `changes [--since <token|git ref> | --cursor <name>] [--json]`
 pub fn cmd_changes(args: &[String]) {
-    let (mut since, mut cursor, mut as_json) = (None::<String>, None::<String>, false);
+    let (mut since, mut cursor, mut as_json, mut all) = (None::<String>, None::<String>, false, false);
     let mut rest = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -315,6 +392,7 @@ pub fn cmd_changes(args: &[String]) {
             "--since" => { i += 1; since = args.get(i).cloned(); }
             "--cursor" => { i += 1; cursor = args.get(i).cloned(); }
             "--json" => as_json = true,
+            "--all" => all = true,
             _ => rest.push(args[i].clone()),
         }
         i += 1;
@@ -343,23 +421,50 @@ pub fn cmd_changes(args: &[String]) {
         (None, Some(f)) => std::fs::read_to_string(f).ok().map(|s| s.trim().to_string()),
         (None, None) => None,
     };
+    // --since は token (その snapshot が在る) を先に見て、無ければ git ref として解く。
+    let mut git_commit: Option<String> = None;
     let base = match &base_token {
-        Some(t) if valid_name(t) => match read_snapshot(&dir.join(format!("{t}.{SNAP_EXT}"))) {
-            Some(s) => Some(s),
-            None => {
-                // 消えた token は黙って baseline 扱いにしない (「差分なし」と読まれてしまう)。
-                eprintln!("# ⚠ snapshot {t} が無い (prune 済みか別 db の token)。今の状態を新しい baseline にした");
-                None
-            }
-        },
-        Some(t) => {
-            eprintln!("# token の形式が違う: \"{t}\"");
-            std::process::exit(2);
+        Some(t) if valid_name(t) && dir.join(format!("{t}.{SNAP_EXT}")).exists() => {
+            read_snapshot(&dir.join(format!("{t}.{SNAP_EXT}"))).or_else(|| missing_snapshot(t))
         }
+        Some(t) if since.is_some() && !looks_like_token(t) => {
+            let Some(root) = read_meta(&db).map(|m| m.0).filter(|r| !r.is_empty()) else {
+                eprintln!("# この index は root を知らない (旧版) → git ref を解けない。kenning index で焼き直しを");
+                std::process::exit(2);
+            };
+            match git_ref_snapshot(&o.db, &root, t) {
+                Ok((snap, c)) => {
+                    git_commit = Some(c);
+                    Some(snap)
+                }
+                Err(e) => {
+                    eprintln!("# {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Some(t) => missing_snapshot(t),
         None => None,
     };
 
-    let (now, sites) = take_snapshot(&db);
+    // git ref 側は syn 層だけで焼く。今の db が bake 済みなら SCIP で確定した分だけ callers / dead が
+    // 食い違うので、作業ツリー側も syn 層で焼き直して揃える (揃えないと偽の差分が出る)。
+    let (now, sites) = match &git_commit {
+        Some(_) if scip_stale_files(&db).is_some() => {
+            let root = read_meta(&db).map(|m| m.0).unwrap_or_default();
+            snapshot_of_tree(Path::new(&root), &root).unwrap_or_else(|| {
+                eprintln!("# 作業ツリーを syn 層で index できない");
+                std::process::exit(2);
+            })
+        }
+        _ => take_snapshot(&db),
+    };
+    if let (Some(c), Some(base)) = (&git_commit, &base) {
+        let changes = diff_snapshots(base, &now, &sites);
+        let label = format!("{} ({})", base_token.as_deref().unwrap_or(""), &c[..c.len().min(12)]);
+        print_changes(&changes, &label, None, o.limit, as_json, all);
+        return;
+    }
     let token = new_token();
     if let Err(e) = write_snapshot(&dir.join(format!("{token}.{SNAP_EXT}")), &now) {
         eprintln!("# snapshot を書けない: {e}");
@@ -380,25 +485,49 @@ pub fn cmd_changes(args: &[String]) {
         return;
     };
     let changes = diff_snapshots(&base, &now, &sites);
-    let since_t = base_token.unwrap_or_default();
+    print_changes(&changes, base_token.as_deref().unwrap_or(""), Some(&token), o.limit, as_json, all);
+}
+
+/// 起点の snapshot が読めない時。黙って baseline 扱いにしない (「差分なし」と読まれてしまう)。
+fn missing_snapshot(t: &str) -> Option<Snapshot> {
+    eprintln!("# ⚠ snapshot {t} が無い (prune 済み・別 db の token・旧形式)。今の状態を新しい baseline にした");
+    None
+}
+
+/// token 形 (new_token の出力 = 20 桁の 16 進)。git の短縮 hash (7〜12 桁) とは長さで分かれる。
+fn looks_like_token(s: &str) -> bool {
+    s.len() == 20 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// `since` = 見出しに出す起点。`token` = 次回の起点 (git ref 起点は状態を持たないので None)。
+/// `all` = callers (呼び元数の増減) の行も出す。既定は件数だけ — 呼び元が増えただけの行は手を打つ物ではなく、
+/// 実測 (kenning 自身の 1 commit) で 19 行が broken / sig / dead を埋もれさせた。JSON は機械が絞るので常に全件。
+fn print_changes(changes: &[Change], since: &str, token: Option<&str>, limit: usize, as_json: bool, all: bool) {
     if as_json {
-        for c in &changes {
+        for c in changes {
             println!("{}", c.json());
         }
-        println!("{{\"kind\":\"token\",\"token\":{},\"since\":{}}}", json_str(&token), json_str(&since_t));
+        let t = token.map(json_str).unwrap_or_else(|| "null".into());
+        println!("{{\"kind\":\"token\",\"token\":{t},\"since\":{}}}", json_str(since));
         return;
     }
     let count = |k: &str| changes.iter().filter(|c| c.kind() == k).count();
     println!(
-        "# changes since {since_t}: broken {} / sig {} / dead {} / revived {} / callers {}",
+        "# changes since {since}: broken {} / sig {} / dead {} / revived {} / callers {}",
         count("broken"), count("sig"), count("dead"), count("revived"), count("callers")
     );
-    for c in changes.iter().take(o.limit) {
+    let shown: Vec<&Change> = changes.iter().filter(|c| all || c.kind() != "callers").collect();
+    for c in shown.iter().take(limit) {
         let (p, l) = c.at();
         println!("{p}:{l}\t{}\t{}", c.kind(), c.detail());
     }
-    if changes.len() > o.limit {
-        println!("… (+{} 件省略、--limit {} で全部)", changes.len() - o.limit, changes.len());
+    if shown.len() > limit {
+        println!("… (+{} 件省略、--limit {} で全部)", shown.len() - limit, shown.len());
     }
-    println!("# token: {token}");
+    if !all && count("callers") > 0 {
+        println!("# callers の増減 {} 件は省略 (--all で表示)", count("callers"));
+    }
+    if let Some(t) = token {
+        println!("# token: {t}");
+    }
 }

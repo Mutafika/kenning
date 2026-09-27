@@ -1308,7 +1308,9 @@ fn changes_tracks_dead_revived_and_unwired_additions() {
     let out = edit_and_changes(&dir, &db, &cut, "c");
     assert!(out.contains("\tdead\thelper が live root から届かなくなった"), "鎖の頭が dead にならない:\n{out}");
     assert!(out.contains("\tdead\tleaf が live root から届かなくなった"), "鎖の下流が dead にならない:\n{out}");
-    assert!(out.contains("\tcallers\thelper: callers 1 → 0"), "呼び元数の変化が出ない:\n{out}");
+    assert!(out.contains("# callers の増減 1 件は省略"), "callers は既定で件数だけのはず:\n{out}");
+    let all = query(&["changes", "--since", out.lines().find_map(|l| l.strip_prefix("# changes since ")).unwrap().split(':').next().unwrap(), "--all"], &db);
+    assert!(all.contains("\tcallers\thelper: callers 1 → 0"), "--all で呼び元数の変化が出ない:\n{all}");
 
     let out = edit_and_changes(&dir, &db, CHG_BASE, "c");
     assert!(out.contains("\trevived\thelper") && out.contains("\trevived\tleaf"), "戻したのに revived が出ない:\n{out}");
@@ -1348,9 +1350,9 @@ fn changes_json_is_one_object_per_line_and_ends_with_token() {
 #[test]
 fn changes_unknown_token_warns_instead_of_reporting_no_changes() {
     let (_dir, db) = changes_fixture();
-    let out = kenning().args(["changes", "--since", "00000000deadbeef", "--db", db.to_str().unwrap()]).env("KENNING_NO_STALE", "1").output().unwrap();
+    let out = kenning().args(["changes", "--since", "0000000000000000beef", "--db", db.to_str().unwrap()]).env("KENNING_NO_STALE", "1").output().unwrap();
     let (so, se) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(se.contains("snapshot 00000000deadbeef が無い"), "警告が出ない:\n{se}");
+    assert!(se.contains("snapshot 0000000000000000beef が無い"), "警告が出ない:\n{se}");
     assert!(so.contains("baseline を作った") && !so.contains("changes since"), "差分なしと誤読される出力:\n{so}");
 }
 
@@ -1366,4 +1368,65 @@ fn changes_drops_idle_cursors() {
     query(&["changes", "--cursor", "c"], &db);
     assert!(!stale.exists(), "30 日放置の cursor が残っている");
     assert!(dir.join("cursor-c").exists(), "使用中の cursor まで消えた");
+}
+
+fn git_in(dir: &Path, args: &[&str]) {
+    let out = Command::new("git").arg("-C").arg(dir).args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]).args(args).output().unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+/// `--since <git ref>` は状態を持たない: commit していない作業の差分 (= git diff の意味版)。
+/// db は repo の外に置く (repo 内だと tracked でない db が作業ツリー側にだけ居て非対称になる)。
+#[test]
+fn changes_since_git_ref_diffs_uncommitted_work_without_state() {
+    let dir = tmp();
+    write_fixture(&dir, CHG_BASE);
+    git_in(&dir, &["init", "-q"]);
+    git_in(&dir, &["add", "-A"]);
+    git_in(&dir, &["commit", "-qm", "base"]);
+    let db = tmp().join("k.db");
+    index(&dir, &db);
+    let clean = query(&["changes", "--since", "HEAD"], &db);
+    assert!(clean.contains("broken 0 / sig 0 / dead 0 / revived 0 / callers 0"), "無変更で差分:\n{clean}");
+    assert!(!clean.contains("# token:"), "git ref 起点は状態を持たない (token を出さない):\n{clean}");
+
+    std::fs::write(dir.join("src/other.rs"), CHG_BASE.replace("fn helper(x: u32)", "fn helper(x: i64)").replace("fn leaf() {}\n", "")).unwrap();
+    update(&dir, &db);
+    let out = query(&["changes", "--since", "HEAD"], &db);
+    assert!(out.contains("\tsig\thelper: fn helper(x: u32) → fn helper(x: i64)"), "sig が出ない:\n{out}");
+    assert!(out.contains("\tbroken\tleaf の定義が消えた"), "broken が出ない:\n{out}");
+    assert!(out.contains(&format!("{}/src/other.rs:", dir.display())), "位置が作業ツリーの path でない:\n{out}");
+
+    let bad = kenning().args(["changes", "--since", "no-such-ref", "--db", db.to_str().unwrap()]).env("KENNING_NO_STALE", "1").output().unwrap();
+    assert!(!bad.status.success() && String::from_utf8_lossy(&bad.stderr).contains("git ref でもない"), "解けない ref を黙って通した: {bad:?}");
+}
+
+/// 同名の free fn が複数 file にある時 (tests/*.rs の `tmp()` など)、file が 1 つ増えただけで
+/// 別 file の同名同士を突き合わせてはいけない (enchudb の作業ツリーで偽の sig 3 件を出した)。
+#[test]
+fn changes_does_not_pair_same_named_fns_across_files_when_a_file_is_added() {
+    let dir = tmp();
+    write_fixture(&dir, "pub fn a_entry() { tmp(); }\nfn tmp() {}\n");
+    std::fs::write(dir.join("src/zeta.rs"), "pub fn z_entry() { tmp(1); }\nfn tmp(x: u8) {}\n").unwrap();
+    let db = dir.join("k.db");
+    index(&dir, &db);
+    query(&["changes", "--cursor", "c"], &db);
+    // path 順で間に入る file を足す (通し番号で区別していると、ここで zeta の tmp とずれる)
+    std::fs::write(dir.join("src/mid.rs"), "pub fn m_entry() { tmp(\"s\"); }\nfn tmp(s: &str) {}\n").unwrap();
+    update(&dir, &db);
+    let out = query(&["changes", "--cursor", "c"], &db);
+    assert!(out.contains("sig 0"), "file を足しただけで偽の sig が出た:\n{out}");
+}
+
+/// 旧形式の snapshot (key の振り方が違う) は読まない — 読むと key がずれて偽の差分になる。
+#[test]
+fn changes_ignores_snapshots_of_an_older_format() {
+    let (_dir, db) = changes_fixture();
+    let dir = PathBuf::from(format!("{}.changes", db.display()));
+    let token = std::fs::read_to_string(dir.join("cursor-c")).unwrap();
+    let snap = dir.join(format!("{}.tsv", token.trim()));
+    let body = std::fs::read_to_string(&snap).unwrap();
+    std::fs::write(&snap, body.lines().skip(1).collect::<Vec<_>>().join("\n")).unwrap(); // header 無し = 旧形式
+    let out = kenning().args(["changes", "--cursor", "c", "--db", db.to_str().unwrap()]).env("KENNING_NO_STALE", "1").output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("旧形式"), "旧形式を黙って読んだ: {out:?}");
 }
