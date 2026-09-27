@@ -55,6 +55,12 @@ kenning search  kind:fn callers:0 namecalls:0 test:0  # 1 段だけの版 (入�
                                     #   `traitimpl:0` も付ける (trait 実装は trait 経由で呼ばれ、構造的に 0 になる)
 kenning outline <path|dir>          # ファイル構造 (Read せず)。`.` で repo の地図。.md/.toml/.yml は見出し構造 = read <file>#… の目次。
                                     #   dir なら配下 file の地図 (symbol 数 / loc)。`read <path>` も同じ (file 全体は Read)
+kenning changes [--since <token> | --cursor <name>] [--json]  # 前回 snapshot からの意味的な差分:
+                                    #   broken (定義が消えたのに呼び出しが残る。位置 = 残った呼び出し) / sig (シグネチャ
+                                    #   変更 + callers 数) / dead (届かなくなった・足したが繋がっていない) / revived /
+                                    #   callers (確定 callers 数の増減)。無指定は baseline を作って token だけ返す。
+                                    #   --cursor は名前付き起点を kenning 側で進める (hook 向け、呼び手ごとに独立)。
+                                    #   snapshot は `<db>.changes/` に最新 8 個 (+ cursor が指す物)
 kenning stats [path:<substr>]        # 規模と解決の内訳 (repo 内確定率 + 外部/同名複数/値渡し/マクロ)
 kenning cache [ls|prune] [--older-than D] [--dry-run]  # 自動 db の棚卸し / 掃除 (repo 消失・旧版を回収)
 ```

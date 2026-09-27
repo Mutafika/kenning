@@ -99,6 +99,7 @@ fn main() {
         Some("outline") => kenning::cmd_outline(&args[2..]),
         Some("stats") => kenning::cmd_stats(&args[2..]),
         Some("cache") => kenning::cmd_cache(&args[2..]),
+        Some("changes") => kenning::cmd_changes(&args[2..]),
         Some("bench") => kenning::cmd_bench(&args[2..]),
         Some("--version" | "-V" | "version") => println!("kenning {}", env!("CARGO_PKG_VERSION")),
         Some("help" | "--help" | "-h") => println!("{USAGE}"),
@@ -145,6 +146,8 @@ const USAGE: &str = concat!(
      \u{0020}                                     attr: calls: callers: namecalls: traitimpl: reachable:\n  \
      \u{0020}                              reachable:0 = live root から届かない定義 = 消せる候補 (dead な塊ごと)\n  \
      outline <path|dir>               ファイルの symbol / 見出し一覧、dir なら配下 file の地図 (末尾一致可)\n  \
+     changes [--since <token> | --cursor <name>] [--json]  前回からの意味的な差分 (壊れた参照 /\n  \
+     \u{0020}                              シグネチャ変更 / 新しく dead / 復活 / 呼び元数)。無指定は baseline 作成\n  \
      stats [path:<substr>]            規模と解決の内訳 (repo 内確定率。path: で dir 別)\n  \
      cache  [ls|prune] [--older-than D] [--dry-run]  自動 db の棚卸し / 掃除 (root 消失・旧版)\n  \
      bench  [quality|agent|micro|all] 再現可能ベンチ (--n/--nq/--seed、markdown 出力)\n\n\

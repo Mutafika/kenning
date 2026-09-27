@@ -226,6 +226,7 @@ mod query;
 mod graph;
 mod bench;
 mod cache;
+mod changes;
 
 pub(crate) use parse::*;
 pub(crate) use scip_facts::*;
@@ -237,6 +238,7 @@ pub(crate) use query::*;
 pub(crate) use graph::*;
 pub(crate) use bench::*;
 pub(crate) use cache::*;
+pub(crate) use changes::*;
 
 #[cfg(test)]
 mod tests;

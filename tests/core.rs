@@ -1246,3 +1246,124 @@ fn only_self_receiver_method_calls_are_confirmed() {
     assert!(candidates.contains("in outside"), "確定しない呼び出しは候補に残すはず:\n{out}");
     assert!(candidates.contains("[method-name]"), "候補の理由をラベルで出すはず:\n{out}");
 }
+
+// ── changes: 前回 snapshot からの意味的な差分 ──
+
+fn update(dir: &Path, db: &Path) {
+    let out = kenning().args(["update", dir.to_str().unwrap(), db.to_str().unwrap()]).output().expect("spawn kenning update");
+    assert!(out.status.success(), "update failed: {out:?}");
+}
+
+/// 1 つの crate を書き換えて update → changes を 1 手で。`other.rs` だけ差し替える。
+fn edit_and_changes(dir: &Path, db: &Path, other: &str, cursor: &str) -> String {
+    std::fs::write(dir.join("src/other.rs"), other).unwrap();
+    update(dir, db);
+    query(&["changes", "--cursor", cursor], db)
+}
+
+const CHG_BASE: &str = "pub fn entry() {\n    helper(1);\n}\n\nfn helper(x: u32) {\n    leaf();\n}\n\nfn leaf() {}\n";
+
+fn changes_fixture() -> (PathBuf, PathBuf) {
+    let dir = tmp();
+    write_fixture(&dir, CHG_BASE);
+    let db = dir.join("k.db");
+    index(&dir, &db);
+    let first = query(&["changes", "--cursor", "c"], &db);
+    assert!(first.contains("baseline を作った"), "初回は baseline を作るはず:\n{first}");
+    (dir, db)
+}
+
+/// 何も変えなければ差分は 0 — full 再 index を挟んでも (key は eid ではなく名前なので) 0。
+#[test]
+fn changes_is_empty_without_edits_even_across_full_reindex() {
+    let (dir, db) = changes_fixture();
+    let out = query(&["changes", "--cursor", "c"], &db);
+    assert!(out.contains("broken 0 / sig 0 / dead 0 / revived 0 / callers 0"), "無変更で差分が出た:\n{out}");
+    let _ = std::fs::remove_dir_all(&db);
+    index(&dir, &db);
+    let out = query(&["changes", "--cursor", "c"], &db);
+    assert!(out.contains("broken 0 / sig 0 / dead 0 / revived 0 / callers 0"), "再 index で偽の差分が出た:\n{out}");
+}
+
+#[test]
+fn changes_reports_signature_change_with_caller_count() {
+    let (dir, db) = changes_fixture();
+    let out = edit_and_changes(&dir, &db, &CHG_BASE.replace("fn helper(x: u32)", "fn helper(x: u32, y: bool)"), "c");
+    assert!(out.contains("\tsig\thelper: fn helper(x: u32) → fn helper(x: u32, y: bool)  (callers 1)"), "sig 変更が出ない:\n{out}");
+}
+
+/// 定義を消したのに呼び出しが残る = 壊れた参照。位置は**残っている呼び出し**を指す (直す場所)。
+#[test]
+fn changes_reports_removed_definition_with_remaining_calls() {
+    let (dir, db) = changes_fixture();
+    let out = edit_and_changes(&dir, &db, &CHG_BASE.replace("fn leaf() {}\n", ""), "c");
+    assert!(out.contains("other.rs:6\tbroken\tleaf の定義が消えたが、呼び出しが 1 件残る"), "壊れた参照が出ない:\n{out}");
+}
+
+/// 唯一の呼び元を切ると鎖ごと dead、戻すと revived。足しただけで誰も呼ばない物は「繋ぎ忘れ」。
+#[test]
+fn changes_tracks_dead_revived_and_unwired_additions() {
+    let (dir, db) = changes_fixture();
+    let cut = CHG_BASE.replace("    helper(1);\n", "");
+    let out = edit_and_changes(&dir, &db, &cut, "c");
+    assert!(out.contains("\tdead\thelper が live root から届かなくなった"), "鎖の頭が dead にならない:\n{out}");
+    assert!(out.contains("\tdead\tleaf が live root から届かなくなった"), "鎖の下流が dead にならない:\n{out}");
+    assert!(out.contains("\tcallers\thelper: callers 1 → 0"), "呼び元数の変化が出ない:\n{out}");
+
+    let out = edit_and_changes(&dir, &db, CHG_BASE, "c");
+    assert!(out.contains("\trevived\thelper") && out.contains("\trevived\tleaf"), "戻したのに revived が出ない:\n{out}");
+
+    let out = edit_and_changes(&dir, &db, &format!("{CHG_BASE}\nfn orphan() {{}}\n"), "c");
+    assert!(out.contains("\tdead\torphan を足したが live root から届かない"), "繋ぎ忘れが出ない:\n{out}");
+}
+
+/// cursor は呼び手ごとに独立 (別 session が進めても自分の起点は動かない)。--since は token 直指定。
+#[test]
+fn changes_cursors_are_independent_and_since_takes_a_token() {
+    let (dir, db) = changes_fixture();
+    let base = query(&["changes", "--cursor", "other"], &db);
+    let token = base.lines().find_map(|l| l.strip_prefix("# token: ")).unwrap().to_string();
+    let out = edit_and_changes(&dir, &db, &CHG_BASE.replace("fn helper(x: u32)", "fn helper(x: u64)"), "c");
+    assert!(out.contains("\tsig\t"), "cursor c で差分が出ない:\n{out}");
+    // cursor c は進んだが other は据え置き → other から見ても同じ差分がまだ見える
+    let other = query(&["changes", "--cursor", "other"], &db);
+    assert!(other.contains("\tsig\t"), "別 cursor の起点が動いてしまった:\n{other}");
+    let since = query(&["changes", "--since", &token], &db);
+    assert!(since.contains("\tsig\t"), "--since <token> で差分が出ない:\n{since}");
+}
+
+#[test]
+fn changes_json_is_one_object_per_line_and_ends_with_token() {
+    let (dir, db) = changes_fixture();
+    std::fs::write(dir.join("src/other.rs"), CHG_BASE.replace("fn helper(x: u32)", "fn helper(x: u8)")).unwrap();
+    update(&dir, &db);
+    let out = query(&["changes", "--cursor", "c", "--json"], &db);
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines.iter().all(|l| l.starts_with('{') && l.ends_with('}')), "NDJSON でない:\n{out}");
+    assert!(lines.iter().any(|l| l.contains("\"kind\":\"sig\"") && l.contains("\"old\":\"fn helper(x: u32)\"")), "sig が無い:\n{out}");
+    assert!(lines.last().unwrap().starts_with("{\"kind\":\"token\""), "最後の行が token でない:\n{out}");
+}
+
+/// 消えた token を「差分なし」と読ませない (警告して新しい baseline に)。
+#[test]
+fn changes_unknown_token_warns_instead_of_reporting_no_changes() {
+    let (_dir, db) = changes_fixture();
+    let out = kenning().args(["changes", "--since", "00000000deadbeef", "--db", db.to_str().unwrap()]).env("KENNING_NO_STALE", "1").output().unwrap();
+    let (so, se) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(se.contains("snapshot 00000000deadbeef が無い"), "警告が出ない:\n{se}");
+    assert!(so.contains("baseline を作った") && !so.contains("changes since"), "差分なしと誤読される出力:\n{so}");
+}
+
+/// 放置された cursor (終わった session の hook が作った物) は TTL で捨てられ、snapshot を pin し続けない。
+#[test]
+fn changes_drops_idle_cursors() {
+    let (_dir, db) = changes_fixture();
+    let dir = PathBuf::from(format!("{}.changes", db.display()));
+    let stale = dir.join("cursor-old-session");
+    std::fs::write(&stale, "0000000000000000dead").unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+    std::fs::File::options().write(true).open(&stale).unwrap().set_modified(old).unwrap();
+    query(&["changes", "--cursor", "c"], &db);
+    assert!(!stale.exists(), "30 日放置の cursor が残っている");
+    assert!(dir.join("cursor-c").exists(), "使用中の cursor まで消えた");
+}
