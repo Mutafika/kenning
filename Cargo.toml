@@ -11,8 +11,10 @@ repository = "https://github.com/Mutafika/kenning"
 # クエリエンジン = enchudb (紐/円柱、全列自動 index の faceted 等値 AND が設計点)。
 # git dep は release tag で pin する — v0.14.0 以降は annotated tag なので `git rev-parse vX` は
 # tag object の hash を返す (commit ではない)。生 hash を書くとそこで事故るため tag 指定にする。
-# ローカル開発で兄弟 dir の enchudb を使う時は .cargo/config.toml の [patch] で差し替え
-# (gitignore 済み。patch 有効中は Cargo.lock が書き換わるので commit に混ぜない)。
+# 普段は patch なし = 手元の build / test も tag 版。enchudb と同時に直す時だけ
+# `.cargo/config.toml.dev` を `.cargo/config.toml` に戻して兄弟 dir に差し替える (gitignore 済み)。
+# 常時有効にしていた頃は、兄弟 dir の未 release コードで test して落ちる / Cargo.lock が path 形に
+# 書き換わる事故が繰り返し起きたので既定で切った (2026-09-27)。
 # 0.14.4 → 0.25.1 (2026-08): API 互換 (コード変更なし)。standalone に効くのは torn read (#119/#128/#132)、
 # readonly open の RSS リーク (#127)、WAL tail 消失 (0.21)、満杯で process 死 / disk full SIGBUS (#59/#167)、
 # growable の lazy commit (0.25、実 disk 半減)。代償は single-writer 書込 -35% (HLC lock、実測 index 0.48→0.58s)。
