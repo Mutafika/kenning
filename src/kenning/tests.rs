@@ -860,3 +860,32 @@ fn parse_sinfo_snaps_reads_id_label_digest_in_order() {
     assert_eq!(pick_sinfo_snap(&v, "snap_aaa111").map(|s| s.id.as_str()), Some("snap_aaa111"), "完全 id");
     assert!(pick_sinfo_snap(&v, "zzz").is_none());
 }
+
+/// 指紋は決定的で、入力が 1 byte 違えば変わる (sinfo の heads 出力の変化を検知する用途)。
+#[test]
+fn fnv1a_is_deterministic_and_sensitive() {
+    assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+    assert_eq!(fnv1a(b"kenning 0.16.3"), fnv1a(b"kenning 0.16.3"));
+    assert_ne!(fnv1a(b"kenning 0.16.3"), fnv1a(b"kenning 0.16.4"));
+}
+
+/// `.git` を直接読んだ HEAD が `git rev-parse HEAD` と一致する (loose ref / packed-refs の両方)。
+#[test]
+fn git_head_matches_rev_parse_for_loose_and_packed_refs() {
+    let d = tmp_tree("githead");
+    let git = |args: &[&str]| {
+        let o = std::process::Command::new("git").arg("-C").arg(&d)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]).args(args).output().unwrap();
+        assert!(o.status.success(), "git {args:?}: {o:?}");
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    git(&["init", "-q"]);
+    std::fs::write(d.join("a.txt"), "x").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "c1"]);
+    let root = d.to_string_lossy().to_string();
+    assert_eq!(milestone_id(&root, "/nonexistent.db"), Some(format!("git:{}", git(&["rev-parse", "HEAD"]))), "loose ref");
+    git(&["pack-refs", "--all"]);
+    assert_eq!(milestone_id(&root, "/nonexistent.db"), Some(format!("git:{}", git(&["rev-parse", "HEAD"]))), "packed-refs");
+    let _ = std::fs::remove_dir_all(&d);
+}

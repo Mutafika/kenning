@@ -362,6 +362,10 @@ pub fn run_bake(dir: &str) {
         }
     // 自動 bake が同じ workspace を焼けるように覚えておく (root 直下が cargo project でない repo 用)。
     let _ = std::fs::write(bake_dir_marker(&db), &bake_s);
+    // この bake が「どの節目 (vup / commit) の時点か」を覚える。次にこれが進んだら焼き直す。
+    if let Some(m) = milestone_id(&root_s, &db) {
+        let _ = std::fs::write(bake_milestone_marker(&db), m);
+    }
     eprintln!("# 精密 facts 有効: refs / callers が RA 同等精度に (`kenning refs <name>`)");
 }
 
@@ -430,7 +434,16 @@ fn load_per_cpu() -> Option<f64> {
 
 /// 増分 update が「SCIP facts が古い」と判定した時に呼ぶ。告知 1 行 + 条件が揃えば裏で bake。
 pub(crate) fn maybe_auto_bake(db: &str, dir: &str, stale: u32) {
-    let head = format!("# SCIP facts が古くなってきた (bake 後 {stale} ファイル変更)");
+    auto_bake_with(db, dir, format!("# SCIP facts が古くなってきた (bake 後 {stale} ファイル変更)"));
+}
+
+/// 1 process で判定・告知は 1 回だけ (節目の検知と閾値の検知が同じ query で重なっても 2 行出さない)。
+static AUTO_BAKE_DECIDED: AtomicBool = AtomicBool::new(false);
+
+fn auto_bake_with(db: &str, dir: &str, head: String) {
+    if AUTO_BAKE_DECIDED.swap(true, Ordering::Relaxed) {
+        return;
+    }
     let log = auto_bake_log(db);
     let since_last = std::fs::metadata(&log).ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).map(|d| d.as_secs());
     let off = auto_bake_off();
@@ -444,6 +457,109 @@ pub(crate) fn maybe_auto_bake(db: &str, dir: &str, stale: u32) {
                 Ok(()) => eprintln!("{head} → 裏で bake を起動 (nice、ログ {log}。無効化は KENNING_AUTO_BAKE=0)"),
                 Err(e) => eprintln!("{head} → 自動 bake を起動できない ({e})。`kenning bake` 推奨"),
             }
+        }
+    }
+}
+
+// ── 節目 (vup / commit) で焼き直す ──
+// bake のきっかけは「20 ファイル変わった」より「作業の節目」の方が筋が良い: 焼く時点が揃い、
+// 節目同士の比較 (`changes`) の精度も揃う。VCS に呼んでもらうのではなく kenning が状態を読みに行く
+// (git: .git の HEAD、sinfo: module ごとの current = `sf log --heads --json`)。閾値の方は保険として残る。
+
+pub(crate) fn bake_milestone_marker(db: &str) -> String {
+    format!("{db}.bake-milestone")
+}
+
+/// 節目の ID。git と sinfo の両方を使う repo は両方を連結 (どちらが進んでも変わる)。どちらも無ければ None。
+pub(crate) fn milestone_id(root: &str, db: &str) -> Option<String> {
+    let parts: Vec<String> = [git_head(root).map(|h| format!("git:{h}")), sinfo_heads(root, db).map(|h| format!("sinfo:{h}"))]
+        .into_iter()
+        .flatten()
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// `.git/HEAD` を直接読む (process を起こさない、µs)。ref は loose → packed-refs の順。
+/// worktree (`.git` が file) や読めない形は `git rev-parse` に落とす。
+fn git_head(root: &str) -> Option<String> {
+    let g = Path::new(root).join(".git");
+    if g.is_dir() {
+        let head = std::fs::read_to_string(g.join("HEAD")).ok()?;
+        let head = head.trim();
+        let Some(r) = head.strip_prefix("ref: ") else { return Some(head.to_string()) };
+        if let Ok(h) = std::fs::read_to_string(g.join(r)) {
+            return Some(h.trim().to_string());
+        }
+        if let Some(h) = std::fs::read_to_string(g.join("packed-refs")).ok().and_then(|p| {
+            p.lines().find_map(|l| l.strip_suffix(r).map(|x| x.trim().to_string()))
+        }) {
+            return Some(h);
+        }
+    } else if !g.exists() {
+        return None;
+    }
+    let out = std::process::Command::new("git").arg("-C").arg(root).args(["rev-parse", "HEAD"]).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// sinfo の module ごとの current の指紋。`sf` を毎 query 起こさないよう、`.sinfo/db` の中身の最新
+/// mtime が前回と同じなら `<db>.sinfo-heads` に覚えた指紋を返す (vup すれば db が書かれて mtime が動く)。
+fn sinfo_heads(root: &str, db: &str) -> Option<String> {
+    let sdb = Path::new(root).join(".sinfo").join("db");
+    if !sdb.is_dir() {
+        return None;
+    }
+    let mtime = newest_mtime_ns(&sdb)?;
+    let memo = format!("{db}.sinfo-heads");
+    if let Some((m, h)) = std::fs::read_to_string(&memo).ok().and_then(|s| s.trim().split_once('\t').map(|(a, b)| (a.to_string(), b.to_string())))
+        && m == mtime.to_string()
+    {
+        return Some(h);
+    }
+    let out = std::process::Command::new("sf").args(["log", "--heads", "--json"]).current_dir(root).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let h = format!("{:016x}", fnv1a(&out.stdout));
+    let _ = std::fs::write(&memo, format!("{mtime}\t{h}"));
+    Some(h)
+}
+
+fn newest_mtime_ns(dir: &Path) -> Option<u128> {
+    let mut best: Option<u128> = None;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).ok()?.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                stack.push(e.path());
+            }
+            if let Some(t) = md.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()) {
+                best = Some(best.map_or(t.as_nanos(), |b| b.max(t.as_nanos())));
+            }
+        }
+    }
+    best
+}
+
+/// 64-bit FNV-1a (指紋用。暗号強度は要らず、依存を足さない)。
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// query ごと (鮮度確認の直前) に呼ぶ。bake 済みで変更があり、節目が bake 時点から進んでいれば焼き直す。
+/// 節目の記録が無い (この機能より前の bake) なら今の節目を記録するだけ — 入れた途端に全 repo を焼かない。
+pub(crate) fn maybe_milestone_bake(db: &str, root: &str, upd_since_bake: u32) {
+    if upd_since_bake == 0 {
+        return; // 節目が進んでも中身が bake 時点と同じなら焼き直す意味が無い
+    }
+    let Some(now) = milestone_id(root, db) else { return };
+    let marker = bake_milestone_marker(db);
+    match std::fs::read_to_string(&marker) {
+        Ok(prev) if prev.trim() == now => {}
+        Ok(_) => auto_bake_with(db, root, format!("# vup / commit が bake 以降に進んだ (bake 後 {upd_since_bake} ファイル変更)")),
+        Err(_) => {
+            let _ = std::fs::write(&marker, now);
         }
     }
 }

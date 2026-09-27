@@ -216,9 +216,9 @@ pub(crate) fn maybe_auto_update(db_path: &str, auto_root: Option<&Path>) {
                 return;
             }
         };
-        probe_meta(&db).map(|m| (m, load_known(&db)))
+        probe_meta(&db).map(|m| (m, load_known(&db), scip_stale_files(&db)))
     }; // ← readonly を閉じてから書込 open する
-    let ((root, built_at, ver), known) = match probed {
+    let ((root, built_at, ver), known, bake_stale) = match probed {
         Ok(v) => v,
         Err(why) => {
             match auto_root {
@@ -233,6 +233,11 @@ pub(crate) fn maybe_auto_update(db_path: &str, auto_root: Option<&Path>) {
         // update 経路に流すと「増分 update 失敗 (旧 schema?)」の紛らわしい 2 行目が出る。
         heal_full_reindex(&root, db_path, &format!("index の版が古い (v{ver} → v{INDEX_VER})"));
         return;
+    }
+    // vup / commit (節目) が bake 以降に進んでいれば焼き直す。ファイル無変更の query でも見る必要がある
+    // (vup はファイルを変えないので、下の鮮度ゲートは Fresh で素通りする)。
+    if let Some(upd) = bake_stale {
+        maybe_milestone_bake(db_path, &root, upd);
     }
     // mtime は巻き戻る (git checkout / rsync / touch -t) ので、若い db だけ mtime を信じ、古い db は
     // 一度 hash 差分で答え合わせする (update 側が全ファイル読んで比較する)。
