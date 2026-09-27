@@ -360,7 +360,110 @@ pub fn run_bake(dir: &str) {
                     .unwrap();
             }
         }
+    // 自動 bake が同じ workspace を焼けるように覚えておく (root 直下が cargo project でない repo 用)。
+    let _ = std::fs::write(bake_dir_marker(&db), &bake_s);
     eprintln!("# 精密 facts 有効: refs / callers が RA 同等精度に (`kenning refs <name>`)");
+}
+
+// ── 自動 bake: 精密 facts の鮮度を常駐なしで保つ ──
+// 活発な repo では bake の効きが数日で消える (enchudb 実測: 確定率 80.2% → 193 file 変更後 18.5%)。
+// RA を常駐させずに保つため、増分 update が「古い」と判定した時に、空いていれば裏で bake を切り離して
+// 起動する。query 自体は待たない。対象は一度手で bake した repo だけ (勝手に GB 級を焚き始めない)。
+
+/// 同じ repo で自動 bake を起こす最短間隔。
+pub(crate) const AUTO_BAKE_INTERVAL_SECS: u64 = 30 * 60;
+/// 1 CPU あたりの load がこれ以上なら見送る (並列 session で埋まっている時に 2GB 級を足さない)。
+pub(crate) const AUTO_BAKE_MAX_LOAD_PER_CPU: f64 = 1.0;
+
+pub(crate) fn bake_dir_marker(db: &str) -> String {
+    format!("{db}.bake-dir")
+}
+fn auto_bake_log(db: &str) -> String {
+    format!("{db}.auto-bake.log") // `<db>.` prefix = cache prune の道連れ対象
+}
+
+/// 自動 bake の可否。
+#[derive(Debug, PartialEq)]
+pub(crate) enum AutoBake {
+    Off,
+    /// 前回起動からまだ間隔が空いていない (残り秒)。
+    Throttled(u64),
+    /// 負荷が高い (1 CPU あたりの load)。
+    Busy(f64),
+    Go,
+}
+
+/// 判定だけ (副作用なし = テスト可能)。`since_last` = 前回起動からの秒、`load` = 1 CPU あたりの load。
+pub(crate) fn auto_bake_gate(off: bool, since_last: Option<u64>, load: Option<f64>) -> AutoBake {
+    if off {
+        return AutoBake::Off;
+    }
+    if let Some(s) = since_last.filter(|s| *s < AUTO_BAKE_INTERVAL_SECS) {
+        return AutoBake::Throttled(AUTO_BAKE_INTERVAL_SECS - s);
+    }
+    match load {
+        Some(l) if l >= AUTO_BAKE_MAX_LOAD_PER_CPU => AutoBake::Busy(l),
+        _ => AutoBake::Go, // 測れない時は bake 側の空きメモリゲートに任せる
+    }
+}
+
+/// `KENNING_AUTO_BAKE=0` (または全自動停止 `KENNING_NO_AUTO`) で無効。自動 bake の子自身も起こさない。
+pub(crate) fn auto_bake_off() -> bool {
+    std::env::var("KENNING_AUTO_BAKE").is_ok_and(|v| v == "0")
+        || std::env::var_os("KENNING_NO_AUTO").is_some()
+        || std::env::var_os("KENNING_AUTO_BAKE_CHILD").is_some()
+}
+
+/// `{ 8.21 8.46 8.77 }` (macOS sysctl) / `8.21 8.46 8.77 3/900 123` (Linux /proc/loadavg) の 1 分値。
+pub(crate) fn parse_load1(s: &str) -> Option<f64> {
+    s.split_whitespace().find(|t| *t != "{").and_then(|t| t.parse().ok())
+}
+
+fn load_per_cpu() -> Option<f64> {
+    let raw = std::fs::read_to_string("/proc/loadavg").ok().or_else(|| {
+        let out = std::process::Command::new("sysctl").args(["-n", "vm.loadavg"]).output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    })?;
+    let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+    parse_load1(&raw).map(|l| l / ncpu)
+}
+
+/// 増分 update が「SCIP facts が古い」と判定した時に呼ぶ。告知 1 行 + 条件が揃えば裏で bake。
+pub(crate) fn maybe_auto_bake(db: &str, dir: &str, stale: u32) {
+    let head = format!("# SCIP facts が古くなってきた (bake 後 {stale} ファイル変更)");
+    let log = auto_bake_log(db);
+    let since_last = std::fs::metadata(&log).ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).map(|d| d.as_secs());
+    let off = auto_bake_off();
+    match auto_bake_gate(off, since_last, if off { None } else { load_per_cpu() }) {
+        AutoBake::Off => eprintln!("{head} → `kenning bake` 推奨 (自動 bake は無効: KENNING_AUTO_BAKE=0)"),
+        AutoBake::Throttled(rest) => eprintln!("{head} → 自動 bake は起動済み / 間隔待ち (あと {} 分、ログ {log})", rest.div_ceil(60)),
+        AutoBake::Busy(l) => eprintln!("{head} → 負荷が高い (load/CPU {l:.2}) ので自動 bake は見送り。`kenning bake` 推奨"),
+        AutoBake::Go => {
+            let target = std::fs::read_to_string(bake_dir_marker(db)).ok().map(|s| s.trim().to_string()).filter(|s| Path::new(s).is_dir()).unwrap_or_else(|| dir.to_string());
+            match spawn_auto_bake(&target, &log) {
+                Ok(()) => eprintln!("{head} → 裏で bake を起動 (nice、ログ {log}。無効化は KENNING_AUTO_BAKE=0)"),
+                Err(e) => eprintln!("{head} → 自動 bake を起動できない ({e})。`kenning bake` 推奨"),
+            }
+        }
+    }
+}
+
+/// 自分自身の `bake <dir>` を低優先度・別 process group で切り離す (query は待たない。端末の Ctrl-C も届かない)。
+fn spawn_auto_bake(target: &str, log: &str) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let out = std::fs::File::create(log)?; // 作成 = 起動時刻 (間隔判定は log の mtime)
+    let mut cmd = std::process::Command::new("nice");
+    cmd.args(["-n", "10"]).arg(exe).arg("bake").arg(target)
+        .env("KENNING_AUTO_BAKE_CHILD", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(out.try_clone()?)
+        .stderr(out);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn().map(|_| ())
 }
 
 /// RA の `--config-path` に渡す JSON。features=all と RUSTFLAGS を必要な分だけ載せる

@@ -824,3 +824,20 @@ fn ra_config_writes_only_the_keys_that_are_set() {
     );
     assert!(ra_config(false, "--cfg x=\"y\"").contains(r#"x=\"y\""#), "引用符を escape する");
 }
+
+/// 自動 bake の判定: 無効化が最優先、次に間隔、最後に負荷。負荷を測れなければ bake 側のメモリゲートに任せる。
+#[test]
+fn auto_bake_gate_respects_switch_interval_and_load() {
+    assert_eq!(auto_bake_gate(true, None, Some(0.1)), AutoBake::Off);
+    assert_eq!(auto_bake_gate(false, Some(60), Some(0.1)), AutoBake::Throttled(AUTO_BAKE_INTERVAL_SECS - 60));
+    assert_eq!(auto_bake_gate(false, Some(AUTO_BAKE_INTERVAL_SECS), Some(0.1)), AutoBake::Go);
+    assert_eq!(auto_bake_gate(false, None, Some(2.0)), AutoBake::Busy(2.0));
+    assert_eq!(auto_bake_gate(false, None, None), AutoBake::Go);
+}
+
+#[test]
+fn parse_load1_reads_macos_and_linux_formats() {
+    assert_eq!(parse_load1("{ 8.21 8.46 8.77 }"), Some(8.21));
+    assert_eq!(parse_load1("0.52 0.58 0.59 3/900 12345\n"), Some(0.52));
+    assert_eq!(parse_load1(""), None);
+}

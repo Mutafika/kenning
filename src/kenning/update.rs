@@ -40,8 +40,10 @@ pub(crate) fn update_with_heal(db: Database, dir: &str, path: &str, scan: Update
     std::panic::set_hook(Box::new(|_| {}));
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| update_inner(db, dir, scan, why)));
     std::panic::set_hook(prev);
-    if r.is_err() {
-        heal_full_reindex(dir, path, "増分 update 失敗 (旧 schema の index?)");
+    match r {
+        Err(_) => heal_full_reindex(dir, path, "増分 update 失敗 (旧 schema の index?)"),
+        Ok(Some(stale)) => maybe_auto_bake(path, dir, stale),
+        Ok(None) => {}
     }
 }
 
@@ -69,7 +71,8 @@ pub(crate) fn heal_full_reindex(dir: &str, path: &str, why: &str) {
 }
 
 /// update の本体 (open 済み db を受け取る)。auto-update (maybe_auto_update) と run_update が共用。
-pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str) {
+/// 戻り値 = bake 済みで SCIP facts が古くなった時の「bake 後の変更ファイル数」(自動 bake の判断材料)。
+pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str) -> Option<u32> {
     // index 意味論の版が違えば増分は不整合 (旧値と新値が混ざる) → panic して
     // update_with_heal の full 再 index (.scip 再利用) に落とす。
     let mut built_at = 0u32; // 前回 index / update の開始時刻 (mtime 絞り込みの基準)
@@ -159,7 +162,7 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
     if cur.is_empty() && !prev.is_empty() {
         eprintln!("# ⚠ {dir} で index 対象ファイルが 0 件 (db には {} 件)。root がずれている疑いがあるため update を中止。", prev.len());
         eprintln!("# root を指定して: kenning index <repo> / 全部 ignore していないか `git check-ignore -v <file>` を確認。");
-        return;
+        return None;
     }
 
     // 3. 分類。to_add = 変更 ∪ 新規 (再 index)、to_remove = 変更 ∪ 削除 (旧 facts 消去)。
@@ -207,7 +210,7 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
         if !quiet() {
             eprintln!("変更なし ({} files 走査 / {n_read} 読込 {scan:?}、meta 再スタンプ {:?})。", cur.len(), t.elapsed() - scan);
         }
-        return;
+        return None;
     }
 
     // 4. 変更/削除ファイルの旧 facts を消去 (影響 symbol 名を集める)。
@@ -308,6 +311,7 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
 
     // meta を再スタンプ (built_at を現在に)。bake 情報は持ち越し + 変更数を積算 (閾値で bake 推奨)。
     // 旧 index (meta 表 / bake 列なし) は present なフィールドだけ扱い後方互換。
+    let mut stale: Option<u32> = None;
     if let Some(meta_t) = db.get_table("meta") {
         let root_abs = abs_dir(dir);
         let nfiles = file_t.all().count().unwrap() as u32;
@@ -329,7 +333,7 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
                 ins = ins.set("bake_peak_mb", p as u32);
             }
             if b > 0 && upd >= SCIP_STALE_FILES {
-                eprintln!("# SCIP facts が古くなってきた (bake 後 {upd} ファイル変更) → `kenning bake` 推奨");
+                stale = Some(upd); // 告知と自動 bake は呼び手 (update_with_heal) で
             }
         }
         ins.commit().unwrap();
@@ -345,6 +349,7 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
     if !quiet() {
         eprintln!("\n次: `kenning def <name>` / `callers <name>` / `search kind:fn vis:pub`");
     }
+    stale
 }
 
 /// `update <db>` — dir 省略時: meta の root を読んで再 index (自己記述 index の活用)。

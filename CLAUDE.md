@@ -104,7 +104,13 @@ repo が RUSTFLAGS 前提の custom cfg を要る場合 (tokio の `--cfg tokio_
 現れないので自動では当てられない) は `KENNING_BAKE_RUSTFLAGS='--cfg tokio_unstable' kenning bake`
 — 実測で tokio の確定率 59.2% → 65.0%。
 空きメモリゲート + 直列 lock 付き — 刺さる状況では焚かない。bake しなくても syn 層で全 navigation は
-動く (精度控えめ・嘘なし)。bake 後 20 ファイル変更で stderr に再 bake 推奨が出る。
+動く (精度控えめ・嘘なし)。
+
+**自動 bake (既定オン、一度手で bake した repo だけ):** bake 後 20 ファイル変わると、query の増分 update が
+裏で `bake` を切り離して起動する (nice・別 process group、query は待たない、ログ `<db>.auto-bake.log`)。
+活発な repo では放置すると効きが数日で消えるため (enchudb 実測: 確定率 80.2% → 193 file 変更後 18.5%)。
+起こさない条件: 前回起動から 30 分以内 / load が CPU 数以上 / 空きメモリ不足 (bake 側ゲート) / 別の bake 中。
+**無効化は `KENNING_AUTO_BAKE=0`** (`KENNING_NO_AUTO=1` でも止まる)。stderr の 1 行で状態が分かる。
 
 ## 出力の読み方 (Claude 向け)
 
