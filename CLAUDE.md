@@ -58,7 +58,7 @@ kenning outline <path|dir>          # ファイル構造 (Read せず)。`.` で
 kenning changes --since HEAD        # commit していない作業の**意味的な差分** (git diff の意味版、状態なし)。
                                     #   broken (定義が消えたのに呼び出しが残る。位置 = 残った呼び出し = 直す場所) /
                                     #   sig (シグネチャ変更 + callers 数) / dead (届かなくなった・足したが繋がっていない) /
-                                    #   revived。**リファクタの後・commit 前に打つ**。--since は任意の git ref
+                                    #   revived / callers → 0 (重複定義で解決を奪われた等)。--since は任意の git ref
                                     #   (`main` / `HEAD~3`)。呼び元数の増減は件数だけ (`--all` で行も)、--json で NDJSON。
                                     #   継続監視は `--cursor <name>` (起点を kenning 側で進める、呼び手ごとに独立) か
                                     #   `--since <token>`。snapshot は `<db>.changes/` (自動掃除)
@@ -72,6 +72,21 @@ gitignore 済みだが実際に compile される生成 `.rs` を持つ repo だ
 手動制御が要る時だけ: `--db <path>` / env `KENNING_DB` (明示 db は自動 index しない)、
 `KENNING_NO_AUTO=1` (魔法全停止)、`KENNING_NO_STALE=1` (鮮度チェックのみ停止)。
 binary は `~/.cargo/bin/kenning` (cargo install --path . 済み)。
+
+## リファクタの途中の確認 (cargo check を毎回回さない)
+
+何ファイルにも跨る変更の**途中**は `kenning changes --since HEAD` で確認し、シグネチャを変えた物は
+`kenning callers <name>` で直す場所を列挙する。**`cargo check` はターンの最後に 1 回** (正確さの最終関門)。
+並列 session が多い機械では build の CPU と `target/` の lock 待ちが効くため。実測 (enchudb 13 crate、増分):
+
+| 編集 | kenning changes | cargo check |
+|---|---|---|
+| 本体だけ変更 | 0.5 CPU 秒 / 0.5 s | 32 CPU 秒 / 7〜11 s |
+| pub fn の sig 変更 (呼び元 113) | 0.2 CPU 秒 / 0.3 s | 3.7 CPU 秒 / 2.6〜3 s (エラー 35 件) |
+
+changes は syn 層の近似で型エラーは見ない — 途中の目安であって `cargo check` の代わりではない。
+逆に `cargo check` が黙る物 (重複定義で呼び出しの解決を奪われた = callers → 0、pub のまま誰も呼ばない)
+は changes にしか出ない。
 
 ## 精度を上げる (bake = 一発)
 
