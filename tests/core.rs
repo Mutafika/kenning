@@ -1308,12 +1308,16 @@ fn changes_tracks_dead_revived_and_unwired_additions() {
     let out = edit_and_changes(&dir, &db, &cut, "c");
     assert!(out.contains("\tdead\thelper が live root から届かなくなった"), "鎖の頭が dead にならない:\n{out}");
     assert!(out.contains("\tdead\tleaf が live root から届かなくなった"), "鎖の下流が dead にならない:\n{out}");
-    assert!(out.contains("# callers の増減 1 件は省略"), "callers は既定で件数だけのはず:\n{out}");
-    let all = query(&["changes", "--since", out.lines().find_map(|l| l.strip_prefix("# changes since ")).unwrap().split(':').next().unwrap(), "--all"], &db);
-    assert!(all.contains("\tcallers\thelper: callers 1 → 0"), "--all で呼び元数の変化が出ない:\n{all}");
+    // 0 になった物は既定で出す (重複定義に呼び出しを奪われた等の兆候)
+    assert!(out.contains("\tcallers\thelper: callers 1 → 0 (確定の呼び元が無くなった)"), "0 になった callers が出ない:\n{out}");
 
     let out = edit_and_changes(&dir, &db, CHG_BASE, "c");
     assert!(out.contains("\trevived\thelper") && out.contains("\trevived\tleaf"), "戻したのに revived が出ない:\n{out}");
+    // 増えただけの物は件数だけ (--all で行も)
+    let since = out.lines().find_map(|l| l.strip_prefix("# changes since ")).unwrap().split(':').next().unwrap().to_string();
+    assert!(out.contains("# callers の増減 ") && !out.contains("\tcallers\thelper: callers 0 → 1"), "増えただけの callers が既定で出た:\n{out}");
+    let all = query(&["changes", "--since", &since, "--all"], &db);
+    assert!(all.contains("\tcallers\thelper: callers 0 → 1"), "--all で呼び元数の増加が出ない:\n{all}");
 
     let out = edit_and_changes(&dir, &db, &format!("{CHG_BASE}\nfn orphan() {{}}\n"), "c");
     assert!(out.contains("\tdead\torphan を足したが live root から届かない"), "繋ぎ忘れが出ない:\n{out}");
@@ -1429,4 +1433,21 @@ fn changes_ignores_snapshots_of_an_older_format() {
     std::fs::write(&snap, body.lines().skip(1).collect::<Vec<_>>().join("\n")).unwrap(); // header 無し = 旧形式
     let out = kenning().args(["changes", "--cursor", "c", "--db", db.to_str().unwrap()]).env("KENNING_NO_STALE", "1").output().unwrap();
     assert!(String::from_utf8_lossy(&out.stderr).contains("旧形式"), "旧形式を黙って読んだ: {out:?}");
+}
+
+/// 同名の定義を別 file に足すと (DRY 違反の重複)、元の定義の呼び出しが曖昧になって確定を失う。
+/// key が「一意 → path 付き」に変わっても同じ定義として突き合わせ、callers → 0 と原因を出す
+/// (kenning 自身の `json_str` 重複がこの形。path で区別する修正の直後はここが見えなくなっていた)。
+#[test]
+fn changes_flags_a_duplicate_definition_that_steals_resolution() {
+    let dir = tmp();
+    write_fixture(&dir, "pub fn entry() { enc(\"x\"); }\nfn enc(s: &str) -> String { s.into() }\n");
+    let db = dir.join("k.db");
+    index(&dir, &db);
+    query(&["changes", "--cursor", "c"], &db);
+    std::fs::write(dir.join("src/dup.rs"), "pub fn other() { enc(\"y\"); }\nfn enc(s: &str) -> String { s.to_string() }\n").unwrap();
+    update(&dir, &db);
+    let out = query(&["changes", "--cursor", "c"], &db);
+    assert!(out.contains("other.rs:2\tcallers\tenc: callers 1 → 0"), "重複で確定を失ったのが出ない:\n{out}");
+    assert!(out.contains("同名の定義が増えた"), "原因 (同名の定義の追加) が出ない:\n{out}");
 }

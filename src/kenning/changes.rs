@@ -49,7 +49,8 @@ pub(crate) enum Change {
     /// `added` = 今回足された定義 (足したのに誰も呼んでいない = 繋ぎ忘れ)。
     Dead { qual: String, at: (String, u32), added: bool },
     Revived { qual: String, at: (String, u32) },
-    Callers { qual: String, at: (String, u32), old: u32, new: u32 },
+    /// `dup` = 同名の定義が増えた (呼び出しの解決が曖昧になって確定を失った可能性)。
+    Callers { qual: String, at: (String, u32), old: u32, new: u32, dup: bool },
 }
 
 impl Change {
@@ -79,6 +80,8 @@ impl Change {
             Change::Dead { qual, added: false, .. } => format!("{qual} が live root から届かなくなった"),
             Change::Dead { qual, added: true, .. } => format!("{qual} を足したが live root から届かない (繋ぎ忘れ?)"),
             Change::Revived { qual, .. } => format!("{qual} がまた届くようになった"),
+            Change::Callers { qual, old, new: 0, dup: true, .. } => format!("{qual}: callers {old} → 0 (同名の定義が増えた — 呼び出しの解決が曖昧になった。重複定義?)"),
+            Change::Callers { qual, old, new: 0, .. } => format!("{qual}: callers {old} → 0 (確定の呼び元が無くなった)"),
             Change::Callers { qual, old, new, .. } => format!("{qual}: callers {old} → {new}"),
         }
     }
@@ -88,7 +91,7 @@ impl Change {
         match self {
             Change::Broken { remaining, .. } => s += &format!(",\"remaining\":{remaining}"),
             Change::Sig { old, new, callers, .. } => s += &format!(",\"old\":{},\"new\":{},\"callers\":{callers}", json_str(old), json_str(new)),
-            Change::Callers { old, new, .. } => s += &format!(",\"old\":{old},\"new\":{new}"),
+            Change::Callers { old, new, dup, .. } => s += &format!(",\"old\":{old},\"new\":{new},\"dup\":{dup}"),
             Change::Dead { added, .. } => s += &format!(",\"added\":{added}"),
             Change::Revived { .. } => {}
         }
@@ -219,9 +222,23 @@ pub(crate) fn read_snapshot(path: &Path) -> Option<Snapshot> {
 pub(crate) fn diff_snapshots(old: &Snapshot, new: &Snapshot, sites: &CallSites) -> Vec<Change> {
     let bare = |q: &str| q.rsplit("::").next().unwrap_or(q).to_string();
     let live_names: HashSet<String> = new.values().map(|r| bare(&r.qual)).collect();
+    let n_defs = |s: &Snapshot| {
+        let mut m: HashMap<String, usize> = HashMap::new();
+        for r in s.values() {
+            *m.entry(bare(&r.qual)).or_default() += 1;
+        }
+        m
+    };
+    let (old_n, new_n) = (n_defs(old), n_defs(new));
+    // key が「一意 ↔ path 付き」で変わった定義 (同名が増えた / 減った) を同じ path で突き合わせる。
+    // これをしないと、重複定義を足した瞬間に元の定義が「消えて別の物が生えた」に見え、確定を
+    // 奪われたこと (callers → 0) が出ない。
+    let new_by_path: HashMap<(&str, &str), &String> = new.iter().map(|(k, r)| ((key_base(k), r.path.as_str()), k)).collect();
+    let mut matched: HashSet<&String> = HashSet::new();
     let mut out = Vec::new();
     for (k, o) in old {
-        match new.get(k) {
+        let hit = new.get_key_value(k).or_else(|| new_by_path.get(&(key_base(k), o.path.as_str())).and_then(|nk| new.get_key_value(*nk)));
+        match hit {
             None => {
                 // 同名の定義が別に残っていれば、呼び出しはそちらを指している可能性がある → 黙る
                 // (壊れていないものを壊れたと言わない)。
@@ -233,7 +250,8 @@ pub(crate) fn diff_snapshots(old: &Snapshot, new: &Snapshot, sites: &CallSites) 
                     out.push(Change::Broken { qual: o.qual.clone(), at: v[0].clone(), remaining: v.len() as u32 });
                 }
             }
-            Some(n) => {
+            Some((nk, n)) => {
+                matched.insert(nk);
                 let at = (n.path.clone(), n.line);
                 if o.sig != n.sig {
                     out.push(Change::Sig { qual: n.qual.clone(), at: at.clone(), old: o.sig.clone(), new: n.sig.clone(), callers: n.callers });
@@ -244,20 +262,27 @@ pub(crate) fn diff_snapshots(old: &Snapshot, new: &Snapshot, sites: &CallSites) 
                     out.push(Change::Revived { qual: n.qual.clone(), at: at.clone() });
                 }
                 if o.callers != n.callers {
-                    out.push(Change::Callers { qual: n.qual.clone(), at, old: o.callers, new: n.callers });
+                    let name = bare(&n.qual);
+                    let dup = new_n.get(&name).copied().unwrap_or(0) > old_n.get(&name).copied().unwrap_or(0);
+                    out.push(Change::Callers { qual: n.qual.clone(), at, old: o.callers, new: n.callers, dup });
                 }
             }
         }
     }
     // 新しく足された定義は「dead で生まれた」時だけ報告する (足したのに誰も呼んでいない = 繋ぎ忘れ)。
     for (k, n) in new {
-        if !old.contains_key(k) && n.dead {
+        if !matched.contains(k) && n.dead {
             out.push(Change::Dead { qual: n.qual.clone(), at: (n.path.clone(), n.line), added: true });
         }
     }
     let rank = |c: &Change| ["broken", "sig", "dead", "revived", "callers"].iter().position(|k| *k == c.kind()).unwrap_or(9);
     out.sort_by(|a, b| (rank(a), a.at()).cmp(&(rank(b), b.at())));
     out
+}
+
+/// key の path 部分 (衝突時に付く `\t@<path>[#n]`) を除いた部分。
+fn key_base(k: &str) -> &str {
+    k.split_once("\t@").map(|(b, _)| b).unwrap_or(k)
 }
 
 fn changes_dir(db: &str) -> PathBuf {
@@ -494,14 +519,20 @@ fn missing_snapshot(t: &str) -> Option<Snapshot> {
     None
 }
 
+fn is_default_visible(c: &Change) -> bool {
+    !matches!(c, Change::Callers { new, .. } if *new != 0)
+}
+
 /// token 形 (new_token の出力 = 20 桁の 16 進)。git の短縮 hash (7〜12 桁) とは長さで分かれる。
 fn looks_like_token(s: &str) -> bool {
     s.len() == 20 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// `since` = 見出しに出す起点。`token` = 次回の起点 (git ref 起点は状態を持たないので None)。
-/// `all` = callers (呼び元数の増減) の行も出す。既定は件数だけ — 呼び元が増えただけの行は手を打つ物ではなく、
-/// 実測 (kenning 自身の 1 commit) で 19 行が broken / sig / dead を埋もれさせた。JSON は機械が絞るので常に全件。
+/// `all` = callers (呼び元数の増減) の行も全部出す。既定は **0 になった物だけ** — 増減の大半は手を打つ物
+/// ではなく、実測 (kenning 自身の 1 commit) で 19 行が broken / sig / dead を埋もれさせた。一方 0 になった物は
+/// 重複定義に呼び出しを奪われた等の兆候で、名前が字句として残るので dead にも出ない (自分で書いた
+/// `json_str` の重複がこれでしか見つからなかった)。JSON は機械が絞るので常に全件。
 fn print_changes(changes: &[Change], since: &str, token: Option<&str>, limit: usize, as_json: bool, all: bool) {
     if as_json {
         for c in changes {
@@ -516,7 +547,7 @@ fn print_changes(changes: &[Change], since: &str, token: Option<&str>, limit: us
         "# changes since {since}: broken {} / sig {} / dead {} / revived {} / callers {}",
         count("broken"), count("sig"), count("dead"), count("revived"), count("callers")
     );
-    let shown: Vec<&Change> = changes.iter().filter(|c| all || c.kind() != "callers").collect();
+    let shown: Vec<&Change> = changes.iter().filter(|c| all || is_default_visible(c)).collect();
     for c in shown.iter().take(limit) {
         let (p, l) = c.at();
         println!("{p}:{l}\t{}\t{}", c.kind(), c.detail());
@@ -524,8 +555,9 @@ fn print_changes(changes: &[Change], since: &str, token: Option<&str>, limit: us
     if shown.len() > limit {
         println!("… (+{} 件省略、--limit {} で全部)", shown.len() - limit, shown.len());
     }
-    if !all && count("callers") > 0 {
-        println!("# callers の増減 {} 件は省略 (--all で表示)", count("callers"));
+    let hidden = changes.len() - shown.len();
+    if hidden > 0 {
+        println!("# callers の増減 {hidden} 件は省略 (--all で表示)");
     }
     if let Some(t) = token {
         println!("# token: {t}");
