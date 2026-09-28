@@ -291,12 +291,12 @@ it cannot say *which* definition a call belongs to, and has no impact/path/facet
 - `bake`: one rust-analyzer batch run, then **zero** resident memory. Measured: ripgrep 7 s /
   1.1 GB, tokio 28 s / 2.0 GB, enchudb 46 s / 2.3 GB. **In-repo confirmation rate** (calls into
   std / dependency crates are excluded from the denominator — see below) before → after:
-  tokio 21.8 % → 72.6 %, ripgrep 55.8 % → 92.6 % (both `features = "all"`), enchudb
-  21.3 % → 80.5 % — enchudb bakes with *default* features because `features = "all"` stalls
+  tokio 28.6 % → 73.7 %, ripgrep 60.7 % → 92.7 % (both `features = "all"`), enchudb
+  32.0 % → 89.5 % — enchudb bakes with *default* features because `features = "all"` stalls
   past the timeout there, exactly the fallback the cap exists for. Without a bake, the syn
-  layer's written-type inference now reaches (bench infer, 2026-09-28): **ripgrep 55.8 %**
-  (bake 92.6 %), **kenning 81.1 %** (86.4 %), **tokio 21.8 %** (72.6 %) — with zero wrong
-  confirmations on all three. tokio stays low because much of it is generic, macro-generated or
+  layer's written-type inference and Rust's scoping rules now reach (bench infer, v0.5.1):
+  **ripgrep 60.7 %** (bake 92.7 %), **enchudb 32.0 %** (89.5 %), **tokio 28.6 %** (73.7 %) — with
+  zero wrong confirmations on all of them (and on kenning itself). tokio stays low because much of it is generic, macro-generated or
   cfg-switched, exactly where a syn layer that must not guess has to stay silent. What it
   drops stays as a located candidate.
 
