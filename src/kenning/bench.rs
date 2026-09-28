@@ -631,7 +631,7 @@ pub(crate) fn bench_micro(db_path: &str, sym_t: &Table, call_t: &Table, files: &
     println!("```\n");
 }
 
-/// `bench [quality|agent|beyond|text|micro|all] [--db P] [--n N] [--seed S]` — markdown を stdout へ。
+/// `bench [quality|agent|beyond|text|micro|infer|all] [--db P] [--n N] [--seed S]` — markdown を stdout へ。
 pub fn cmd_bench(args: &[String]) {
     let mut sub = "all".to_string();
     let mut n = 100usize;
@@ -641,7 +641,7 @@ pub fn cmd_bench(args: &[String]) {
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "quality" | "agent" | "beyond" | "text" | "micro" | "all" => sub = a.clone(),
+            "quality" | "agent" | "beyond" | "text" | "micro" | "infer" | "all" => sub = a.clone(),
             "--n" => n = it.next().and_then(|v| v.parse().ok()).unwrap_or(n),
             "--nq" => nq = it.next().and_then(|v| v.parse().ok()).unwrap_or(nq),
             "--seed" => seed = it.next().and_then(|v| v.parse().ok()).unwrap_or(seed),
@@ -687,4 +687,142 @@ pub fn cmd_bench(args: &[String]) {
     if sub == "micro" || sub == "all" {
         bench_micro(&o.db, &sym_t, &call_t, &files);
     }
+    // infer は bake 済み db を正解に使うので、明示した時だけ (all には入れない: syn 層の index を 1 本焼く)
+    if sub == "infer" {
+        if baked {
+            bench_infer(&root, &o.db, &db);
+        } else {
+            println!("infer: この index は未 bake — 正解 (rust-analyzer) が無いので測れない。`kenning bake` の後で");
+        }
+    }
+}
+
+/// call 1 行の突き合わせ鍵 (path, line, callee 名) → 解決先の定義 (path, line) と res。
+type CallKey = (String, u32, String);
+type CallRows = HashMap<CallKey, Vec<(Option<(String, u32)>, u32)>>;
+fn call_rows(db: &Database) -> CallRows {
+    let file_t = db.get_table("file").unwrap();
+    let sym_t = db.get_table("sym").unwrap();
+    let call_t = db.get_table("call").unwrap();
+    let paths = file_paths(&file_t);
+    let mut m = CallRows::new();
+    for c in call_t.all().find().unwrap_or_default() {
+        let er = call_t.entity(c);
+        let key = (paths.get(&ref_of(er.get("file"))).cloned().unwrap_or_default(), num(er.get("line")), txt(er.get("callee")));
+        let target = match er.get("callee_sym") {
+            Some(Value::Ref(t)) => {
+                let se = sym_t.entity(t);
+                Some((paths.get(&ref_of(se.get("file"))).cloned().unwrap_or_default(), num(se.get("line"))))
+            }
+            _ => None,
+        };
+        m.entry(key).or_default().push((target, num(er.get("res"))));
+    }
+    m
+}
+
+/// SCIP symbol の末尾の名前。symbol は `<scheme> <manager> <package> <version> <descriptors>` で、
+/// version に `.` を含むので descriptors だけを見る (`summary/impl#[SummaryBuilder]new().` → `new`、
+/// `impl#[`Parser<'a>`]bump().` → `bump`、`print_stats().` → `print_stats`)。
+pub(crate) fn scip_name(sym: &str) -> &str {
+    let desc = sym.splitn(5, ' ').nth(4).unwrap_or(sym).trim_end_matches(['.', '#']);
+    let last = desc.rsplit(['/', '#', ']']).next().unwrap_or(desc);
+    last.split('(').next().unwrap_or(last).trim_matches('`')
+}
+
+/// SCIP symbol の package 欄 (3 つ目)。repo の crate なら「定義位置が読めない = 判定不能」、外なら「repo の外」。
+pub(crate) fn scip_package(sym: &str) -> &str {
+    sym.split(' ').nth(2).unwrap_or("")
+}
+
+/// ⑥型推定の答え合わせ: 同じ repo を syn 層だけで焼き直し、syn 層が**確定**した call を、同じ行で
+/// rust-analyzer (.scip) が同じ名前に付けた symbol の定義位置と突き合わせる。一致 = 正しい確定、
+/// 不一致 = 誤確定 (「確実 = 誤りなし」を破っている)、RA が沈黙 / 同じ行に同名が複数 = 判定不能。
+/// bake 後に内容が変わった file は正解が無いので数えない (bake 直後ほど母数が多い)。
+fn bench_infer(root: &str, db_path: &str, baked_db: &Database) {
+    let Some(scip_path) = scip_sidecar_of(db_path) else {
+        println!("infer: .scip が無い — `kenning bake` の後で");
+        return;
+    };
+    let tmp = std::env::temp_dir().join(format!("kenning-bench-infer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let exe = std::env::current_exe().unwrap();
+    let ok = std::process::Command::new(exe).arg("index").arg(root).arg(&tmp)
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status().is_ok_and(|s| s.success());
+    let syn_db = if ok { Database::open_readonly(&tmp.to_string_lossy()).ok() } else { None };
+    let Some(syn_db) = syn_db else {
+        println!("infer: syn 層の index を作れない");
+        return;
+    };
+    // 正解は .scip から直接読む (bake 済み db は増分 update で syn 層の答えが混ざるので使わない)。
+    // Scip::load は bake 後に内容が変わった file を捨てる = 残るのは正解として信じてよい file だけ。
+    let scip = Scip::load(&scip_path, root);
+    let mut def_at: HashMap<&str, (String, u32)> = HashMap::new(); // symbol → 定義位置 (rel, 1-indexed)
+    let mut on_line: HashMap<(String, u32), Vec<&str>> = HashMap::new(); // (rel, 1-indexed) → 参照 symbol
+    for o in &scip.occ {
+        if o.roles & 1 == 1 {
+            def_at.insert(o.symbol.as_str(), (o.rel_path.clone(), o.line0 + 1));
+        } else if !o.symbol.starts_with("local ") {
+            on_line.entry((o.rel_path.clone(), o.line0 + 1)).or_default().push(o.symbol.as_str());
+        }
+    }
+    let syn = call_rows(&syn_db);
+    let sym_t = syn_db.get_table("sym").unwrap();
+    let local_crates: HashSet<String> = sym_t.all().find().unwrap_or_default().into_iter().map(|e| txt(sym_t.entity(e).get("crate_")).replace('-', "_")).collect();
+    // res ごとに (確定数, 一致, 不一致, RA 未確定)
+    let mut by_res: std::collections::BTreeMap<u32, [usize; 4]> = std::collections::BTreeMap::new();
+    let mut wrong: Vec<String> = Vec::new();
+    for (key, rows) in &syn {
+        let [(Some(got), res)] = rows.as_slice() else { continue };
+        let rel = rel_of(&key.0, root);
+        if !scip.has_doc(&rel) {
+            continue; // bake 後に変わった / RA が解析していない file は正解が無い
+        }
+        let e = by_res.entry(*res).or_default();
+        e[0] += 1;
+        // その行で RA が同じ名前を指した symbol がちょうど 1 つなら、それが正解。
+        let mut syms: Vec<&str> = on_line.get(&(rel, key.1)).map(|v| v.iter().copied().filter(|s| scip_name(s) == key.2).collect()).unwrap_or_default();
+        syms.sort_unstable();
+        syms.dedup();
+        let ra_says = match syms.as_slice() {
+            [s] => match def_at.get(s) {
+                Some((r, l)) => Some(format!("{}/{r}:{l}", root.trim_end_matches('/'))),
+                // repo の crate の symbol なのに定義が読めない = 定義側の file が bake 後に変わった → 判定不能
+                None if local_crates.contains(&scip_package(s).replace('-', "_")) => None,
+                None => Some("repo の外 (std / 依存)".to_string()),
+            },
+            _ => None, // RA が沈黙 / 同じ行に同名が複数
+        };
+        match ra_says {
+            Some(w) if w == format!("{}:{}", got.0, got.1) => e[1] += 1,
+            Some(w) => {
+                e[2] += 1;
+                if wrong.iter().filter(|w| w.ends_with(&format!("({})", RES_NAMES.get(*res as usize).unwrap_or(&"?")))).count() < 8 {
+                    wrong.push(format!("{}:{}\t{} → syn {}:{} / RA {w} ({})", key.0, key.1, key.2, got.0, got.1, RES_NAMES.get(*res as usize).unwrap_or(&"?")));
+                }
+            }
+            None => e[3] += 1,
+        }
+    }
+    let n_method = syn.values().flatten().filter(|(_, r)| *r == R_METHOD).count();
+    let (rs_syn, rs_ra) = (ResolveStats::of(&syn_db.get_table("call").unwrap()), ResolveStats::of(&baked_db.get_table("call").unwrap()));
+    println!("## ⑥ 型推定の答え合わせ (syn 層の確定 vs rust-analyzer)\n");
+    println!(
+        "repo 内確定率: **syn 層だけ {:.1}%** (確定 {} / repo 内 {}) vs bake {:.1}% — RA 無しで届いている割合 {:.0}%\n",
+        rs_syn.local_pct(), rs_syn.confirmed(), rs_syn.local(), rs_ra.local_pct(),
+        if rs_ra.confirmed() > 0 { rs_syn.confirmed() as f64 * 100.0 / rs_ra.confirmed() as f64 } else { 0.0 }
+    );
+    println!("| res | syn 層で確定 | RA と一致 | **不一致 (誤確定)** | RA 未確定 |");
+    println!("|---|---|---|---|---|");
+    for (r, [n, ok, bad, unk]) in &by_res {
+        println!("| {} | {n} | {ok} | **{bad}** | {unk} |", RES_NAMES.get(*r as usize).unwrap_or(&"?"));
+    }
+    println!("\n受け手の型が分からず候補どまり (method-name): {n_method}\n");
+    for w in &wrong {
+        println!("- {w}");
+    }
+    drop(syn_db);
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_file(format!("{}.index.lock", tmp.display()));
 }

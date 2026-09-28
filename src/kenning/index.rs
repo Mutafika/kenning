@@ -293,6 +293,11 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         .number("res")            // 信頼度 (R_UNRESOLVED..R_EXTERNAL)
         .tag("qual")              // 修飾 (Type::/mod::。無ければ "")。増分の再解決用に永続化
         .number("is_method")      // x.f() 形式か。同上
+        .tag("recv_ty")           // 受け手の型の手掛かり (Recv)。増分の再解決用に永続化
+        .tag("recv_fn")
+        .number("recv_try")
+        .tag("recv_root")
+        .tag("qual_root")
         .ref_to("file", "file")
         .number("line")
         .with_capacity(call_cap)
@@ -398,6 +403,7 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
     let mut d_indoc_method = 0u64;
     let mut d_sameline = 0u64; // 同じ行に occurrence はある = 列の対応ズレ (join の取りこぼし) // うち method 呼び (x.f())
     let mut d_samples: Vec<String> = Vec::new();
+    let rz = Resolver::new(&acc.defs, ws.rs.iter().filter_map(|p| p.to_str()));
     for cs in &acc.pending {
         if (cs.as_value || cs.in_macro) && !acc.defs.contains_key(&cs.name) {
             continue; // 定義表に無い名前 = 局所変数 / 外部。call 表をノイズで膨らませない
@@ -413,7 +419,7 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
                 Some(sym) => match acc.sym_by_symbol.get(sym) {
                     Some(&AMBIGUOUS_SYMBOL) => {
                         // symbol がターゲット間で衝突 → どの定義か決められない。syn の規準に落とす。
-                        let (t, r) = resolve_call(cs, &acc.defs);
+                        let (t, r) = resolve_call(cs, &rz);
                         (t, r)
                     }
                     Some(&eid) => {
@@ -454,7 +460,7 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
                             d_nodoc += 1;
                         }
                     }
-                    let (t, r) = resolve_call(cs, &acc.defs);
+                    let (t, r) = resolve_call(cs, &rz);
                     if t.is_some() {
                         syn_recovered += 1;
                     }
@@ -462,7 +468,7 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
                 }
             }
         } else {
-            resolve_call(cs, &acc.defs)
+            resolve_call(cs, &rz)
         };
         res_counts[res as usize] += 1;
         do_insert_call(&call_t, cs, target, res);
@@ -595,7 +601,10 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         {
-            ins = ins.set("baked_at", t.as_secs() as u32).set("upd_since_bake", 0u32);
+            // 捨てた doc の分だけ「bake 後の変更」として積む (自動 bake が焼き直す)。記録の無い旧版の
+            // bake は全部捨てているので、閾値まで積んで確実に焼き直させる。
+            let stale = acc.scip.as_ref().map(|s| if s.unverified { s.stale_docs.max(SCIP_STALE_FILES) } else { s.stale_docs }).unwrap_or(0);
+            ins = ins.set("baked_at", t.as_secs() as u32).set("upd_since_bake", stale);
         }
     ins.commit().unwrap();
 

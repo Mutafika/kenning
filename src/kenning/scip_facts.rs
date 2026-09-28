@@ -19,6 +19,38 @@ pub(crate) struct Scip {
     pub(crate) occ: Vec<ScipOcc>,
     pos2idx: HashMap<(String, u32, u32), usize>,
     doc_paths: HashSet<String>, // SCIP が解析した doc の rel_path 集合 (no-occ 診断用)
+    /// bake 後に内容が変わったので捨てた doc の数 (= その file は syn 層で解決する)。
+    pub(crate) stale_docs: u32,
+    /// bake 時の内容の記録 (`<scip>.src`) が無かった = どの doc も位置を保証できない (旧版の bake)。
+    pub(crate) unverified: bool,
+}
+
+/// bake 時点の各 .rs の内容 fingerprint の置き場 (`<scip>.src`、行 = `絶対 path<TAB>hash`)。
+pub(crate) fn scip_src_path(scip: &str) -> String {
+    format!("{scip}.src")
+}
+
+/// bake を始める時点の内容を記録する。SCIP の答えは (file, 行, 列) で join するので、bake 後に
+/// 行がずれた file に使うと**別の呼び出し・別の定義に確定する** (実例: 古い .scip の再利用で
+/// `depth(..)` が `insert_call` の確実 caller になった)。記録と一致する file だけ SCIP を使う。
+pub(crate) fn write_scip_src(scip: &str, root: &str) {
+    let mut s = String::new();
+    for p in rust_files(root) {
+        if let Ok(src) = std::fs::read_to_string(&p) {
+            s += &format!("{}\t{}\n", canon(&p.to_string_lossy()), hash_u32(&src));
+        }
+    }
+    let _ = std::fs::write(scip_src_path(scip), s);
+}
+
+/// 比較用の正規形 (`/tmp` ↔ `/private/tmp` のような symlink 差で別物にならないように)。
+fn canon(p: &str) -> String {
+    std::fs::canonicalize(p).map(|c| c.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string())
+}
+
+fn read_scip_src(scip: &str) -> Option<HashMap<String, u32>> {
+    let body = std::fs::read_to_string(scip_src_path(scip)).ok()?;
+    Some(body.lines().filter_map(|l| l.split_once('\t')).filter_map(|(p, h)| Some((p.to_string(), h.parse().ok()?))).collect())
 }
 /// SCIP の `metadata.project_root` (file:// URI) を絶対パスに。無ければ None。
 pub(crate) fn scip_project_root(idx: &scip::types::Index) -> Option<String> {
@@ -44,13 +76,21 @@ impl Scip {
         let mut occ = Vec::new();
         let mut pos2idx = HashMap::new();
         let mut doc_paths = HashSet::new();
+        let recorded = read_scip_src(path);
+        let mut stale_docs = 0u32;
         for doc in &idx.documents {
             let rel = if prefix.is_empty() { doc.relative_path.clone() } else { format!("{prefix}/{}", doc.relative_path) };
+            // doc の元ソースを 1 度だけ読み、行→char 列変換に使う。bake 時の内容と違えば doc ごと捨てる
+            // (位置がずれた答えは誤確定の元)。記録が無い旧版の bake は 1 つも保証できないので全部捨てる。
+            let abs = format!("{}/{}", scip_root, doc.relative_path);
+            let src = std::fs::read_to_string(&abs).ok();
+            let fresh = matches!((&recorded, &src), (Some(m), Some(s)) if m.get(&canon(&abs)) == Some(&hash_u32(s)));
+            if !fresh {
+                stale_docs += 1;
+                continue;
+            }
             doc_paths.insert(rel.clone());
-            // doc の元ソースを 1 度だけ読み、行→char 列変換に使う(読めなければ byte 列のまま)。
-            let src_lines: Option<Vec<String>> = std::fs::read_to_string(format!("{}/{}", scip_root, doc.relative_path))
-                .ok()
-                .map(|s| s.lines().map(str::to_string).collect());
+            let src_lines: Option<Vec<String>> = src.map(|s| s.lines().map(str::to_string).collect());
             for o in &doc.occurrences {
                 if o.range.len() >= 2 {
                     let line0 = o.range[0] as u32;
@@ -72,7 +112,13 @@ impl Scip {
                 }
             }
         }
-        Scip { occ, pos2idx, doc_paths }
+        if stale_docs > 0 {
+            eprintln!(
+                "# .scip の {stale_docs} file は{} → その分は syn 層で解決 (位置がずれた答えは使わない)",
+                if recorded.is_none() { "内容の記録が無い旧版の bake" } else { " bake 後に変わった" }
+            );
+        }
+        Scip { occ, pos2idx, doc_paths, stale_docs, unverified: recorded.is_none() }
     }
     /// syn の (rel_path, line 1-indexed, col 0-indexed) を SCIP 鍵に変換して symbol を引く。
     pub(crate) fn symbol_at(&self, rel_path: &str, line1: u32, col0: u32) -> Option<&str> {

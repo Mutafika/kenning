@@ -1244,7 +1244,8 @@ fn stats_separates_external_calls_from_the_resolve_rate() {
 
 /// 受け手の型が分からない method 呼び (`d.ping()`) を名前一致だけで確定すると、std/dep の
 /// 同名 method (`.next()` / `.len()`) を自前の定義の caller として並べてしまう。
-/// **確定するのは `self.f()` だけ**、他は候補どまり — これが「確実 = 誤りなし」の境界。
+/// **確定するのは `self.f()` と、受け手の型がソースに書いてある物だけ**、他は候補どまり —
+/// これが「確実 = 誤りなし」の境界。ここでの `d` は free fn の戻り値で、型はどこにも書いていない。
 #[test]
 fn only_self_receiver_method_calls_are_confirmed() {
     let d = tmp();
@@ -1255,7 +1256,8 @@ fn only_self_receiver_method_calls_are_confirmed() {
              pub fn ping(&self) {}\n\
              pub fn go(&self) { self.ping(); }\n\
          }\n\
-         pub fn outside(d: &D) { d.ping(); }\n",
+         fn make_d() -> D { D }\n\
+         pub fn outside() { let d = make_d(); d.ping(); }\n",
     );
     let db = d.join("k.db");
     index(&d, &db);
@@ -1487,4 +1489,115 @@ fn changes_suppresses_caller_diffs_across_a_bake() {
     assert!(out.contains("bake が入った"), "精度が変わった注記が無い:\n{out}");
     assert!(!out.contains("\tcallers\t"), "精度差を含む callers を出した:\n{out}");
     assert!(out.contains("\tdead\thelper"), "callers 以外は出るはず:\n{out}");
+}
+
+/// 受け手の型が**ソースに書いてある**時だけ `x.f()` を確定する (res=typed)。書いていない・
+/// シャドーイングで分からなくなった・型引数・戻り値が Self でない物は候補どまり (誤確定しない)。
+#[test]
+fn method_calls_on_receivers_with_written_types_are_confirmed() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"pub struct Db;
+pub struct Other;
+impl Db {
+    pub fn new() -> Self { Db }
+    pub fn open(p: &str) -> Result<Self, String> { let _ = p; Ok(Db) }
+    pub fn peer() -> Other { Other }
+    pub fn get(&self) {}
+}
+impl Other {
+    pub fn get(&self) {}
+}
+pub fn by_param(db: &Db) { db.get(); }
+pub fn by_let_type() { let db: Db = Db; db.get(); }
+pub fn by_struct_lit() { let db = Db {}; db.get(); }
+pub fn by_ctor() { let db = Db::new(); db.get(); }
+pub fn by_try_ctor() -> Result<(), String> { let db = Db::open("x")?; db.get(); Ok(()) }
+pub fn not_self_ret() { let o = Db::peer(); o.get(); }
+pub fn shadowed(db: &Db) { let db = make(); db.get(); }
+pub fn generic<T>(db: T) { let _ = db; }
+pub fn generic_call<Db2: Fn()>(db: Db2) { db.get(); }
+pub fn inner_scope(db: &Db) { { let db = make(); let _ = db; } db.get(); }
+fn make() -> Db { Db }
+"#,
+    );
+    let db = d.join("k.db");
+    index(&d, &db);
+    let out = query(&["callers", "get", "Db"], &db);
+    let (confirmed, rest) = out.split_once("候補").unwrap_or((out.as_str(), ""));
+    for f in ["by_param", "by_let_type", "by_struct_lit", "by_ctor", "by_try_ctor", "inner_scope"] {
+        assert!(confirmed.contains(&format!("in {f}\t")), "{f} の db.get() が確定しない:\n{out}");
+    }
+    for f in ["not_self_ret", "shadowed", "generic_call"] {
+        assert!(!confirmed.contains(&format!("in {f}\t")), "{f} を Db::get に誤確定した:\n{out}");
+    }
+    assert!(rest.contains("in shadowed"), "シャドーイングで型が分からない呼び出しは候補に残るはず:\n{out}");
+    let stats = query(&["stats"], &db);
+    assert!(stats.contains("typed="), "stats に typed の内訳が出ない:\n{stats}");
+}
+
+/// 出どころが repo の外 (`walkdir::DirEntry` / `use std::io::Error`) の型名は、同名の自前の型と
+/// 結び付けない (ripgrep を RA と突き合わせて見つけた誤確定の形)。`use crate::..` や repo の module
+/// から来た型は内側として確定する。
+#[test]
+fn external_types_with_repo_lookalike_names_are_not_confirmed() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"use std::io::Error;
+use crate::other::Db as MyDb;
+pub struct DirEntry;
+impl DirEntry { pub fn file_type(&self) {} }
+pub struct Db;
+impl Db { pub fn get(&self) {} }
+pub fn ext_param(e: &walkdir::DirEntry) { e.file_type(); }
+pub fn ext_fs(e: &std::fs::DirEntry) { e.file_type(); }
+pub fn own_param(e: &DirEntry) { e.file_type(); }
+pub fn std_error() { let _ = Error::new(1); }
+pub fn own_renamed(db: &MyDb) { db.get(); }
+"#,
+    );
+    std::fs::write(d.join("src/errs.rs"), "pub struct Error;\nimpl Error { pub fn new(x: u8) -> Self { let _ = x; Error } }\n").unwrap();
+    let db = d.join("k.db");
+    index(&d, &db);
+    let ft = query(&["callers", "file_type"], &db);
+    let (confirmed, _) = ft.split_once("候補").unwrap_or((ft.as_str(), ""));
+    assert!(confirmed.contains("in own_param"), "自前の DirEntry は確定するはず:\n{ft}");
+    assert!(!confirmed.contains("in ext_param") && !confirmed.contains("in ext_fs"), "外部の DirEntry を自前に誤確定:\n{ft}");
+    let new = query(&["callers", "new", "Error"], &db);
+    assert!(!new.split_once("候補").map(|x| x.0).unwrap_or(&new).contains("in std_error"), "std の Error::new を自前に誤確定:\n{new}");
+    let get = query(&["callers", "get", "Db"], &db);
+    assert!(get.split_once("候補").map(|x| x.0).unwrap_or(&get).contains("in own_renamed"), "use crate:: で別名にした自前の型は確定するはず:\n{get}");
+}
+
+/// 修飾なしの `f()` が repo の fn でない形: 束縛したクロージャ / 関数の中で外から `use` した fn /
+/// 同名の **method** しか無い (`f()` では method を呼べない)。どれも確定しない (ripgrep で RA と突き合わせた形)。
+#[test]
+fn bare_calls_to_closures_inner_imports_and_methods_are_not_confirmed() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"pub struct T;
+impl T { pub fn cmd(&self) {} }
+pub fn select(x: u8) -> u8 { x }
+fn symlink() {}
+pub fn uses_closure() { let select = |x: u8| x; let _ = select(1); }
+pub fn uses_inner_use() { use std::os::unix::fs::symlink; let _ = symlink("a", "b"); }
+pub fn calls_method_name() { cmd(); }
+pub fn real_call() { let _ = select(2); symlink(); }
+"#,
+    );
+    let db = d.join("k.db");
+    index(&d, &db);
+    let confirmed = |name: &str| {
+        let out = query(&["callers", name], &db);
+        out.split_once("候補").map(|x| x.0.to_string()).unwrap_or(out)
+    };
+    let sel = confirmed("select");
+    assert!(sel.contains("in real_call") && !sel.contains("in uses_closure"), "クロージャ呼びを select に誤確定:\n{sel}");
+    let sym = confirmed("symlink");
+    assert!(sym.contains("in real_call") && !sym.contains("in uses_inner_use"), "関数内 use の std の symlink を自前に誤確定:\n{sym}");
+    let cmd = confirmed("cmd");
+    assert!(!cmd.contains("in calls_method_name"), "修飾なしの cmd() を method に誤確定:\n{cmd}");
 }

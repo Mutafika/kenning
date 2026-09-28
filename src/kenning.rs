@@ -75,7 +75,7 @@ pub(crate) const GENERATED_FILES: &[&str] = &[
 /// v5: file 表に非 Rust テキスト (md/toml/yml/…) も載せる — `text` の対象が .rs 限定でなくなった。
 // v6 (2026-08): enchudb 0.14.4 → 0.25.1。意味論は不変だが、旧 enchudb で作った db を一度焼き直して
 // growable lazy commit (実 disk 半減) と新 recovery に乗せるため bump (次クエリで自動 heal、repo あたり ~1s)。
-pub(crate) const INDEX_VER: u32 = 20; // 7: dir 表 / 8: node_modules 除外 / 9: macro 内 call / 10: 値渡し参照 / 11: 値参照を式全般へ + sym.trait_impl 列 / 12: 仮引数を束縛として除外 / 13: super::/crate::/self:: を module 相対として解決 / 19: 外部呼び出し (std/dep) を R_EXTERNAL に分離 / 20: 受け手不明の method 呼びを候補どまりに (誤確定の除去)
+pub(crate) const INDEX_VER: u32 = 21; // 21: 受け手の型推定 (call.recv_ty / recv_fn / recv_try、res=typed) / 7: dir 表 / 8: node_modules 除外 / 9: macro 内 call / 10: 値渡し参照 / 11: 値参照を式全般へ + sym.trait_impl 列 / 12: 仮引数を束縛として除外 / 13: super::/crate::/self:: を module 相対として解決 / 19: 外部呼び出し (std/dep) を R_EXTERNAL に分離 / 20: 受け手不明の method 呼びを候補どまりに (誤確定の除去)
 
 /// このプロセスで鮮度チェック済みか。parse_opts の auto 経路 (maybe_auto_update / auto-index) が
 /// 立てる。open_ro 側の warn_if_stale が同じ stat-walk を繰り返さないため — 非 Rust の大 dir を
@@ -109,8 +109,11 @@ pub(crate) const R_EXTERNAL: u32 = 6;
 /// その呼び出しが std/dep の同名 method (`.next()` / `.len()`) である可能性は消せないので
 /// **確定させない** (候補どまり)。`self.f()` だけは受け手 = 現在の impl 型と分かるので確定する。
 pub(crate) const R_METHOD: u32 = 7;
+/// `x.f()` の受け手の型を**書いてある物だけ**から推定して確定した (引数 `x: T` / `let x: T` /
+/// `T { .. }` / `T::new()` が `-> Self`)。推定できない・同名の型が複数なら R_METHOD のまま。
+pub(crate) const R_TYPED: u32 = 8;
 pub(crate) const RES_NAMES: &[&str] =
-    &["unresolved", "unique", "qualified", "ambiguous", "value-ref", "macro-token", "external", "method-name"];
+    &["unresolved", "unique", "qualified", "ambiguous", "value-ref", "macro-token", "external", "method-name", "typed"];
 
 // ── call.is_method の encoding (受け手をどこまで知っているか) ──
 pub(crate) const M_NONE: u32 = 0; // 関数 / path 呼び

@@ -238,14 +238,31 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
 
     // 6. 全 sym から global defs を再構築 (新旧すべて反映、再パース不要)。
     let defs = build_defs_from_table(&sym_t);
+    let rs_paths: Vec<String> = file_t.where_eq("lang", LANG_RUST).find().unwrap_or_default().into_iter().map(|e| txt(file_t.entity(e).get("path"))).collect();
+    let rz = Resolver::new(&defs, rs_paths.iter().map(String::as_str));
 
     // 7. incoming 再解決: 影響名を callee に持つ「既存 (=未変更ファイル) の call」を
     //    delete + 再挿入して callee_sym/res を最新化。この時点で存在する該当 call は
     //    未変更ファイル由来のみ (変更/削除は 4 で purge 済、新規は 8 で未挿入)。
-    let mut reresolved = 0u64;
+    // 受け手の型推定に使った型名 / 生成関数名 (`let x = T::new()` の T と new) が変わった call も
+    // 解き直す (T::new の戻り値が Self でなくなれば、x.f() の確定は取り消さないといけない)。
+    // 対象を先に全部集める — 解き直した call は新しい eid で入るので、後の名前で二重に拾わない。
+    let mut targets: Vec<EntityId> = Vec::new();
+    let mut seen: HashSet<EntityId> = HashSet::new();
     for name in &affected {
-        for ce in call_t.where_eq("callee", name.as_str()).find().unwrap() {
+        for col in ["callee", "recv_ty", "recv_fn"] {
+            for ce in call_t.where_eq(col, name.as_str()).find().unwrap_or_default() {
+                if seen.insert(ce) {
+                    targets.push(ce);
+                }
+            }
+        }
+    }
+    let mut reresolved = 0u64;
+    {
+        for ce in targets {
             let er = call_t.entity(ce);
+            let name = txt(er.get("callee"));
             let Some(Value::Ref(caller)) = er.get("caller") else { continue };
             let Some(Value::Ref(file)) = er.get("file") else { continue };
             let qual_s = txt(er.get("qual"));
@@ -254,17 +271,19 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
                 caller_container: txt(sym_t.entity(caller).get("container")),
                 file,
                 rel_path: String::new(), // update は syn 再解決 (rel_path/col は使わない)
-                name: name.clone(),
+                name,
                 qualifier: if qual_s.is_empty() { None } else { Some(qual_s) },
                 is_method: num(er.get("is_method")) >= M_RECV,
                 self_recv: num(er.get("is_method")) == M_SELF,
                 as_value: num(er.get("res")) == R_VALUE, // 値渡し参照は再解決後も候補どまり
                 in_macro: num(er.get("res")) == R_MACRO,  // 字句走査由来も同じく候補どまり
+                recv: Recv { ty: txt(er.get("recv_ty")), via_fn: txt(er.get("recv_fn")), via_try: num(er.get("recv_try")) == 1, root: txt(er.get("recv_root")) },
+                qual_root: txt(er.get("qual_root")),
                 line: num(er.get("line")),
                 col: 0,
             };
             call_t.entity(ce).delete().unwrap();
-            insert_call(&call_t, &cs, &defs);
+            insert_call(&call_t, &cs, &rz);
             reresolved += 1;
         }
     }
@@ -272,7 +291,7 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
     // 8. 追加/変更ファイルの outgoing call を解決して挿入。
     let mut n_new_call = 0u64;
     for cs in &acc.pending {
-        insert_call(&call_t, cs, &defs);
+        insert_call(&call_t, cs, &rz);
         n_new_call += 1;
     }
 

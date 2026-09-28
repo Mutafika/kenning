@@ -257,6 +257,8 @@ pub fn run_bake(dir: &str) {
     if !rustflags.is_empty() {
         eprintln!("# bake: RUSTFLAGS={rustflags} を RA に注入 (KENNING_BAKE_RUSTFLAGS)");
     }
+    // RA が読む前の内容を記録 (この後で編集された file は、再利用時に SCIP を使わない)。
+    write_scip_src(&scip_path, &root_s);
     for attempt in 0..2 {
         let all = use_all && attempt == 0;
         // features=all も RUSTFLAGS も無い時だけ config を書かない (= RA の既定で焚く)。
