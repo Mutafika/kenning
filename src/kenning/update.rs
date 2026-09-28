@@ -245,8 +245,13 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
 
     // 6. 全 sym から global defs を再構築 (新旧すべて反映、再パース不要)。
     let defs = build_defs_from_table(&sym_t);
-    let rs_paths: Vec<String> = file_t.where_eq("lang", LANG_RUST).find().unwrap_or_default().into_iter().map(|e| txt(file_t.entity(e).get("path"))).collect();
-    let rz = Resolver::new(&defs, rs_paths.iter().map(String::as_str), load_field_types(field_t.as_ref()));
+    let mut for_all: HashSet<String> = acc.impls.iter().filter(|i| i.for_all).map(|i| i.trait_name.clone()).collect();
+    if let Some(it) = &impl_t {
+        for e in it.where_eq("for_all", 1u32).find().unwrap_or_default() {
+            for_all.insert(txt(it.entity(e).get("trait_name")));
+        }
+    }
+    let rz = Resolver::new(&defs, &file_t, load_field_types(field_t.as_ref()), for_all);
 
     // 7. incoming 再解決: 影響名を callee に持つ「既存 (=未変更ファイル) の call」を
     //    delete + 再挿入して callee_sym/res を最新化。この時点で存在する該当 call は
@@ -317,6 +322,7 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
             it.insert()
                 .set("trait_name", ie.trait_name.as_str())
                 .set("type_name", ie.type_name.as_str())
+                .set("for_all", ie.for_all as u32)
                 .set("file", Value::Ref(ie.file))
                 .set("line", ie.line)
                 .commit()

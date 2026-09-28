@@ -923,3 +923,19 @@ fn scip_name_reads_the_descriptor_not_the_version() {
     assert_eq!(scip_name("rust-analyzer cargo ignore 0.4.29 dir/Parents#"), "Parents");
     assert_eq!(scip_package("rust-analyzer cargo grep-printer 0.3.1 summary/impl#[SummaryBuilder]new()."), "grep-printer");
 }
+
+/// method 呼びで rust-analyzer が trait の宣言を指す impl の形 (型引数そのもの / それを包む参照・ポインタ)。
+#[test]
+fn blanket_self_types_are_params_or_pointers_to_params() {
+    let is = |src: &str| {
+        let i: syn::ItemImpl = syn::parse_str(src).unwrap();
+        let params: HashSet<String> = i.generics.type_params().map(|t| t.ident.to_string()).collect();
+        is_blanket_self(&i.self_ty, &params)
+    };
+    assert!(is("impl<T: Tr> Tr for T {}"));
+    assert!(is("impl<'a, M: Tr> Tr for &'a M {}"));
+    assert!(is("impl<S: Tr> Tr for Box<S> {}"));
+    assert!(is("impl<P> Tr for Pin<P> {}"));
+    assert!(!is("impl<R> Tr for BufReader<R> {}"), "型引数を持つ具体的な型は blanket ではない");
+    assert!(!is("impl Tr for A {}"));
+}

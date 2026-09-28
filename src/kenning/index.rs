@@ -262,6 +262,7 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         .number("lang")
         .number("loc")
         .number("hash") // 内容 fingerprint (増分 index の変更検知)
+        .tag("gated_mods") // 否定の cfg で宣言した子 module 名 (空白区切り)
         .with_capacity(file_cap)
         .build()
         .unwrap();
@@ -282,6 +283,10 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         .tag("ret_root")
         .tag("ret_arg")
         .tag("ret_arg_root")
+        .tag("impl_trait") // trait 実装の method ならその trait (確定先を trait の宣言に揃える)
+        .tag("impl_trait_root")
+        .number("impl_blanket") // 型引数を含む型への trait 実装 (method 呼びでも確定先は trait の宣言)
+        .number("gated") // 否定の cfg の中の定義 (代用品。確定先にしない)
         .tag("attrs") // 正規化済み属性 (`allow(dead_code) inline`)。facet `attr:` の材料
         .tag("doc") // doc コメント 1 行目 (無ければ ""。def/outline で sig と並べて出す)
         .number("line")
@@ -336,6 +341,7 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
     db.table("impl")
         .tag("trait_name")
         .tag("type_name")
+        .number("for_all") // `impl<R: Buf> BufExt for R` (拡張 trait の形)
         .ref_to("file", "file")
         .number("line")
         .with_capacity(impl_cap)
@@ -432,7 +438,8 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         }
         m
     };
-    let rz = Resolver::new(&acc.defs, ws.rs.iter().filter_map(|p| p.to_str()), field_types);
+    let for_all: HashSet<String> = acc.impls.iter().filter(|i| i.for_all).map(|i| i.trait_name.clone()).collect();
+    let rz = Resolver::new(&acc.defs, &file_t, field_types, for_all);
     for cs in &acc.pending {
         if (cs.as_value || cs.in_macro) && !acc.defs.contains_key(&cs.name) {
             continue; // 定義表に無い名前 = 局所変数 / 外部。call 表をノイズで膨らませない
@@ -603,6 +610,7 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
             .insert()
             .set("trait_name", ie.trait_name.as_str())
             .set("type_name", ie.type_name.as_str())
+            .set("for_all", ie.for_all as u32)
             .set("file", Value::Ref(ie.file))
             .set("line", ie.line)
             .commit()

@@ -1727,3 +1727,159 @@ fn deref_of_self_in_pointer_impls_is_not_the_same_type() {
     assert!(!confirmed.contains("other.rs:2\tin"), "(*self).f() を &M の f 自身に確定:\n{out}");
     assert!(!confirmed.contains("other.rs:3\tin"), "(**self).f() を Box の f 自身に確定:\n{out}");
 }
+
+/// `cfg_x! { .. }` のように item / impl の中身を包むマクロの中の定義も見える。見えないままだと、
+/// 同名の「見えている方」を一意と思い込んで誤確定する (tokio の cfg_rt! 等で実際に起きていた)。
+#[test]
+fn definitions_wrapped_in_item_macros_are_indexed() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"macro_rules! cfg_x { ($($i:item)*) => { $($i)* } }
+cfg_x! {
+    pub fn hidden() {}
+    pub fn twin() {}
+    pub struct H;
+}
+impl H {
+    cfg_x! { pub fn in_impl(&self) {} }
+}
+pub fn caller() { hidden(); twin(); }
+"#,
+    );
+    std::fs::write(d.join("src/twin.rs"), "pub fn twin() {}\n").unwrap();
+    let db = d.join("k.db");
+    index(&d, &db);
+    assert!(query(&["def", "hidden"], &db).contains("other.rs:3"), "マクロ内の fn が見えない");
+    assert!(query(&["def", "in_impl"], &db).contains("H::in_impl"), "impl 内マクロの method が見えない");
+    let twin = query(&["callers", "twin"], &db);
+    assert!(twin.contains("2 型が定義 (同名)") && twin.contains("名前一致 1 件中 0 件を確定"), "同名が 2 つあるのに一意として確定:\n{twin}");
+}
+
+/// trait 実装の method への確定先は rust-analyzer (= bake 済み) の流儀に揃える: 具体的な型への impl を
+/// method 呼びで呼べば impl の method、型引数を含む型への impl や path 呼び `T::f()` なら trait の宣言
+/// (std の trait なら repo の外)。
+#[test]
+fn trait_impl_call_targets_follow_rust_analyzer() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"pub trait Tr { fn go(&self); }
+pub struct A;
+impl Tr for A { fn go(&self) {} }
+pub struct W<T>(T);
+impl<T> Tr for W<T> { fn go(&self) {} }
+impl Default for A { fn default() -> Self { A } }
+pub fn concrete(a: &A) { a.go(); }
+pub fn generic_arg(w: &W<u8>) { w.go(); }
+pub fn path_call() { let _ = A::default(); }
+"#,
+    );
+    let db = d.join("k.db");
+    index(&d, &db);
+    let confirmed = |args: &[&str]| {
+        let out = query(args, &db);
+        out.split("候補").next().unwrap_or("").to_string()
+    };
+    assert!(confirmed(&["callers", "go", "A"]).contains("in concrete\t"), "具体的な impl は impl の method に確定するはず");
+    assert!(confirmed(&["callers", "go", "W"]).contains("in generic_arg\t"), "W<T> への impl は具体的な型の impl (impl の method に確定するはず)");
+    assert!(!confirmed(&["callers", "default", "A"]).contains("in path_call\t"), "std の Default::default を自前に確定");
+}
+
+/// repo に `std` という module があっても、`use std::time::Instant` の std は標準ライブラリ。
+#[test]
+fn a_local_module_named_std_does_not_make_std_local() {
+    let d = tmp();
+    write_fixture(&d, "use std::time::Instant;\npub fn f() { let _ = Instant::now(); }\n");
+    std::fs::create_dir_all(d.join("src/std")).unwrap();
+    std::fs::write(d.join("src/std/mod.rs"), "pub struct Instant;\nimpl Instant { pub fn now() -> Self { Instant } }\n").unwrap();
+    let db = d.join("k.db");
+    index(&d, &db);
+    let out = query(&["callers", "now", "Instant"], &db);
+    assert!(!out.split("候補").next().unwrap_or("").contains("in f\t"), "std の Instant::now を自前に確定:\n{out}");
+}
+
+/// 別 crate の fn は use しなければ修飾なしでは呼べない / tests・benches 直下の file は互いに別 crate /
+/// use していない prelude の型 (Vec) は std / 外の型への impl の中の self.f() は std の inherent が先 /
+/// 同名 method を宣言する trait が複数あれば trait 境界からは決めない。どれも確定しない。
+#[test]
+fn syn_resolution_respects_crates_prelude_and_trait_ambiguity() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"use std::process::Child as StdChild;
+pub trait Kill { fn kill(&mut self); }
+impl Kill for StdChild { fn kill(&mut self) { self.kill(); } }
+pub trait Buf { fn consume(&self); }
+pub trait BufExt { fn consume(&self) {} }
+impl<R: Buf> BufExt for R {}
+pub trait Sealed { fn extend(&mut self); }
+impl<T> Sealed for Vec<T> { fn extend(&mut self) {} }
+pub fn by_bound<R: Buf>(r: R) { r.consume(); }
+pub fn by_vec() { let mut v: Vec<u8> = Vec::new(); v.extend(); }
+"#,
+    );
+    std::fs::create_dir_all(d.join("benches")).unwrap();
+    std::fs::write(d.join("benches/a.rs"), "fn helper() {}\nfn main() { helper(); }\n").unwrap();
+    std::fs::write(d.join("benches/b.rs"), "fn main() { helper(); }\n").unwrap();
+    let db = d.join("k.db");
+    index(&d, &db);
+    let confirmed = |args: &[&str]| query(args, &db).split("候補").next().unwrap_or("").to_string();
+    assert!(!confirmed(&["callers", "kill", "StdChild"]).contains("in StdChild::kill"), "外の型への impl の self.kill() を自分に確定");
+    assert!(!confirmed(&["callers", "consume", "Buf"]).contains("in by_bound"), "同名 method の trait が 2 つあるのに確定");
+    assert!(!confirmed(&["callers", "extend"]).contains("in by_vec"), "use していない Vec (std) の extend を自前に確定");
+    let helper = confirmed(&["callers", "helper"]);
+    assert!(helper.contains("benches/a.rs:2"), "同じ file の helper() は確定するはず:\n{helper}");
+    assert!(!helper.contains("benches/b.rs"), "別ターゲット (benches/b.rs) の helper() を確定:\n{helper}");
+}
+
+/// 自作マクロの中の受け手は信じない (トークンを組み替え得る) / std の式マクロは信じる /
+/// repo で定義していない型 (re-export された std の Arc) への trait 実装には確定しない /
+/// `cfg_not_*!` の中の定義 (代用品) は確定先にしない。属性の cfg(not(..)) は普段の build の本体でもあり得るので
+/// 除外しない (双子なら同名 2 つ = 曖昧で確定しない)。
+#[test]
+fn macros_reexported_types_and_negative_cfg_are_handled_conservatively() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"macro_rules! delegate { ($e:expr) => { $e } }
+macro_rules! cfg_not_x { ($($i:item)*) => { $($i)* } }
+cfg_not_x! { mod shim; }
+macro_rules! cfg_x { ($($i:item)*) => { $($i)* } }
+cfg_x! { mod both; }
+cfg_not_x! { mod both; }
+mod loom { pub use std::sync::Arc; }
+use crate::loom::Arc;
+use self::shim::Atomic;
+pub trait Link { fn from_raw(p: u8) -> Self; }
+impl Link for Arc<u8> { fn from_raw(p: u8) -> Self { Arc::new(p) } }
+pub struct Cmd;
+impl Cmd { pub fn run(&self) -> u8 { 1 } pub fn go(&self) { delegate!(self.run()); } }
+pub fn std_macro(c: &Cmd) { println!("{}", c.run()); }
+pub fn reexported() { let _ = Arc::from_raw(1); }
+pub fn shimmed(a: &Atomic) { a.load(); }
+#[cfg(not(unix))]
+pub fn plat() {}
+#[cfg(unix)]
+pub fn plat() {}
+pub fn calls_plat() { plat(); }
+"#,
+    );
+    // `mod shim;` は src/other.rs の中の宣言なので、子 file は src/other/shim.rs
+    std::fs::create_dir_all(d.join("src/other")).unwrap();
+    std::fs::write(d.join("src/other/shim.rs"), "pub struct Atomic;\nimpl Atomic { pub fn load(&self) {} }\n").unwrap();
+    // 両方の枝で宣言された module (出し分け) の中身は除外しない
+    std::fs::write(d.join("src/other/both.rs"), "pub struct Real;\nimpl Real { pub fn work(&self) {} }\npub fn use_real(r: &Real) { r.work(); }\n").unwrap();
+    let db = d.join("k.db");
+    index(&d, &db);
+    let confirmed = |args: &[&str]| query(args, &db).split("候補").next().unwrap_or("").to_string();
+    let run = confirmed(&["callers", "run", "Cmd"]);
+    assert!(run.contains("in std_macro\t"), "std の println! の中の c.run() は確定するはず:\n{run}");
+    assert!(!run.contains("in Cmd::go\t"), "自作マクロの中の self.run() を確定:\n{run}");
+    assert!(!confirmed(&["callers", "from_raw"]).contains("in reexported\t"), "re-export された std の Arc::from_raw を自前の trait 実装に確定");
+    assert!(!confirmed(&["callers", "load", "Atomic"]).contains("in shimmed\t"), "cfg_not の代用品の Atomic::load に確定");
+    assert!(confirmed(&["callers", "work", "Real"]).contains("in use_real\t"), "両方の枝で宣言された module の中身まで除外した");
+    // 属性の cfg の双子は同名 2 つ = どちらにも確定しない (どちらが活性かは build 次第)
+    let plat = query(&["callers", "plat"], &db);
+    assert!(plat.contains("名前一致 1 件中 0 件を確定"), "cfg の双子の片方に確定:\n{plat}");
+}

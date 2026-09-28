@@ -163,6 +163,13 @@ pub(crate) fn ty_ref(ty: &syn::Type, imp: ImportLookup, generics: &HashSet<Strin
     }
 }
 
+/// 引数を式としてそのまま評価する std のマクロ (受け手の型の推定をそのまま効かせてよい)。
+const STD_EXPR_MACROS: &[&str] = &[
+    "println", "print", "eprintln", "eprint", "format", "format_args", "write", "writeln", "panic", "assert", "assert_eq",
+    "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne", "vec", "dbg", "todo", "unimplemented", "unreachable",
+    "ready", "matches",
+];
+
 /// 受け手の型推定で「境界」と数えない目印の trait (method を持たない / 持っていても呼ばれ方が違う)。
 const MARKER_TRAITS: &[&str] = &["Send", "Sync", "Sized", "Unpin", "Copy", "UnwindSafe", "RefUnwindSafe"];
 
@@ -230,6 +237,12 @@ pub(crate) struct CallCollector {
     generics: HashSet<String>,
     /// 型引数のうち trait 境界がちょうど 1 つの物 (`T: Store` の T → Store)。`x: T` の `x.f()` は Store::f。
     bounds: HashMap<String, TyRef>,
+    /// 自作マクロ (repo の macro_rules 等) の引数の中か。トークンを組み替え得る (`delegate_call!(self.f())` の
+    /// self は中身の値に書き換わる) ので、受け手に基づく確定をしない。std の式マクロは中身をそのまま使う。
+    in_user_macro: bool,
+    /// 囲む impl の自分の型の出どころ (`impl Kill for StdChild` の StdChild が std なら "std")。
+    /// 外の型への impl の中の `self.f()` は、std の inherent method が trait の method より優先される。
+    self_root: String,
     /// この file の `use`: 名前 → (出どころ = 先頭 seg, 元の名前)。`use std::io::Error` なら
     /// Error → ("std", "Error")、`use crate::a::Db as MyDb` なら MyDb → ("crate", "Db")。
     imports: std::rc::Rc<HashMap<String, (String, String)>>,
@@ -347,7 +360,7 @@ impl CallCollector {
             }
             syn::Expr::Paren(p) => self.expr_recv(&p.expr),
             syn::Expr::Group(g) => self.expr_recv(&g.expr),
-            syn::Expr::Path(p) if p.path.is_ident("self") => Some(Recv { ty: "Self".into(), ..Default::default() }),
+            syn::Expr::Path(p) if p.path.is_ident("self") => Some(Recv { ty: "Self".into(), root: self.self_root.clone(), ..Default::default() }),
             syn::Expr::Path(p) => p.path.get_ident().and_then(|i| self.lookup(&i.to_string())),
             _ => None,
         }
@@ -447,9 +460,15 @@ impl<'ast> Visit<'ast> for CallCollector {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         // 受け手の型は syn だけでは不明 (→ 候補どまり)。**例外は `self.f()`** — 受け手は
         // 今いる impl の型なので、その container の同名 method に健全に確定できる。
-        let self_recv = matches!(&*node.receiver, syn::Expr::Path(p) if p.path.is_ident("self"));
+        let self_recv = !self.in_user_macro && matches!(&*node.receiver, syn::Expr::Path(p) if p.path.is_ident("self"));
         // それ以外は、受け手が束縛名 `x` で、その型がソースに書いてある時だけ手掛かりを持つ。
-        let recv = if self_recv { Recv::default() } else { self.expr_recv(&node.receiver).unwrap_or_default() };
+        let recv = if self.in_user_macro {
+            Recv::default()
+        } else if self_recv {
+            Recv { root: self.self_root.clone(), ..Default::default() }
+        } else {
+            self.expr_recv(&node.receiver).unwrap_or_default()
+        };
         self.calls.push(RawCall {
             name: node.method.to_string(),
             qualifier: None,
@@ -534,8 +553,19 @@ impl<'ast> Visit<'ast> for CallCollector {
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
         use syn::punctuated::Punctuated;
         if let Ok(args) = node.parse_body_with(Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated) {
-            // parse した式は所有物 ('ast ではない) なので、別 collector で回して結果だけ貰う。
-            let mut sub = CallCollector::default();
+            // parse した式は所有物 ('ast ではない) なので、別 collector で回して結果だけ貰う。束縛・use・型引数は
+            // 引き継ぐ (`println!("{}", x.f())` の x の型)。std 以外のマクロの中では受け手に基づく確定をしない。
+            let name = node.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+            let mut sub = CallCollector {
+                scopes: self.scopes.clone(),
+                generics: self.generics.clone(),
+                bounds: self.bounds.clone(),
+                imports: self.imports.clone(),
+                fn_imports: self.fn_imports.clone(),
+                self_root: self.self_root.clone(),
+                in_user_macro: self.in_user_macro || !STD_EXPR_MACROS.contains(&name.as_str()),
+                ..Default::default()
+            };
             for e in &args {
                 visit::visit_expr(&mut sub, e);
             }
@@ -549,6 +579,7 @@ impl<'ast> Visit<'ast> for CallCollector {
 }
 
 /// pass1 で作る in-memory シンボル表の 1 定義。名前解決の突き合わせ先。
+#[derive(Clone)]
 pub(crate) struct SymDef {
     eid: EntityId,
     kind: u32,         // method 呼び (x.foo()) は method 定義のみを対象にするため
@@ -556,6 +587,10 @@ pub(crate) struct SymDef {
     module: String,    // "a::b"。`mod::` 修飾の突き合わせ用
     crate_: String,    // 定義元 crate。`mycrate::fn` / `enchudb_schema::foo` の突き合わせ用
     ret: TyRef,        // 戻り値の型。`T::new()` / `x.a()` の型を決める (出どころ付き)
+    impl_trait: TyRef, // trait 実装の method ならその trait (name / root)
+    impl_blanket: bool, // 型引数を含む型への trait 実装
+    file: EntityId,     // 定義のある file (別 crate / 別ターゲットの判定)
+    gated: bool,        // 否定の cfg の中の定義 (確定先にしない)
 }
 
 /// Cargo の crate 名は `-`、Rust path は `_`。突き合わせ前に正規化する。
@@ -585,6 +620,7 @@ pub(crate) struct CallSite {
 pub(crate) struct ImplEdge {
     pub(crate) trait_name: String,
     pub(crate) type_name: String,
+    pub(crate) for_all: bool, // `impl<R: Buf> BufExt for R` — 自分の型が型引数そのもの (拡張 trait の形)
     pub(crate) file: EntityId,
     pub(crate) line: u32,
 }
@@ -608,6 +644,10 @@ pub(crate) struct Ctx {
     in_test: bool,
     container: String,     // 現在の impl 型 (method の所属)
     in_trait_impl: bool,   // `impl Trait for T` の中か (= trait 経由で呼ばれ得る method)
+    impl_trait: TyRef,     // 囲む `impl Trait for T` の Trait (名前 + 出どころ)。inherent impl なら空
+    impl_blanket: bool,    // その impl の自分の型が型引数そのもの / それを包む参照・ポインタ (`impl<P> Tr for Pin<P>` / `for &M`)
+    impl_self_root: String, // その impl の自分の型の出どころ (外の型への impl を見分ける)
+    neg_gate: bool,        // `cfg_not_*! { .. }` の中 = 「その機能が無い時」の代用品の定義
     impl_generics: Vec<String>, // 囲む impl の型引数 (受け手の型推定で具体型と区別する)
     impl_bounds: HashMap<String, TyRef>, // 囲む impl の型引数の単一 trait 境界
     imports: std::rc::Rc<HashMap<String, (String, String)>>, // この file の `use` (名前 → (出どころ, 元の名前))
@@ -625,6 +665,11 @@ pub(crate) struct FileFacts {
     /// 関数の中ではないので caller となる sym が無い = caller 無しの call 行として持つ。
     pub(crate) item_calls: Vec<RawCall>,
     pub(crate) fields: Vec<RawField>,
+    /// `cfg_not_*!` の中で宣言された子 module 名 (`cfg_not_has_atomic_u64! { mod atomic_u64_as_mutex; }`)。
+    pub(crate) gated_mods: Vec<String>,
+    /// cfg_not の外で宣言された子 module 名。同じ名前が両方の枝にあれば (`cfg_rt! { mod runtime; }` と
+    /// `cfg_not_rt! { mod runtime; }`) 代用品ではなく同じ module の出し分けなので除外しない。
+    live_mods: Vec<String>,
 }
 
 /// 1 定義 + その本体の呼び出し箇所。
@@ -644,6 +689,9 @@ pub(crate) struct RawSym {
     pub(crate) doc: String,
     pub(crate) attrs: String, // 正規化済み属性 (`allow(dead_code) inline`)。facet `attr:` の材料
     pub(crate) ret: TyRef,    // fn / method の戻り値の型 (連鎖 `x.a().b()` をたどる材料。無ければ空)
+    pub(crate) impl_trait: TyRef, // trait 実装の method ならその trait (確定先を RA の流儀に揃える)
+    pub(crate) impl_blanket: bool, // 型引数を含む型への trait 実装 (method 呼びでも RA は trait の宣言を指す)
+    pub(crate) gated: bool,        // 否定の cfg の中の定義 (代用品。確定先にしない)
     pub(crate) calls: Vec<RawCall>,
 }
 
@@ -658,6 +706,7 @@ pub(crate) struct RawField {
 pub(crate) struct RawImpl {
     trait_name: String,
     type_name: String,
+    for_all: bool,
     line: u32,
 }
 
@@ -692,7 +741,7 @@ pub(crate) fn record_symbol(
 ) {
     let mut calls = Vec::new();
     if let Some(b) = body {
-        let mut cc = CallCollector { imports: ctx.imports.clone(), ..Default::default() };
+        let mut cc = CallCollector { imports: ctx.imports.clone(), self_root: ctx.impl_self_root.clone(), ..Default::default() };
         cc.generics.extend(ctx.impl_generics.iter().cloned());
         cc.bounds.extend(ctx.impl_bounds.iter().map(|(k, v)| (k.clone(), v.clone())));
         // 引数名は signature 側にあるので、body だけ歩くと束縛が漏れる。
@@ -733,6 +782,9 @@ pub(crate) fn record_symbol(
             syn::ReturnType::Default => None,
         })
         .unwrap_or_default(),
+        impl_trait: if kind == K_METHOD { ctx.impl_trait.clone() } else { TyRef::default() },
+        impl_blanket: kind == K_METHOD && ctx.impl_blanket,
+        gated: ctx.neg_gate,
         calls,
     });
 }
@@ -748,6 +800,7 @@ pub(crate) fn insert_file_facts(file_t: &Table, sym_t: &Table, acc: &mut Acc, ro
         .set("lang", LANG_RUST)
         .set("loc", facts.loc)
         .set("hash", facts.hash)
+        .set("gated_mods", facts.gated_mods.join(" ").as_str())
         .commit()
         .unwrap();
     let rel_path = rel_of(path_s, root);
@@ -777,6 +830,10 @@ pub(crate) fn insert_file_facts(file_t: &Table, sym_t: &Table, acc: &mut Acc, ro
             .set("ret_root", s.ret.root.as_str())
             .set("ret_arg", s.ret.arg.as_str())
             .set("ret_arg_root", s.ret.arg_root.as_str())
+            .set("impl_trait", s.impl_trait.name.as_str())
+            .set("impl_trait_root", s.impl_trait.root.as_str())
+            .set("impl_blanket", s.impl_blanket as u32)
+            .set("gated", s.gated as u32)
             .set("doc", s.doc.as_str())
         .set("attrs", s.attrs.as_str())
             .set("line", s.line)
@@ -784,7 +841,7 @@ pub(crate) fn insert_file_facts(file_t: &Table, sym_t: &Table, acc: &mut Acc, ro
             .commit()
             .unwrap();
         // 名前解決の突き合わせ先として登録 (syn 用)。
-        acc.defs.entry(s.name).or_default().push(SymDef { eid: sym_eid, kind: s.kind, container: s.container.clone(), module: s.module, crate_: crate_name.clone(), ret: s.ret.clone() });
+        acc.defs.entry(s.name).or_default().push(SymDef { eid: sym_eid, kind: s.kind, container: s.container.clone(), module: s.module, crate_: crate_name.clone(), ret: s.ret.clone(), impl_trait: s.impl_trait.clone(), impl_blanket: s.impl_blanket, file: file_eid, gated: s.gated });
         // SCIP symbol → 自 index の eid (call の正確解決に使う)。
         // **衝突したら 0 (曖昧) にする**: RA の symbol 文字列は test / example / bench の各ターゲットで
         // 同じになることがあり (enchudb には同名 `cleanup` が 108 個)、上書きすると
@@ -837,7 +894,7 @@ pub(crate) fn insert_file_facts(file_t: &Table, sym_t: &Table, acc: &mut Acc, ro
         });
     }
     for im in facts.impls {
-        acc.impls.push(ImplEdge { trait_name: im.trait_name, type_name: im.type_name, file: file_eid, line: im.line });
+        acc.impls.push(ImplEdge { trait_name: im.trait_name, type_name: im.type_name, for_all: im.for_all, file: file_eid, line: im.line });
     }
     acc.fields.extend(facts.fields.into_iter().map(|f| (file_eid, f)));
 }
@@ -937,6 +994,62 @@ pub(crate) fn first_doc_line(attrs: &[syn::Attribute]) -> String {
     String::new()
 }
 
+/// impl の自分の型が「型引数そのもの / それを包む参照・ポインタ」か (`impl<T> Tr for T` / `for &M` /
+/// `for Box<T>` / `for Pin<P>`)。この形の impl の method を呼ぶと rust-analyzer は trait の宣言を指す。
+/// `impl<R> Tr for BufReader<R>` は具体的な型の impl (RA は impl の method を指す)。
+pub(crate) fn is_blanket_self(ty: &syn::Type, params: &HashSet<String>) -> bool {
+    match ty {
+        syn::Type::Reference(r) => is_blanket_self(&r.elem, params),
+        syn::Type::Paren(p) => is_blanket_self(&p.elem, params),
+        syn::Type::Path(p) if p.qself.is_none() => {
+            let Some(last) = p.path.segments.last() else { return false };
+            if p.path.segments.len() == 1 && params.contains(&last.ident.to_string()) {
+                return true;
+            }
+            if !matches!(last.ident.to_string().as_str(), "Box" | "Pin" | "Rc" | "Arc") {
+                return false;
+            }
+            match &last.arguments {
+                syn::PathArguments::AngleBracketed(a) => a.args.iter().any(|g| matches!(g, syn::GenericArgument::Type(t) if is_blanket_self(t, params))),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// マクロの本体を item の並びとして読む (`cfg_rt! { .. }` の中身)。1 つでも読めなければ Err。
+fn parse_items<T: syn::parse::Parse>(input: syn::parse::ParseStream) -> syn::Result<Vec<T>> {
+    let mut v = Vec::new();
+    while !input.is_empty() {
+        v.push(input.parse()?);
+    }
+    Ok(v)
+}
+
+/// impl の中身。`cfg_rt! { fn f() {} }` のように impl の中で method を包むマクロも読む。
+fn walk_impl_items(items: &[syn::ImplItem], ctx: &mut Ctx, out: &mut FileFacts) {
+    for ii in items {
+        match ii {
+            syn::ImplItem::Fn(m) => {
+                let is_test = ctx.in_test || is_test_attrs(&m.attrs);
+                record_symbol(
+                    ctx, out, &m.sig.ident.to_string(), K_METHOD,
+                    classify_vis(&m.vis), m.sig.asyncness.is_some(), is_test,
+                    line_of(m.sig.ident.span()), col_of(m.sig.ident.span()), end_line_of(m), Some(&m.sig), Some(&m.block),
+                    &m.attrs,
+                );
+            }
+            syn::ImplItem::Macro(m) => {
+                if let Ok(inner) = m.mac.parse_body_with(parse_items::<syn::ImplItem>) {
+                    walk_impl_items(&inner, ctx, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub(crate) fn walk_items(items: &[syn::Item], ctx: &mut Ctx, out: &mut FileFacts) {
     for it in items {
         walk_item(it, ctx, out);
@@ -1017,9 +1130,11 @@ pub(crate) fn walk_item(it: &syn::Item, ctx: &mut Ctx, out: &mut FileFacts) {
             // trait 名 = path 末尾 seg、line も同 seg の Ident span (Type の span は trait 不要で避ける)。
             if let Some((_, tpath, _)) = &i.trait_
                 && let Some(seg) = tpath.segments.last() {
+                    let params: HashSet<String> = i.generics.type_params().map(|t| t.ident.to_string()).collect();
                     out.impls.push(RawImpl {
                         trait_name: seg.ident.to_string(),
                         type_name: type_name.clone(),
+                        for_all: matches!(&*i.self_ty, syn::Type::Path(p) if p.qself.is_none() && p.path.get_ident().is_some_and(|id| params.contains(&id.to_string()))),
                         line: line_of(seg.ident.span()),
                     });
                 }
@@ -1033,17 +1148,27 @@ pub(crate) fn walk_item(it: &syn::Item, ctx: &mut Ctx, out: &mut FileFacts) {
                 generic_bounds(&i.generics, &imp)
             };
             let prev_b = std::mem::replace(&mut ctx.impl_bounds, bounds);
-            for ii in &i.items {
-                if let syn::ImplItem::Fn(m) = ii {
-                    let is_test = ctx.in_test || is_test_attrs(&m.attrs);
-                    record_symbol(
-                        ctx, out, &m.sig.ident.to_string(), K_METHOD,
-                        classify_vis(&m.vis), m.sig.asyncness.is_some(), is_test,
-                        line_of(m.sig.ident.span()), col_of(m.sig.ident.span()), end_line_of(m), Some(&m.sig), Some(&m.block),
-                        &m.attrs,
-                    );
+            let tr = i.trait_.as_ref().and_then(|(_, p, _)| {
+                let last = p.segments.last()?.ident.to_string();
+                let imp = |n: &str| ctx.imports.get(n).cloned();
+                Some(TyRef { name: unalias_of(p, last, &imp), root: type_root_of(p, &imp), ..Default::default() })
+            });
+            let prev_tr = std::mem::replace(&mut ctx.impl_trait, tr.unwrap_or_default());
+            let params: HashSet<String> = i.generics.type_params().map(|t| t.ident.to_string()).collect();
+            let blanket = is_blanket_self(&i.self_ty, &params);
+            let prev_bl = std::mem::replace(&mut ctx.impl_blanket, blanket);
+            let self_root = match &*i.self_ty {
+                syn::Type::Path(p) if p.qself.is_none() => {
+                    let imp = |n: &str| ctx.imports.get(n).cloned();
+                    type_root_of(&p.path, &imp)
                 }
-            }
+                _ => String::new(),
+            };
+            let prev_sr = std::mem::replace(&mut ctx.impl_self_root, self_root);
+            walk_impl_items(&i.items, ctx, out);
+            ctx.impl_self_root = prev_sr;
+            ctx.impl_blanket = prev_bl;
+            ctx.impl_trait = prev_tr;
             ctx.container = prev;
             ctx.in_trait_impl = prev_ti;
             ctx.impl_generics = prev_g;
@@ -1054,6 +1179,22 @@ pub(crate) fn walk_item(it: &syn::Item, ctx: &mut Ctx, out: &mut FileFacts) {
         // bench 関数群が丸ごと「誰からも呼ばれていない」に見える (実際そう見えていた)。
         syn::Item::Macro(m) => {
             use syn::punctuated::Punctuated;
+            if m.mac.path.is_ident("macro_rules") {
+                return; // マクロの定義そのもの (中身はパターン)
+            }
+            // `cfg_rt! { pub fn f() {} impl X {..} }` のように item を包むマクロ (tokio は定義の多くがこれ)。
+            // 中身を読まないと定義が見えず、同名の「見えている方」を一意と思い込んで誤確定する。
+            if let Ok(items) = m.mac.parse_body_with(parse_items::<syn::Item>)
+                && !items.is_empty()
+            {
+                // `cfg_not_*! { .. }` は「その機能が無い時」の代用品 (tokio の loom の AtomicU64 等)
+                let neg = m.mac.path.segments.last().is_some_and(|s| s.ident.to_string().starts_with("cfg_not"));
+                let gate = ctx.neg_gate || neg;
+                let prev = std::mem::replace(&mut ctx.neg_gate, gate);
+                walk_items(&items, ctx, out);
+                ctx.neg_gate = prev;
+                return;
+            }
             if let Ok(args) = m.mac.parse_body_with(Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated) {
                 let mut cc = CallCollector { imports: ctx.imports.clone(), ..Default::default() };
                 for e in &args {
@@ -1065,13 +1206,22 @@ pub(crate) fn walk_item(it: &syn::Item, ctx: &mut Ctx, out: &mut FileFacts) {
             }
         }
         syn::Item::Mod(m) => {
+            // 属性の `cfg(not(..))` は代用品とは限らない (tokio の `#[cfg(not(loom))] mod std;` は普段の build の本体)。
+            // 意図が名前に出ている `cfg_not_*!` の中の宣言だけを代用品とみなす。
+            let neg = ctx.neg_gate;
             if let Some((_, inner)) = &m.content {
                 let test = ctx.in_test || m.attrs.iter().any(is_cfg_test);
                 ctx.module.push(m.ident.to_string());
                 let prev = std::mem::replace(&mut ctx.in_test, test);
+                let prev_n = std::mem::replace(&mut ctx.neg_gate, neg);
                 walk_items(inner, ctx, out);
+                ctx.neg_gate = prev_n;
                 ctx.in_test = prev;
                 ctx.module.pop();
+            } else if neg {
+                out.gated_mods.push(m.ident.to_string()); // 子 file は Resolver が path から引く
+            } else {
+                out.live_mods.push(m.ident.to_string());
             }
         }
         _ => {}
@@ -1086,16 +1236,73 @@ pub(crate) struct Resolver<'a> {
     pub(crate) defs: &'a HashMap<String, Vec<SymDef>>,
     local_roots: HashSet<String>,
     fields: FieldTypes,
+    /// file eid → (crate 名, path)。修飾なしの呼び出しが別 crate / 別ターゲットを指していないかを見る。
+    files: HashMap<EntityId, (String, String)>,
+    /// repo で宣言された trait の名前。
+    traits: HashSet<String>,
+    /// 「全ての型 (境界付き) に向けた impl」を持つ trait = 拡張 trait (`impl<R: Buf> BufExt for R {}`)。
+    /// trait 境界の受け手でも、これらが同名 method を宣言していればどちらが呼ばれるか決められない。
+    for_all_traits: HashSet<String>,
+    /// repo で定義した型 / trait の名前。ここに無い型 (re-export された std の Arc 等) への trait 実装の method は、
+    /// その型の inherent method (`Arc::from_raw`) に隠され得るので確定先にしない。
+    types: HashSet<String>,
+    /// `cfg_not_*!` の中で宣言された module の file (= 代用品。普段の build では使われない)。
+    gated_files: HashSet<EntityId>,
+}
+
+/// `use` せずに使える prelude の型。出どころが空 (= use していない) のこれらは std の型 (repo に同名の
+/// `impl .. for Vec<T>` があっても、`v.extend()` は std の Vec::extend)。
+const PRELUDE_TYPES: &[&str] = &["Vec", "String", "Box", "Option", "Result"];
+
+/// tests/ benches/ examples/ の直下の file は、それぞれが別の crate (cargo のターゲット)。
+fn target_root_file(path: &str) -> bool {
+    Path::new(path).parent().and_then(|d| d.file_name()).and_then(|d| d.to_str()).is_some_and(|d| matches!(d, "tests" | "benches" | "examples"))
 }
 impl<'a> Resolver<'a> {
     /// `rs_paths` = index 対象の .rs (module 名 = file 名 / mod.rs の dir 名を内側に数える)。
-    pub(crate) fn new<'p>(defs: &'a HashMap<String, Vec<SymDef>>, rs_paths: impl Iterator<Item = &'p str>, fields: FieldTypes) -> Self {
+    /// `file_t` = index 済みの file 表 (crate 名 / path / 言語)。
+    pub(crate) fn new(defs: &'a HashMap<String, Vec<SymDef>>, file_t: &Table, fields: FieldTypes, for_all_traits: HashSet<String>) -> Self {
+        let mut files: HashMap<EntityId, (String, String)> = HashMap::new();
+        for e in file_t.where_eq("lang", LANG_RUST).find().unwrap_or_default() {
+            let er = file_t.entity(e);
+            files.insert(e, (crate_key(&txt(er.get("crate_"))), txt(er.get("path"))));
+        }
+        let traits: HashSet<String> = defs.iter().filter(|(_, v)| v.iter().any(|d| d.kind == K_TRAIT)).map(|(k, _)| k.clone()).collect();
+        let types: HashSet<String> =
+            defs.iter().filter(|(_, v)| v.iter().any(|d| matches!(d.kind, K_STRUCT | K_ENUM | K_TRAIT))).map(|(k, _)| k.clone()).collect();
+        // `cfg_not_*!` の中で宣言された `mod x;` → その file (親が mod.rs / lib.rs / main.rs なら同じ dir、それ以外は
+        // 親の名前の dir の下) とその下の全 file。
+        let mut gated_dirs: Vec<PathBuf> = Vec::new();
+        let mut gated_paths: HashSet<PathBuf> = HashSet::new();
+        for e in file_t.where_eq("lang", LANG_RUST).find().unwrap_or_default() {
+            let er = file_t.entity(e);
+            let mods = txt(er.get("gated_mods"));
+            if mods.is_empty() {
+                continue;
+            }
+            let p = PathBuf::from(txt(er.get("path")));
+            let (Some(dir), Some(stem)) = (p.parent(), p.file_stem().and_then(|s| s.to_str())) else { continue };
+            let base = if matches!(stem, "mod" | "lib" | "main") { dir.to_path_buf() } else { dir.join(stem) };
+            for m in mods.split(' ').filter(|m| !m.is_empty()) {
+                gated_paths.insert(base.join(format!("{m}.rs")));
+                gated_dirs.push(base.join(m));
+            }
+        }
+        let gated_files: HashSet<EntityId> = files
+            .iter()
+            .filter(|(_, (_, p))| {
+                let p = Path::new(p);
+                gated_paths.contains(p) || gated_dirs.iter().any(|d| p.starts_with(d))
+            })
+            .map(|(e, _)| *e)
+            .collect();
+        let rs_paths: Vec<String> = files.values().map(|(_, p)| p.clone()).collect();
         let mut local_roots: HashSet<String> = ["crate", "self", "super", "Self"].iter().map(|s| s.to_string()).collect();
         for d in defs.values().flatten() {
             local_roots.insert(crate_key(&d.crate_));
             local_roots.extend(d.module.split("::").filter(|m| !m.is_empty()).map(str::to_string));
         }
-        for p in rs_paths {
+        for p in &rs_paths {
             let p = Path::new(p);
             match p.file_stem().and_then(|s| s.to_str()) {
                 Some("mod") => {
@@ -1109,10 +1316,57 @@ impl<'a> Resolver<'a> {
                 None => {}
             }
         }
-        Resolver { defs, local_roots, fields }
+        // std / core / alloc は同名の module があっても常に外 (`use std::time::Instant` の std は標準ライブラリ。
+        // tokio の loom/std/ module を内側と数えて Instant::now を自前に確定した実例)。
+        for ext in ["std", "core", "alloc"] {
+            local_roots.remove(ext);
+        }
+        Resolver { defs, local_roots, fields, files, traits, for_all_traits, types, gated_files }
     }
     fn is_local(&self, root: &str) -> bool {
         root.is_empty() || self.local_roots.contains(&crate_key(root))
+    }
+    /// 型の出どころが内側か。`use` していない prelude の型名 (Vec / String / ..) は std。
+    fn is_local_ty(&self, root: &str, name: &str) -> bool {
+        self.is_local(root) && !(root.is_empty() && PRELUDE_TYPES.contains(&name))
+    }
+    /// 確定先を rust-analyzer (= bake 済み kenning) の流儀に揃える。trait 実装の method を
+    /// - method 呼び `x.f()` で、具体的な型への impl なら → その impl の method のまま
+    /// - method 呼びでも型引数を含む型への impl (`impl<P> Tr for Pin<P>`) や、path 呼び `T::f()` なら → trait の宣言
+    ///   (bench infer で RA と突き合わせた挙動。`BinaryDetection::default()` は std の Default::default を指す)
+    ///
+    /// trait が repo の外なら Err (= 呼び先は repo の外)、宣言を 1 つに絞れなければ Ok(None)。
+    fn trait_decl_of(&self, d: &SymDef, name: &str, path_call: bool) -> Result<Option<EntityId>, ()> {
+        if !d.impl_trait.name.is_empty() && !self.types.contains(&d.container) {
+            return Ok(None); // repo で定義していない型への trait 実装 — その型の inherent method が先に当たり得る
+        }
+        if d.impl_trait.name.is_empty() || !(path_call || d.impl_blanket) {
+            return Ok(Some(d.eid));
+        }
+        if !self.is_local(&d.impl_trait.root) {
+            return Err(());
+        }
+        let decls: Vec<&SymDef> = self
+            .defs
+            .get(name)
+            .map(|v| v.iter().filter(|x| x.kind == K_METHOD && x.container == d.impl_trait.name && x.impl_trait.name.is_empty()).collect())
+            .unwrap_or_default();
+        Ok(match decls.as_slice() {
+            [x] => Some(x.eid),
+            _ => None,
+        })
+    }
+    /// 修飾なしの `f()` から定義 `d` に届くか: 別の crate の fn は `use` していなければ呼べない。
+    /// tests/ benches/ examples/ の直下の file は互いに別の crate (benches の `iter()` を tokio-stream の
+    /// iter に確定した実例)。
+    fn reachable_bare(&self, cs: &CallSite, d: &SymDef) -> bool {
+        let (Some((caller_crate, caller_path)), Some((def_crate, def_path))) = (self.files.get(&cs.file), self.files.get(&d.file)) else {
+            return true; // file の情報が無い (旧 index) なら従来どおり
+        };
+        if caller_path != def_path && target_root_file(caller_path) && target_root_file(def_path) {
+            return false;
+        }
+        caller_crate == def_crate || crate_key(&cs.qual_root) == *def_crate
     }
     /// 型 `t` の関数 `f` (method なら `method` = true) の戻り値。ちょうど 1 つに絞れて、戻り値の出どころが
     /// 内側の時だけ。`Self` (と `Result<Self>` の Self) は t に読み替える。
@@ -1126,7 +1380,7 @@ impl<'a> Resolver<'a> {
         if r.name == "Self" {
             r.name = t.to_string();
             r.root = String::new();
-        } else if !self.is_local(&r.root) && !matches!(r.name.as_str(), "Result" | "Option") {
+        } else if !self.is_local_ty(&r.root, &r.name) && !matches!(r.name.as_str(), "Result" | "Option") {
             return None; // repo の外の型 (次の段の method は repo に無い)
         }
         if r.arg == "Self" {
@@ -1179,6 +1433,12 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
     let Some(all_cands) = defs.get(&cs.name) else {
         return (None, R_EXTERNAL); // 呼べる同名定義が index に無い = std / 依存 crate (解決不能)
     };
+    // `cfg_not_*!` の中の定義 (代用品) は確定先にしない。普段の build では使われず、同名の本物 (多くは std) がある。
+    let live: Vec<SymDef> = all_cands.iter().filter(|d| !d.gated && !rz.gated_files.contains(&d.file)).cloned().collect();
+    if live.len() < all_cands.len() && live.iter().all(|d| d.kind != K_FN && d.kind != K_METHOD) {
+        return (None, R_AMBIG);
+    }
+    let all_cands = &live;
     if cs.in_macro {
         // 字句走査の当て推量なので確定させない。呼べる物の名前でなければ記録もしない。
         if !all_cands.iter().any(|d| d.kind == K_FN || d.kind == K_METHOD) {
@@ -1218,8 +1478,12 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
         let target = if q == "Self" { cs.caller_container.as_str() } else { q };
         // (a) container 一致 = Type の associated fn / method。
         let by_container: Vec<&SymDef> = cands.iter().copied().filter(|d| d.container == target).collect();
-        if by_container.len() == 1 {
-            return (Some(by_container[0].eid), R_QUALIFIED);
+        if let [d] = by_container.as_slice() {
+            return match rz.trait_decl_of(d, &cs.name, true) {
+                Ok(Some(e)) => (Some(e), R_QUALIFIED),
+                Ok(None) => (None, R_AMBIG),
+                Err(()) => (None, R_EXTERNAL),
+            };
         }
         if by_container.len() > 1 {
             return (None, R_AMBIG); // 同名 Type が別 crate に複数 → 絞れない
@@ -1254,15 +1518,34 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
         if cs.self_recv {
             let by_self: Vec<&SymDef> =
                 cands.iter().copied().filter(|d| d.container == cs.caller_container).collect();
-            if by_self.len() == 1 {
-                return (Some(by_self[0].eid), R_UNIQUE);
+            // 外の型への impl の中の `self.f()` は std の inherent method が先に当たる (`impl Kill for StdChild`)
+            if !rz.is_local_ty(&cs.recv.root, &cs.caller_container) {
+                return (None, R_METHOD);
+            }
+            if let [d] = by_self.as_slice() {
+                return match rz.trait_decl_of(d, &cs.name, false) {
+                    Ok(Some(e)) => (Some(e), R_UNIQUE),
+                    Ok(None) => (None, R_METHOD),
+                    Err(()) => (None, R_EXTERNAL),
+                };
             }
         }
         // 受け手の型がソースに書いてあれば、その型の同名 method がちょうど 1 つの時だけ確定する。
         if let Some(t) = recv_type_of(cs, rz) {
+            // trait 境界の受け手 (t が trait): 同名 method を宣言する**拡張 trait** (全型向けの impl を持つ) が
+            // あれば、どちらが呼ばれるかは境界の外で決まる → 推定しない (AsyncBufRead / AsyncBufReadExt の consume)
+            if rz.traits.contains(&t)
+                && cands.iter().any(|d| d.container != t && d.impl_trait.name.is_empty() && rz.for_all_traits.contains(&d.container))
+            {
+                return (None, R_METHOD);
+            }
             let by_ty: Vec<&SymDef> = cands.iter().copied().filter(|d| d.container == t).collect();
-            if by_ty.len() == 1 {
-                return (Some(by_ty[0].eid), R_TYPED);
+            if let [d] = by_ty.as_slice() {
+                return match rz.trait_decl_of(d, &cs.name, false) {
+                    Ok(Some(e)) => (Some(e), R_TYPED),
+                    Ok(None) => (None, R_METHOD),
+                    Err(()) => (None, R_EXTERNAL),
+                };
             }
         }
         return (None, R_METHOD); // 候補どまり (名前一致は残るので `callers` には出る)
@@ -1276,7 +1559,8 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
     let fns: Vec<&SymDef> = cands.iter().copied().filter(|d| d.kind != K_METHOD).collect();
     // 同名がちょうど 1 つなら一意解決、複数なら諦める。
     match fns.as_slice() {
-        [d] => (Some(d.eid), R_UNIQUE),
+        [d] if rz.reachable_bare(cs, d) => (Some(d.eid), R_UNIQUE),
+        [_] => (None, R_AMBIG),
         [] => (None, R_EXTERNAL),
         _ => (None, R_AMBIG),
     }
@@ -1286,7 +1570,7 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
 /// たどる。どの段でも「ちょうど 1 つに絞れる・出どころが repo の内側」でなければ None (推定しない)。
 fn recv_type_of(cs: &CallSite, rz: &Resolver) -> Option<String> {
     let r = &cs.recv;
-    if r.ty.is_empty() || !rz.is_local(&r.root) {
+    if r.ty.is_empty() || !rz.is_local_ty(&r.root, &r.ty) {
         return None;
     }
     let mut t = if r.ty == "Self" { cs.caller_container.clone() } else { r.ty.clone() };
@@ -1310,7 +1594,7 @@ fn recv_type_of(cs: &CallSite, rz: &Resolver) -> Option<String> {
             last_ret = None;
             let tys = rz.fields.get(&(t.clone(), f.to_string()))?;
             let [ty] = tys.as_slice() else { return None }; // 同名 struct が複数 → 絞れない
-            if ty.name.is_empty() || !rz.is_local(&ty.root) {
+            if ty.name.is_empty() || !rz.is_local_ty(&ty.root, &ty.name) {
                 return None;
             }
             t = ty.name.clone();
@@ -1322,7 +1606,9 @@ fn recv_type_of(cs: &CallSite, rz: &Resolver) -> Option<String> {
             return None;
         }
     }
-    Some(t)
+    // 連鎖の最後が戻り値の Result / Option / Vec 等 (`?` を当てていない) なら std の型
+    let ext_tail = last_ret.as_ref().is_some_and(|r| !rz.is_local_ty(&r.root, &r.name));
+    (!ext_tail).then_some(t)
 }
 
 /// `?` を当てた後の型: 戻り値が `Result<T, _>` / `Option<T>` の T (出どころが内側の時だけ)。
@@ -1378,6 +1664,10 @@ pub(crate) fn build_defs_from_table(sym_t: &Table) -> HashMap<String, Vec<SymDef
             module: txt(er.get("module")),
             crate_: txt(er.get("crate_")),
             ret: TyRef { name: txt(er.get("ret_ty")), root: txt(er.get("ret_root")), arg: txt(er.get("ret_arg")), arg_root: txt(er.get("ret_arg_root")) },
+            impl_trait: TyRef { name: txt(er.get("impl_trait")), root: txt(er.get("impl_trait_root")), ..Default::default() },
+            impl_blanket: num(er.get("impl_blanket")) == 1,
+            file: ref_of(er.get("file")),
+            gated: num(er.get("gated")) == 1,
         });
     }
     defs
@@ -1458,12 +1748,14 @@ pub(crate) fn file_imports(items: &[syn::Item]) -> HashMap<String, (String, Stri
 
 pub(crate) fn extract_file(src: &str) -> Option<FileFacts> {
     let file = syn::parse_file(src).ok()?;
-    let mut out = FileFacts { loc: src.lines().count() as u32, hash: hash_u32(src), syms: Vec::new(), impls: Vec::new(), item_calls: Vec::new(), fields: Vec::new() };
+    let mut out = FileFacts { loc: src.lines().count() as u32, hash: hash_u32(src), syms: Vec::new(), impls: Vec::new(), item_calls: Vec::new(), fields: Vec::new(), gated_mods: Vec::new(), live_mods: Vec::new() };
     // file 冒頭の inner attribute (`#![cfg(test)]`) は file 全体に効く。per-file parse では親の
     // `#[cfg(test)] mod x;` が見えないので、これを見ないと test 専用 file の helper が
     // 「test でない symbol」として出てしまう (`tests <name>` と `search test:1` が取りこぼす)。
-    let mut ctx = Ctx { module: Vec::new(), in_test: file.attrs.iter().any(is_cfg_test), container: String::new(), in_trait_impl: false, impl_generics: Vec::new(), impl_bounds: HashMap::new(), imports: std::rc::Rc::new(file_imports(&file.items)) };
+    let mut ctx = Ctx { module: Vec::new(), in_test: file.attrs.iter().any(is_cfg_test), container: String::new(), in_trait_impl: false, impl_trait: TyRef::default(), impl_blanket: false, impl_self_root: String::new(), neg_gate: false, impl_generics: Vec::new(), impl_bounds: HashMap::new(), imports: std::rc::Rc::new(file_imports(&file.items)) };
     walk_items(&file.items, &mut ctx, &mut out);
+    let live = std::mem::take(&mut out.live_mods);
+    out.gated_mods.retain(|m| !live.contains(m)); // 両方の枝で宣言 = 出し分けであって代用品ではない
     Some(out)
 }
 
