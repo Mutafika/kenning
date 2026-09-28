@@ -262,7 +262,9 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         .number("lang")
         .number("loc")
         .number("hash") // 内容 fingerprint (増分 index の変更検知)
-        .tag("gated_mods") // 否定の cfg で宣言した子 module 名 (空白区切り)
+        .tag("gated_mods") // cfg_not_*! の中で宣言した子 module (空白区切り、`name` / `name@path`)
+        .tag("cond_mods") // #[cfg(..)] 付きで宣言した子 module (同上)
+        .tag("mod_names") // 宣言した子 module の名前 (#[path] で file 名と違っても repo の内側の名前)
         .with_capacity(file_cap)
         .build()
         .unwrap();
@@ -286,7 +288,8 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         .tag("impl_trait") // trait 実装の method ならその trait (確定先を trait の宣言に揃える)
         .tag("impl_trait_root")
         .number("impl_blanket") // 型引数を含む型への trait 実装 (method 呼びでも確定先は trait の宣言)
-        .number("gated") // 否定の cfg の中の定義 (代用品。確定先にしない)
+        .number("gated") // cfg_not_*! の中の定義 (代用品。確定先にしない)
+        .number("cond") // cfg 付きの定義 (別の file からは確定しない)
         .tag("attrs") // 正規化済み属性 (`allow(dead_code) inline`)。facet `attr:` の材料
         .tag("doc") // doc コメント 1 行目 (無ければ ""。def/outline で sig と並べて出す)
         .number("line")

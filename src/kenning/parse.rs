@@ -240,6 +240,9 @@ pub(crate) struct CallCollector {
     /// 自作マクロ (repo の macro_rules 等) の引数の中か。トークンを組み替え得る (`delegate_call!(self.f())` の
     /// self は中身の値に書き換わる) ので、受け手に基づく確定をしない。std の式マクロは中身をそのまま使う。
     in_user_macro: bool,
+    /// `self: Pin<&mut Self>` / `self: Box<Self>` のように受け手の型を明示した fn の中か。`self.f()` は
+    /// 包んでいる型 (Pin 等) の method に先に当たる (`self.get_mut()` は Pin::get_mut)。
+    self_wrapped: bool,
     /// 囲む impl の自分の型の出どころ (`impl Kill for StdChild` の StdChild が std なら "std")。
     /// 外の型への impl の中の `self.f()` は、std の inherent method が trait の method より優先される。
     self_root: String,
@@ -350,7 +353,12 @@ impl CallCollector {
                 syn::Member::Named(id) => step(self.expr_recv(&f.base)?, format!("f:{id}")),
                 syn::Member::Unnamed(_) => None,
             },
-            syn::Expr::MethodCall(m) => step(self.expr_recv(&m.receiver)?, format!("m:{}", m.method)),
+            syn::Expr::MethodCall(m) => {
+                if self.self_wrapped && matches!(&*m.receiver, syn::Expr::Path(p) if p.path.is_ident("self")) {
+                    return None; // `self: Pin<&mut Self>` の `self.m()` は Pin の method に先に当たり得る
+                }
+                step(self.expr_recv(&m.receiver)?, format!("m:{}", m.method))
+            }
             syn::Expr::Reference(r) => self.expr_recv(&r.expr),
             // `*x` — 変数 / field の参照外しは method 呼びの自動参照外しと同じ先に届く。ただし `*self` は別:
             // `impl Matcher for &M` / `impl Sink for Box<S>` の中では Self 自体が参照 / ポインタで、外すと中身
@@ -360,6 +368,8 @@ impl CallCollector {
             }
             syn::Expr::Paren(p) => self.expr_recv(&p.expr),
             syn::Expr::Group(g) => self.expr_recv(&g.expr),
+            // `self.field` は Pin<&mut Self> 越しでも Self の field に届く (自動参照外し)。当たり得ないのは
+            // `self.m()` の直接の method 呼びだけ (下の MethodCall で止める)。
             syn::Expr::Path(p) if p.path.is_ident("self") => Some(Recv { ty: "Self".into(), root: self.self_root.clone(), ..Default::default() }),
             syn::Expr::Path(p) => p.path.get_ident().and_then(|i| self.lookup(&i.to_string())),
             _ => None,
@@ -460,10 +470,11 @@ impl<'ast> Visit<'ast> for CallCollector {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         // 受け手の型は syn だけでは不明 (→ 候補どまり)。**例外は `self.f()`** — 受け手は
         // 今いる impl の型なので、その container の同名 method に健全に確定できる。
-        let self_recv = !self.in_user_macro && matches!(&*node.receiver, syn::Expr::Path(p) if p.path.is_ident("self"));
+        let self_recv = !self.in_user_macro && !self.self_wrapped && matches!(&*node.receiver, syn::Expr::Path(p) if p.path.is_ident("self"));
         // それ以外は、受け手が束縛名 `x` で、その型がソースに書いてある時だけ手掛かりを持つ。
-        let recv = if self.in_user_macro {
-            Recv::default()
+        let bare_self = matches!(&*node.receiver, syn::Expr::Path(p) if p.path.is_ident("self"));
+        let recv = if self.in_user_macro || (bare_self && self.self_wrapped) {
+            Recv::default() // `self: Pin<&mut Self>` の `self.f()` は Pin の method に先に当たり得る
         } else if self_recv {
             Recv { root: self.self_root.clone(), ..Default::default() }
         } else {
@@ -498,6 +509,15 @@ impl<'ast> Visit<'ast> for CallCollector {
     }
     fn visit_block(&mut self, node: &'ast syn::Block) {
         self.scopes.push(HashMap::new());
+        // ブロックの中の `fn` は宣言より前からも見える。index していない (関数の中の関数) ので、同名の外の fn に
+        // 確定しないよう、先にローカルの束縛として登録する (tokio の tests の中の `fn iter()` を tokio_stream::iter
+        // に確定していた)。
+        for st in &node.stmts {
+            if let syn::Stmt::Item(syn::Item::Fn(f)) = st {
+                self.locals.insert(f.sig.ident.to_string());
+                self.bind(f.sig.ident.to_string(), None);
+            }
+        }
         visit::visit_block(self, node);
         self.scopes.pop();
     }
@@ -563,6 +583,7 @@ impl<'ast> Visit<'ast> for CallCollector {
                 imports: self.imports.clone(),
                 fn_imports: self.fn_imports.clone(),
                 self_root: self.self_root.clone(),
+                self_wrapped: self.self_wrapped,
                 in_user_macro: self.in_user_macro || !STD_EXPR_MACROS.contains(&name.as_str()),
                 ..Default::default()
             };
@@ -590,7 +611,8 @@ pub(crate) struct SymDef {
     impl_trait: TyRef, // trait 実装の method ならその trait (name / root)
     impl_blanket: bool, // 型引数を含む型への trait 実装
     file: EntityId,     // 定義のある file (別 crate / 別ターゲットの判定)
-    gated: bool,        // 否定の cfg の中の定義 (確定先にしない)
+    gated: bool,        // `cfg_not_*!` の中の定義 (確定先にしない)
+    cond: bool,         // cfg 付きの定義 (別の file からは確定しない)
 }
 
 /// Cargo の crate 名は `-`、Rust path は `_`。突き合わせ前に正規化する。
@@ -648,6 +670,7 @@ pub(crate) struct Ctx {
     impl_blanket: bool,    // その impl の自分の型が型引数そのもの / それを包む参照・ポインタ (`impl<P> Tr for Pin<P>` / `for &M`)
     impl_self_root: String, // その impl の自分の型の出どころ (外の型への impl を見分ける)
     neg_gate: bool,        // `cfg_not_*! { .. }` の中 = 「その機能が無い時」の代用品の定義
+    cond: bool,            // cfg 付きの inline module / impl の中 (build の設定で有無が変わる定義)
     impl_generics: Vec<String>, // 囲む impl の型引数 (受け手の型推定で具体型と区別する)
     impl_bounds: HashMap<String, TyRef>, // 囲む impl の型引数の単一 trait 境界
     imports: std::rc::Rc<HashMap<String, (String, String)>>, // この file の `use` (名前 → (出どころ, 元の名前))
@@ -670,6 +693,11 @@ pub(crate) struct FileFacts {
     /// cfg_not の外で宣言された子 module 名。同じ名前が両方の枝にあれば (`cfg_rt! { mod runtime; }` と
     /// `cfg_not_rt! { mod runtime; }`) 代用品ではなく同じ module の出し分けなので除外しない。
     live_mods: Vec<String>,
+    /// `#[cfg(..)] mod x;` (cfg(test) を除く) — 条件付きの module。外から (cfg 付きの re-export 越しに) 呼ぶと
+    /// build の設定次第で別の実体に切り替わり得る (tokio の parking_lot::Condvar ↔ std の Condvar)。
+    pub(crate) cond_mods: Vec<String>,
+    /// この file で宣言した子 module の名前 (`#[path]` で file 名と違う名前でも repo の内側の名前)。
+    pub(crate) mod_names: Vec<String>,
 }
 
 /// 1 定義 + その本体の呼び出し箇所。
@@ -691,7 +719,8 @@ pub(crate) struct RawSym {
     pub(crate) ret: TyRef,    // fn / method の戻り値の型 (連鎖 `x.a().b()` をたどる材料。無ければ空)
     pub(crate) impl_trait: TyRef, // trait 実装の method ならその trait (確定先を RA の流儀に揃える)
     pub(crate) impl_blanket: bool, // 型引数を含む型への trait 実装 (method 呼びでも RA は trait の宣言を指す)
-    pub(crate) gated: bool,        // 否定の cfg の中の定義 (代用品。確定先にしない)
+    pub(crate) gated: bool,        // `cfg_not_*!` の中の定義 (代用品。確定先にしない)
+    pub(crate) cond: bool,         // cfg 付き (build の設定で有無が変わる)。別の file からは確定しない
     pub(crate) calls: Vec<RawCall>,
 }
 
@@ -747,6 +776,7 @@ pub(crate) fn record_symbol(
         // 引数名は signature 側にあるので、body だけ歩くと束縛が漏れる。
         // (tokio の `registration` のような仮引数が「同名関数への参照」に化けていた)
         if let Some(s) = sig {
+            cc.self_wrapped = matches!(s.inputs.first(), Some(syn::FnArg::Receiver(r)) if r.colon_token.is_some());
             cc.generics.extend(s.generics.type_params().map(|t| t.ident.to_string()));
             let fb = {
                 let imp = |n: &str| ctx.imports.get(n).cloned();
@@ -785,6 +815,7 @@ pub(crate) fn record_symbol(
         impl_trait: if kind == K_METHOD { ctx.impl_trait.clone() } else { TyRef::default() },
         impl_blanket: kind == K_METHOD && ctx.impl_blanket,
         gated: ctx.neg_gate,
+        cond: ctx.cond || attrs.iter().any(is_cfg_cond),
         calls,
     });
 }
@@ -801,6 +832,8 @@ pub(crate) fn insert_file_facts(file_t: &Table, sym_t: &Table, acc: &mut Acc, ro
         .set("loc", facts.loc)
         .set("hash", facts.hash)
         .set("gated_mods", facts.gated_mods.join(" ").as_str())
+        .set("cond_mods", facts.cond_mods.join(" ").as_str())
+        .set("mod_names", facts.mod_names.join(" ").as_str())
         .commit()
         .unwrap();
     let rel_path = rel_of(path_s, root);
@@ -834,6 +867,7 @@ pub(crate) fn insert_file_facts(file_t: &Table, sym_t: &Table, acc: &mut Acc, ro
             .set("impl_trait_root", s.impl_trait.root.as_str())
             .set("impl_blanket", s.impl_blanket as u32)
             .set("gated", s.gated as u32)
+            .set("cond", s.cond as u32)
             .set("doc", s.doc.as_str())
         .set("attrs", s.attrs.as_str())
             .set("line", s.line)
@@ -841,7 +875,7 @@ pub(crate) fn insert_file_facts(file_t: &Table, sym_t: &Table, acc: &mut Acc, ro
             .commit()
             .unwrap();
         // 名前解決の突き合わせ先として登録 (syn 用)。
-        acc.defs.entry(s.name).or_default().push(SymDef { eid: sym_eid, kind: s.kind, container: s.container.clone(), module: s.module, crate_: crate_name.clone(), ret: s.ret.clone(), impl_trait: s.impl_trait.clone(), impl_blanket: s.impl_blanket, file: file_eid, gated: s.gated });
+        acc.defs.entry(s.name).or_default().push(SymDef { eid: sym_eid, kind: s.kind, container: s.container.clone(), module: s.module, crate_: crate_name.clone(), ret: s.ret.clone(), impl_trait: s.impl_trait.clone(), impl_blanket: s.impl_blanket, file: file_eid, gated: s.gated, cond: s.cond });
         // SCIP symbol → 自 index の eid (call の正確解決に使う)。
         // **衝突したら 0 (曖昧) にする**: RA の symbol 文字列は test / example / bench の各ターゲットで
         // 同じになることがあり (enchudb には同名 `cleanup` が 108 個)、上書きすると
@@ -1018,6 +1052,40 @@ pub(crate) fn is_blanket_self(ty: &syn::Type, params: &HashSet<String>) -> bool 
     }
 }
 
+/// file module 宣言の記録形: `name`、`#[path = "p"]` 付きなら `name@p` (両方の枝で同じ名前でも別 file を指す:
+/// tokio の `#[path = "atomic_u64_as_mutex.rs"] mod imp;` と `#[path = "atomic_u64_native.rs"] mod imp;`)。
+fn mod_decl_entry(m: &syn::ItemMod) -> String {
+    let path = m.attrs.iter().find(|a| a.path().is_ident("path")).and_then(|a| match &a.meta {
+        syn::Meta::NameValue(nv) => match &nv.value {
+            syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => Some(s.value()),
+            _ => None,
+        },
+        _ => None,
+    });
+    match path {
+        Some(p) => format!("{}@{p}", m.ident),
+        None => m.ident.to_string(),
+    }
+}
+
+/// `#[cfg(..)]` のうち cfg(test) 以外 (= build の設定で有無が変わる)。
+pub(crate) fn is_cfg_cond(a: &syn::Attribute) -> bool {
+    a.path().is_ident("cfg") && !is_cfg_test(a)
+}
+
+/// module 宣言 (`mod_decl_entry` の形) → (その file, その下の dir)。`decl` = 宣言している file。
+/// 親が mod.rs / lib.rs / main.rs なら同じ dir、それ以外は親の名前の dir の下。`#[path]` は宣言している file の dir から。
+pub(crate) fn mod_targets(decl: &Path, entry: &str) -> Option<(PathBuf, PathBuf)> {
+    let dir = decl.parent()?;
+    if let Some((_, p)) = entry.split_once('@') {
+        let f = dir.join(p);
+        return Some((f.clone(), f.with_extension("")));
+    }
+    let stem = decl.file_stem()?.to_str()?;
+    let base = if matches!(stem, "mod" | "lib" | "main") { dir.to_path_buf() } else { dir.join(stem) };
+    Some((base.join(format!("{entry}.rs")), base.join(entry)))
+}
+
 /// マクロの本体を item の並びとして読む (`cfg_rt! { .. }` の中身)。1 つでも読めなければ Err。
 fn parse_items<T: syn::parse::Parse>(input: syn::parse::ParseStream) -> syn::Result<Vec<T>> {
     let mut v = Vec::new();
@@ -1165,7 +1233,10 @@ pub(crate) fn walk_item(it: &syn::Item, ctx: &mut Ctx, out: &mut FileFacts) {
                 _ => String::new(),
             };
             let prev_sr = std::mem::replace(&mut ctx.impl_self_root, self_root);
+            let c = ctx.cond || i.attrs.iter().any(is_cfg_cond);
+            let prev_c = std::mem::replace(&mut ctx.cond, c);
             walk_impl_items(&i.items, ctx, out);
+            ctx.cond = prev_c;
             ctx.impl_self_root = prev_sr;
             ctx.impl_blanket = prev_bl;
             ctx.impl_trait = prev_tr;
@@ -1206,22 +1277,33 @@ pub(crate) fn walk_item(it: &syn::Item, ctx: &mut Ctx, out: &mut FileFacts) {
             }
         }
         syn::Item::Mod(m) => {
+            let entry = mod_decl_entry(m);
+            out.mod_names.push(m.ident.to_string());
             // 属性の `cfg(not(..))` は代用品とは限らない (tokio の `#[cfg(not(loom))] mod std;` は普段の build の本体)。
             // 意図が名前に出ている `cfg_not_*!` の中の宣言だけを代用品とみなす。
             let neg = ctx.neg_gate;
+            let cond = m.attrs.iter().any(is_cfg_cond);
             if let Some((_, inner)) = &m.content {
                 let test = ctx.in_test || m.attrs.iter().any(is_cfg_test);
                 ctx.module.push(m.ident.to_string());
                 let prev = std::mem::replace(&mut ctx.in_test, test);
                 let prev_n = std::mem::replace(&mut ctx.neg_gate, neg);
+                let c = ctx.cond || cond;
+                let prev_c = std::mem::replace(&mut ctx.cond, c);
                 walk_items(inner, ctx, out);
+                ctx.cond = prev_c;
                 ctx.neg_gate = prev_n;
                 ctx.in_test = prev;
                 ctx.module.pop();
-            } else if neg {
-                out.gated_mods.push(m.ident.to_string()); // 子 file は Resolver が path から引く
             } else {
-                out.live_mods.push(m.ident.to_string());
+                if neg {
+                    out.gated_mods.push(entry.clone()); // 子 file は Resolver が path から引く
+                } else {
+                    out.live_mods.push(entry.clone());
+                }
+                if cond || ctx.cond {
+                    out.cond_mods.push(entry);
+                }
             }
         }
         _ => {}
@@ -1248,6 +1330,8 @@ pub(crate) struct Resolver<'a> {
     types: HashSet<String>,
     /// `cfg_not_*!` の中で宣言された module の file (= 代用品。普段の build では使われない)。
     gated_files: HashSet<EntityId>,
+    /// cfg 付きで宣言された module の file → その範囲の番号。範囲の外からは確定しない。
+    cond_region: HashMap<EntityId, usize>,
 }
 
 /// `use` せずに使える prelude の型。出どころが空 (= use していない) のこれらは std の型 (repo に同名の
@@ -1270,37 +1354,32 @@ impl<'a> Resolver<'a> {
         let traits: HashSet<String> = defs.iter().filter(|(_, v)| v.iter().any(|d| d.kind == K_TRAIT)).map(|(k, _)| k.clone()).collect();
         let types: HashSet<String> =
             defs.iter().filter(|(_, v)| v.iter().any(|d| matches!(d.kind, K_STRUCT | K_ENUM | K_TRAIT))).map(|(k, _)| k.clone()).collect();
-        // `cfg_not_*!` の中で宣言された `mod x;` → その file (親が mod.rs / lib.rs / main.rs なら同じ dir、それ以外は
-        // 親の名前の dir の下) とその下の全 file。
-        let mut gated_dirs: Vec<PathBuf> = Vec::new();
-        let mut gated_paths: HashSet<PathBuf> = HashSet::new();
+        // module 宣言 → 対象の file / dir (mod_targets)。`cfg_not_*!` の中の宣言 = 代用品、cfg 付きの宣言 = 条件付き。
+        let mut gated_targets: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut cond_targets: Vec<(PathBuf, PathBuf)> = Vec::new();
         for e in file_t.where_eq("lang", LANG_RUST).find().unwrap_or_default() {
             let er = file_t.entity(e);
-            let mods = txt(er.get("gated_mods"));
-            if mods.is_empty() {
-                continue;
-            }
             let p = PathBuf::from(txt(er.get("path")));
-            let (Some(dir), Some(stem)) = (p.parent(), p.file_stem().and_then(|s| s.to_str())) else { continue };
-            let base = if matches!(stem, "mod" | "lib" | "main") { dir.to_path_buf() } else { dir.join(stem) };
-            for m in mods.split(' ').filter(|m| !m.is_empty()) {
-                gated_paths.insert(base.join(format!("{m}.rs")));
-                gated_dirs.push(base.join(m));
+            for (col, out) in [("gated_mods", &mut gated_targets), ("cond_mods", &mut cond_targets)] {
+                for m in txt(er.get(col)).split(' ').filter(|m| !m.is_empty()) {
+                    out.extend(mod_targets(&p, m));
+                }
             }
         }
-        let gated_files: HashSet<EntityId> = files
-            .iter()
-            .filter(|(_, (_, p))| {
-                let p = Path::new(p);
-                gated_paths.contains(p) || gated_dirs.iter().any(|d| p.starts_with(d))
-            })
-            .map(|(e, _)| *e)
-            .collect();
+        let region_of = |p: &str, ts: &[(PathBuf, PathBuf)]| {
+            let p = Path::new(p);
+            ts.iter().position(|(f, d)| p == f || p.starts_with(d))
+        };
+        let gated_files: HashSet<EntityId> = files.iter().filter(|(_, (_, p))| region_of(p, &gated_targets).is_some()).map(|(e, _)| *e).collect();
+        let cond_region: HashMap<EntityId, usize> = files.iter().filter_map(|(e, (_, p))| region_of(p, &cond_targets).map(|r| (*e, r))).collect();
         let rs_paths: Vec<String> = files.values().map(|(_, p)| p.clone()).collect();
         let mut local_roots: HashSet<String> = ["crate", "self", "super", "Self"].iter().map(|s| s.to_string()).collect();
         for d in defs.values().flatten() {
             local_roots.insert(crate_key(&d.crate_));
             local_roots.extend(d.module.split("::").filter(|m| !m.is_empty()).map(str::to_string));
+        }
+        for e in file_t.where_eq("lang", LANG_RUST).find().unwrap_or_default() {
+            local_roots.extend(txt(file_t.entity(e).get("mod_names")).split(' ').filter(|m| !m.is_empty()).map(str::to_string));
         }
         for p in &rs_paths {
             let p = Path::new(p);
@@ -1321,7 +1400,22 @@ impl<'a> Resolver<'a> {
         for ext in ["std", "core", "alloc"] {
             local_roots.remove(ext);
         }
-        Resolver { defs, local_roots, fields, files, traits, for_all_traits, types, gated_files }
+        Resolver { defs, local_roots, fields, files, traits, for_all_traits, types, gated_files, cond_region }
+    }
+    /// 呼び出し元 (file) から定義 `d` を確定先にしてよいか。cfg 付きの定義 / 条件付き module の中の定義は、
+    /// 同じ file / 同じ条件付き module の中からの呼び出しだけ (外からは cfg 付きの re-export 越しに別の実体に
+    /// 切り替わり得る)。代用品 (`cfg_not_*!`) はどこからも確定しない。
+    fn live_for(&self, caller_file: EntityId, d: &SymDef) -> bool {
+        if d.gated || self.gated_files.contains(&d.file) {
+            return false;
+        }
+        if d.cond && caller_file != d.file {
+            return false;
+        }
+        match self.cond_region.get(&d.file) {
+            Some(r) => self.cond_region.get(&caller_file) == Some(r),
+            None => true,
+        }
     }
     fn is_local(&self, root: &str) -> bool {
         root.is_empty() || self.local_roots.contains(&crate_key(root))
@@ -1330,17 +1424,22 @@ impl<'a> Resolver<'a> {
     fn is_local_ty(&self, root: &str, name: &str) -> bool {
         self.is_local(root) && !(root.is_empty() && PRELUDE_TYPES.contains(&name))
     }
-    /// 確定先を rust-analyzer (= bake 済み kenning) の流儀に揃える。trait 実装の method を
+    /// 確定先を rust-analyzer (= bake 済み kenning) の流儀に揃える (bench infer で RA と突き合わせた挙動)。
+    /// trait 実装の method を
     /// - method 呼び `x.f()` で、具体的な型への impl なら → その impl の method のまま
-    /// - method 呼びでも型引数を含む型への impl (`impl<P> Tr for Pin<P>`) や、path 呼び `T::f()` なら → trait の宣言
-    ///   (bench infer で RA と突き合わせた挙動。`BinaryDetection::default()` は std の Default::default を指す)
+    /// - method 呼びでも型引数そのもの / それを包む参照・ポインタへの impl (`impl<P> Tr for Pin<P>`) なら → trait の宣言
+    /// - path 呼び `T::f()` なら → repo の trait は impl の method のまま (`ListEntry::as_raw`)、std / 依存の trait は
+    ///   repo の外 (`BinaryDetection::default()` は std の Default::default を指す)
     ///
     /// trait が repo の外なら Err (= 呼び先は repo の外)、宣言を 1 つに絞れなければ Ok(None)。
     fn trait_decl_of(&self, d: &SymDef, name: &str, path_call: bool) -> Result<Option<EntityId>, ()> {
         if !d.impl_trait.name.is_empty() && !self.types.contains(&d.container) {
             return Ok(None); // repo で定義していない型への trait 実装 — その型の inherent method が先に当たり得る
         }
-        if d.impl_trait.name.is_empty() || !(path_call || d.impl_blanket) {
+        if path_call && !d.impl_trait.name.is_empty() {
+            return if self.is_local(&d.impl_trait.root) && self.traits.contains(&d.impl_trait.name) { Ok(Some(d.eid)) } else { Err(()) };
+        }
+        if d.impl_trait.name.is_empty() || !d.impl_blanket {
             return Ok(Some(d.eid));
         }
         if !self.is_local(&d.impl_trait.root) {
@@ -1366,7 +1465,27 @@ impl<'a> Resolver<'a> {
         if caller_path != def_path && target_root_file(caller_path) && target_root_file(def_path) {
             return false;
         }
+        // tests/ benches/ examples/ 直下の file は自分の package の lib から見ても別の crate — 名前で use した時だけ
+        // (グロブの use は追えないので確定しない)。
+        if caller_path != def_path && target_root_file(caller_path) {
+            return crate_key(&cs.qual_root) == *def_crate;
+        }
         caller_crate == def_crate || crate_key(&cs.qual_root) == *def_crate
+    }
+    /// method 呼び `x.f()` を定義 `d` (型 `t` の method) に確定してよいか。Rust の method 解決で先に当たり得る
+    /// 別の候補があれば確定しない:
+    /// - `&T` への impl に同名 method がある (`fd.read()` の fd: &T は `impl Read for &T` が先)
+    /// - d が trait 実装で、拡張 trait (全型向け impl) も同名を宣言している (`BufReader::consume` と
+    ///   `AsyncBufReadExt::consume` — 受け手の形で拡張 trait が選ばれる)。inherent method は trait より優先なので可
+    fn method_unshadowed(&self, cands: &[&SymDef], d: &SymDef, t: &str) -> bool {
+        let ref_impl = cands.iter().any(|x| {
+            let c = x.container.trim_start_matches('&').trim_start_matches("mut");
+            let c = c.strip_prefix('\'').map(|r| r.trim_start_matches(|ch: char| ch.is_alphanumeric() || ch == '_')).unwrap_or(c);
+            x.container.starts_with('&') && c == t
+        });
+        let ext = !d.impl_trait.name.is_empty()
+            && cands.iter().any(|x| x.impl_trait.name.is_empty() && self.for_all_traits.contains(&x.container));
+        !ref_impl && !ext
     }
     /// 型 `t` の関数 `f` (method なら `method` = true) の戻り値。ちょうど 1 つに絞れて、戻り値の出どころが
     /// 内側の時だけ。`Self` (と `Result<Self>` の Self) は t に読み替える。
@@ -1433,11 +1552,14 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
     let Some(all_cands) = defs.get(&cs.name) else {
         return (None, R_EXTERNAL); // 呼べる同名定義が index に無い = std / 依存 crate (解決不能)
     };
-    // `cfg_not_*!` の中の定義 (代用品) は確定先にしない。普段の build では使われず、同名の本物 (多くは std) がある。
-    let live: Vec<SymDef> = all_cands.iter().filter(|d| !d.gated && !rz.gated_files.contains(&d.file)).cloned().collect();
-    if live.len() < all_cands.len() && live.iter().all(|d| d.kind != K_FN && d.kind != K_METHOD) {
+    // 代用品 (`cfg_not_*!`) と、外から見た cfg 付きの定義は確定先にしない (build の設定で別の実体になり得る)。
+    // 外した候補は「確定先にしない」だけで、残りを一意にする根拠にはしない (外した方が本当の呼び先かも
+    // しれない)。下の各段で「外した候補にも当てはまる物があれば確定しない」を見る。
+    let (live, excluded): (Vec<SymDef>, Vec<SymDef>) = all_cands.iter().cloned().partition(|d| rz.live_for(cs.file, d));
+    if !excluded.is_empty() && live.iter().all(|d| d.kind != K_FN && d.kind != K_METHOD) {
         return (None, R_AMBIG);
     }
+    let shadowed = |f: &dyn Fn(&SymDef) -> bool| excluded.iter().any(f);
     let all_cands = &live;
     if cs.in_macro {
         // 字句走査の当て推量なので確定させない。呼べる物の名前でなければ記録もしない。
@@ -1478,6 +1600,14 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
         let target = if q == "Self" { cs.caller_container.as_str() } else { q };
         // (a) container 一致 = Type の associated fn / method。
         let by_container: Vec<&SymDef> = cands.iter().copied().filter(|d| d.container == target).collect();
+        if shadowed(&|d| d.container == target) {
+            return (None, R_AMBIG);
+        }
+        // `Trait::f(x)` / `<T as Trait>::f(..)` — trait 名で修飾した呼び出しは、引数 / 自分の型に応じた impl に
+        // 解決される (RA も impl を指す)。宣言に確定すると外れる → 確定しない。
+        if rz.traits.contains(target) && !by_container.is_empty() {
+            return (None, R_AMBIG);
+        }
         if let [d] = by_container.as_slice() {
             return match rz.trait_decl_of(d, &cs.name, true) {
                 Ok(Some(e)) => (Some(e), R_QUALIFIED),
@@ -1522,7 +1652,10 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
             if !rz.is_local_ty(&cs.recv.root, &cs.caller_container) {
                 return (None, R_METHOD);
             }
-            if let [d] = by_self.as_slice() {
+            if let [d] = by_self.as_slice()
+                && !shadowed(&|x| x.container == cs.caller_container)
+                && rz.method_unshadowed(&cands, d, &cs.caller_container)
+            {
                 return match rz.trait_decl_of(d, &cs.name, false) {
                     Ok(Some(e)) => (Some(e), R_UNIQUE),
                     Ok(None) => (None, R_METHOD),
@@ -1540,7 +1673,10 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
                 return (None, R_METHOD);
             }
             let by_ty: Vec<&SymDef> = cands.iter().copied().filter(|d| d.container == t).collect();
-            if let [d] = by_ty.as_slice() {
+            if let [d] = by_ty.as_slice()
+                && !shadowed(&|x| x.container == t)
+                && rz.method_unshadowed(&cands, d, &t)
+            {
                 return match rz.trait_decl_of(d, &cs.name, false) {
                     Ok(Some(e)) => (Some(e), R_TYPED),
                     Ok(None) => (None, R_METHOD),
@@ -1557,6 +1693,9 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
     }
     // 修飾なしの `f()` は method を呼べない (呼ぶには `T::f` / `x.f()` が要る) — method は候補から外す。
     let fns: Vec<&SymDef> = cands.iter().copied().filter(|d| d.kind != K_METHOD).collect();
+    if shadowed(&|d| d.kind != K_METHOD) {
+        return (None, R_AMBIG);
+    }
     // 同名がちょうど 1 つなら一意解決、複数なら諦める。
     match fns.as_slice() {
         [d] if rz.reachable_bare(cs, d) => (Some(d.eid), R_UNIQUE),
@@ -1668,6 +1807,7 @@ pub(crate) fn build_defs_from_table(sym_t: &Table) -> HashMap<String, Vec<SymDef
             impl_blanket: num(er.get("impl_blanket")) == 1,
             file: ref_of(er.get("file")),
             gated: num(er.get("gated")) == 1,
+            cond: num(er.get("cond")) == 1,
         });
     }
     defs
@@ -1740,6 +1880,12 @@ pub(crate) fn file_imports(items: &[syn::Item]) -> HashMap<String, (String, Stri
                     out.extend(file_imports(inner));
                 }
             }
+            // `cfg_rt! { mod x { use std::cell::Cell; .. } }` — item を包むマクロの中の use も効く
+            syn::Item::Macro(m) if !m.mac.path.is_ident("macro_rules") => {
+                if let Ok(items) = m.mac.parse_body_with(parse_items::<syn::Item>) {
+                    out.extend(file_imports(&items));
+                }
+            }
             _ => {}
         }
     }
@@ -1748,11 +1894,11 @@ pub(crate) fn file_imports(items: &[syn::Item]) -> HashMap<String, (String, Stri
 
 pub(crate) fn extract_file(src: &str) -> Option<FileFacts> {
     let file = syn::parse_file(src).ok()?;
-    let mut out = FileFacts { loc: src.lines().count() as u32, hash: hash_u32(src), syms: Vec::new(), impls: Vec::new(), item_calls: Vec::new(), fields: Vec::new(), gated_mods: Vec::new(), live_mods: Vec::new() };
+    let mut out = FileFacts { loc: src.lines().count() as u32, hash: hash_u32(src), syms: Vec::new(), impls: Vec::new(), item_calls: Vec::new(), fields: Vec::new(), gated_mods: Vec::new(), live_mods: Vec::new(), cond_mods: Vec::new(), mod_names: Vec::new() };
     // file 冒頭の inner attribute (`#![cfg(test)]`) は file 全体に効く。per-file parse では親の
     // `#[cfg(test)] mod x;` が見えないので、これを見ないと test 専用 file の helper が
     // 「test でない symbol」として出てしまう (`tests <name>` と `search test:1` が取りこぼす)。
-    let mut ctx = Ctx { module: Vec::new(), in_test: file.attrs.iter().any(is_cfg_test), container: String::new(), in_trait_impl: false, impl_trait: TyRef::default(), impl_blanket: false, impl_self_root: String::new(), neg_gate: false, impl_generics: Vec::new(), impl_bounds: HashMap::new(), imports: std::rc::Rc::new(file_imports(&file.items)) };
+    let mut ctx = Ctx { module: Vec::new(), in_test: file.attrs.iter().any(is_cfg_test), container: String::new(), in_trait_impl: false, impl_trait: TyRef::default(), impl_blanket: false, impl_self_root: String::new(), neg_gate: false, cond: false, impl_generics: Vec::new(), impl_bounds: HashMap::new(), imports: std::rc::Rc::new(file_imports(&file.items)) };
     walk_items(&file.items, &mut ctx, &mut out);
     let live = std::mem::take(&mut out.live_mods);
     out.gated_mods.retain(|m| !live.contains(m)); // 両方の枝で宣言 = 出し分けであって代用品ではない

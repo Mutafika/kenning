@@ -1757,8 +1757,8 @@ pub fn caller() { hidden(); twin(); }
 }
 
 /// trait 実装の method への確定先は rust-analyzer (= bake 済み) の流儀に揃える: 具体的な型への impl を
-/// method 呼びで呼べば impl の method、型引数を含む型への impl や path 呼び `T::f()` なら trait の宣言
-/// (std の trait なら repo の外)。
+/// method 呼びで呼べば impl の method。path 呼び `T::f()` は repo の trait なら impl の method、std の trait
+/// (Default) なら repo の外。
 #[test]
 fn trait_impl_call_targets_follow_rust_analyzer() {
     let d = tmp();
@@ -1773,6 +1773,7 @@ impl Default for A { fn default() -> Self { A } }
 pub fn concrete(a: &A) { a.go(); }
 pub fn generic_arg(w: &W<u8>) { w.go(); }
 pub fn path_call() { let _ = A::default(); }
+pub fn local_path_call(a: &A) { A::go(a); }
 "#,
     );
     let db = d.join("k.db");
@@ -1784,6 +1785,7 @@ pub fn path_call() { let _ = A::default(); }
     assert!(confirmed(&["callers", "go", "A"]).contains("in concrete\t"), "具体的な impl は impl の method に確定するはず");
     assert!(confirmed(&["callers", "go", "W"]).contains("in generic_arg\t"), "W<T> への impl は具体的な型の impl (impl の method に確定するはず)");
     assert!(!confirmed(&["callers", "default", "A"]).contains("in path_call\t"), "std の Default::default を自前に確定");
+    assert!(confirmed(&["callers", "go", "A"]).contains("in local_path_call\t"), "repo の trait の path 呼びは impl の method に確定するはず");
 }
 
 /// repo に `std` という module があっても、`use std::time::Instant` の std は標準ライブラリ。
@@ -1882,4 +1884,114 @@ pub fn calls_plat() { plat(); }
     // 属性の cfg の双子は同名 2 つ = どちらにも確定しない (どちらが活性かは build 次第)
     let plat = query(&["callers", "plat"], &db);
     assert!(plat.contains("名前一致 1 件中 0 件を確定"), "cfg の双子の片方に確定:\n{plat}");
+}
+
+/// `#[path]` で別 file を指す同名の `mod imp;` は、cfg_not 側 (代用品) だけ除外する。`#[cfg(..)] mod x;` の中の
+/// 定義は、その module の外からは確定しない (cfg 付きの re-export 越しに別の実体に切り替わり得る)。
+#[test]
+fn path_attr_modules_and_cfg_conditional_regions() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"macro_rules! cfg_x { ($($i:item)*) => { $($i)* } }
+macro_rules! cfg_not_x { ($($i:item)*) => { $($i)* } }
+cfg_x! { #[path = "native.rs"] mod imp; }
+cfg_not_x! { #[path = "shim.rs"] mod imp; }
+#[cfg(feature = "fast")]
+mod fast;
+pub fn use_native(n: &imp::Native) { n.get(); }
+pub fn use_shim(s: &imp::Shim) { s.get(); }
+pub fn use_fast(f: &fast::Fast) { f.run(); }
+"#,
+    );
+    std::fs::write(d.join("src/native.rs"), "pub struct Native;\nimpl Native { pub fn get(&self) {} }\n").unwrap();
+    std::fs::write(d.join("src/shim.rs"), "pub struct Shim;\nimpl Shim { pub fn get(&self) {} }\n").unwrap();
+    std::fs::create_dir_all(d.join("src/other")).unwrap();
+    std::fs::write(d.join("src/other/fast.rs"), "pub struct Fast;\nimpl Fast { pub fn run(&self) {} pub fn inner(&self) { self.run(); } }\n").unwrap();
+    let db = d.join("k.db");
+    index(&d, &db);
+    let confirmed = |args: &[&str]| query(args, &db).split("候補").next().unwrap_or("").to_string();
+    assert!(confirmed(&["callers", "get", "Native"]).contains("in use_native\t"), "#[path] の native 側は確定するはず");
+    assert!(!confirmed(&["callers", "get", "Shim"]).contains("in use_shim\t"), "cfg_not 側 (#[path] = shim.rs) に確定");
+    let run = confirmed(&["callers", "run", "Fast"]);
+    assert!(!run.contains("in use_fast\t"), "cfg 付き module の中の定義に外から確定:\n{run}");
+    assert!(run.contains("in Fast::inner\t"), "同じ module の中からは確定するはず:\n{run}");
+}
+
+/// 確定先から外した候補 (cfg 付き module の中) は、残った同名の定義を「一意」にする根拠にしない
+/// (外した方が本当の呼び先かもしれない — tokio で unique の誤確定が 3 → 41 件に増えた形)。
+#[test]
+fn excluded_candidates_do_not_make_the_rest_unique() {
+    let d = tmp();
+    write_fixture(&d, "#[cfg(feature = \"x\")]\nmod gated;\npub fn caller() { helper(); }\n");
+    std::fs::create_dir_all(d.join("src/other")).unwrap();
+    std::fs::write(d.join("src/other/gated.rs"), "pub fn helper() {}\n").unwrap();
+    std::fs::write(d.join("src/elsewhere.rs"), "pub fn helper() {}\n").unwrap();
+    let db = d.join("k.db");
+    index(&d, &db);
+    let out = query(&["callers", "helper"], &db);
+    assert!(out.contains("名前一致 1 件中 0 件を確定"), "外した候補があるのに残りの helper に確定:\n{out}");
+}
+
+/// 関数の中で定義した fn (index していない) を、同名の外の fn に確定しない。tests/ 直下の file は自分の
+/// package の lib にとっても別 crate — 名前で use していなければ確定しない。
+#[test]
+fn nested_fns_and_integration_tests_do_not_borrow_outer_names() {
+    let d = tmp();
+    write_fixture(&d, "pub fn iter() {}\npub fn outer() { iter(); fn iter() {} }\n");
+    std::fs::create_dir_all(d.join("tests")).unwrap();
+    std::fs::write(d.join("tests/t.rs"), "use fix::iter;\n#[test]\nfn a() { iter(); }\n").unwrap();
+    std::fs::write(d.join("tests/u.rs"), "use fix::*;\n#[test]\nfn b() { iter(); }\n").unwrap();
+    let db = d.join("k.db");
+    index(&d, &db);
+    let out = query(&["callers", "iter"], &db);
+    let confirmed = out.split("候補").next().unwrap_or("");
+    assert!(!confirmed.contains("in outer\t"), "関数の中の fn iter を外の iter に確定:\n{out}");
+    assert!(confirmed.contains("tests/t.rs"), "名前で use した tests からは確定するはず:\n{out}");
+    assert!(!confirmed.contains("tests/u.rs"), "グロブ use の tests から確定:\n{out}");
+}
+
+/// Rust の method 解決で先に当たり得る別の候補があれば確定しない: `self: Pin<&mut Self>` の `self.f()` (Pin の
+/// method) / `&T` への impl / 拡張 trait が同名を宣言する trait 実装 / `Trait::f(x)` の trait 修飾 /
+/// マクロの中の use (`cfg_x! { mod m { use std::cell::Cell; } }`)。field 越し (`self.inner.f()`) は届く。
+#[test]
+fn method_resolution_precedence_blocks_unsafe_confirmations() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"use std::pin::Pin;
+pub struct Inner;
+impl Inner { pub fn go(&self) {} }
+pub struct S { inner: Inner }
+impl S {
+    pub fn get_mut(&mut self) -> &mut Inner { &mut self.inner }
+    pub fn poll(self: Pin<&mut Self>) { let _ = self.get_mut(); self.inner.go(); }
+}
+pub trait Read { fn read(&mut self); }
+pub struct Fd;
+impl Read for Fd { fn read(&mut self) {} }
+impl Read for &Fd { fn read(&mut self) {} }
+pub fn by_ref(mut fd: &Fd) { fd.read(); }
+pub fn ufcs(fd: &mut Fd) { Read::read(fd); }
+pub trait Buf { fn consume(self: Pin<&mut Self>); }
+pub trait BufExt { fn consume(&mut self) {} }
+impl<R: Buf> BufExt for R {}
+pub struct Rdr;
+impl Buf for Rdr { fn consume(self: Pin<&mut Self>) {} }
+pub fn ext(mut r: Rdr) { r.consume(); }
+macro_rules! cfg_x { ($($i:item)*) => { $($i)* } }
+cfg_x! { mod m { use std::cell::Cell; pub fn mk() { let _ = Cell::new(1); } } }
+pub struct Cell;
+impl Cell { pub fn new(x: u8) -> Self { let _ = x; Cell } }
+"#,
+    );
+    let db = d.join("k.db");
+    index(&d, &db);
+    let confirmed = |args: &[&str]| query(args, &db).split("候補").next().unwrap_or("").to_string();
+    assert!(!confirmed(&["callers", "get_mut", "S"]).contains("in S::poll\t"), "Pin<&mut Self> の self.get_mut() を S::get_mut に確定");
+    assert!(confirmed(&["callers", "go", "Inner"]).contains("in S::poll\t"), "self.inner.go() は field 越しに確定するはず");
+    assert!(!confirmed(&["callers", "read", "Fd"]).contains("in by_ref\t"), "&Fd への impl があるのに Fd::read に確定");
+    assert!(!confirmed(&["callers", "read"]).contains("in ufcs\t"), "Read::read(fd) を宣言に確定");
+    assert!(!confirmed(&["callers", "consume", "Rdr"]).contains("in ext\t"), "拡張 trait の consume があるのに実装に確定");
+    assert!(!confirmed(&["callers", "new", "Cell"]).contains("in m::mk\t") && !confirmed(&["callers", "new", "Cell"]).contains("in mk\t"), "マクロの中で use した std の Cell を自前に確定");
 }
