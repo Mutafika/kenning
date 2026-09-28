@@ -1,0 +1,3 @@
+When a user calls `Runtime::block_on` on a current_thread tokio runtime and the future is not ready, which functions are called, in order, until the thread actually parks (blocks waiting for I/O, timers or an unpark)? Trace the real call chain in this repository's source.
+
+End your reply with a line `ANSWER:` followed by one `path:line<TAB>function` per step of the chain, in call order, nothing else after it.

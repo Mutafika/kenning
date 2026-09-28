@@ -1,0 +1,3 @@
+In this repository, list every call site of the public method `add_permits` of `tokio::sync::Semaphore` (defined in tokio/src/sync/semaphore.rs). Do not include calls to other types' methods that happen to have the same name.
+
+End your reply with a line `ANSWER:` followed by one repo-relative `path:line` per call site, nothing else after it.
