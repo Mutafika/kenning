@@ -1653,3 +1653,77 @@ fn chain_resolution_follows_field_type_changes_incrementally() {
     assert!(!on_db.split_once("候補").map(|x| x.0).unwrap_or(&on_db).contains("in Svc::by_field\t"), "型を変えたのに古い解決が残る:\n{on_db}");
     assert!(on_other.split_once("候補").map(|x| x.0).unwrap_or(&on_other).contains("in Svc::by_field\t"), "新しい型に付け替わらない:\n{on_other}");
 }
+
+/// 受け手が型引数 (`S: Store`、where 句も) / `dyn Store` / `impl Store` なら、`s.put()` は trait で宣言された
+/// put にしか解決されない (inherent は無い)。目印の trait (Send 等) は数えず、境界が 2 つ以上なら推定しない。
+#[test]
+fn trait_bounded_receivers_resolve_to_the_trait_method() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"pub trait Store { fn put(&self); }
+pub trait Other { fn put(&self); }
+pub struct Mem;
+impl Store for Mem { fn put(&self) {} }
+pub fn by_generic<S: Store>(s: &S) { s.put(); }
+pub fn by_where<S>(s: S) where S: Store { s.put(); }
+pub fn by_dyn(s: &dyn Store) { s.put(); }
+pub fn by_impl(s: impl Store) { s.put(); }
+pub fn with_marker<S: Store + Send>(s: S) { s.put(); }
+pub fn two_bounds<S: Store + Other>(s: S) { s.put(); }
+"#,
+    );
+    let db = d.join("k.db");
+    index(&d, &db);
+    let out = query(&["callers", "put", "Store"], &db);
+    let (confirmed, _) = out.split_once("候補").unwrap_or((out.as_str(), ""));
+    for f in ["by_generic", "by_where", "by_dyn", "by_impl", "with_marker"] {
+        assert!(confirmed.contains(&format!("in {f}\t")), "{f} の s.put() が Store::put に確定しない:\n{out}");
+    }
+    assert!(!confirmed.contains("in two_bounds\t"), "境界が 2 つあるのに確定した:\n{out}");
+}
+
+/// クロージャの引数の型 (item 直下のマクロ引数の中も) と `*x` の参照外しでも受け手の型をたどる。
+#[test]
+fn closure_params_and_derefs_carry_receiver_types() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"pub struct Cmd;
+impl Cmd { pub fn arg(&mut self) -> &mut Cmd { self } pub fn run(&self) {} }
+macro_rules! t { ($name:ident, $f:expr) => { pub fn $name() { let _ = $f; } }; }
+t!(in_macro, |mut cmd: Cmd| { cmd.arg().run(); });
+pub fn in_fn() { let f = |c: &Cmd| c.run(); let _ = f; }
+pub fn by_deref(c: &&Cmd) { (**c).run(); }
+"#,
+    );
+    let db = d.join("k.db");
+    index(&d, &db);
+    let out = query(&["callers", "run", "Cmd"], &db);
+    let (confirmed, _) = out.split_once("候補").unwrap_or((out.as_str(), ""));
+    assert!(confirmed.contains("in in_fn\t"), "クロージャ引数の型で確定しない:\n{out}");
+    assert!(confirmed.contains("in by_deref\t"), "参照外しで確定しない:\n{out}");
+    assert!(confirmed.contains("in (item 直下)"), "マクロ引数のクロージャ (連鎖 arg().run()) で確定しない:\n{out}");
+}
+
+/// `impl Tr for &M` の中の `(*self).f()` は Self (= &M) ではなく M の f — 自分自身に確定しない。
+#[test]
+fn deref_of_self_in_pointer_impls_is_not_the_same_type() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        "pub trait Tr { fn f(&self); }\n\
+         impl<'a, M: Tr> Tr for &'a M { fn f(&self) { (*self).f() } }\n\
+         impl<S: Tr> Tr for Box<S> { fn f(&self) { (**self).f() } }\n",
+    );
+    let db = d.join("k.db");
+    index(&d, &db);
+    let out = query(&["callers", "f"], &db);
+    for line in out.lines().filter(|l| l.contains("in ")) {
+        let caller_line: u32 = line.split(':').nth(1).and_then(|s| s.split('\t').next()).and_then(|n| n.parse().ok()).unwrap_or(0);
+        assert!(!(line.contains("確実") && caller_line == 2), "(*self).f() を自分に確定:\n{out}");
+    }
+    let confirmed = out.split("候補").next().unwrap_or("");
+    assert!(!confirmed.contains("other.rs:2\tin"), "(*self).f() を &M の f 自身に確定:\n{out}");
+    assert!(!confirmed.contains("other.rs:3\tin"), "(**self).f() を Box の f 自身に確定:\n{out}");
+}

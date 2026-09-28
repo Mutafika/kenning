@@ -163,6 +163,44 @@ pub(crate) fn ty_ref(ty: &syn::Type, imp: ImportLookup, generics: &HashSet<Strin
     }
 }
 
+/// 受け手の型推定で「境界」と数えない目印の trait (method を持たない / 持っていても呼ばれ方が違う)。
+const MARKER_TRAITS: &[&str] = &["Send", "Sync", "Sized", "Unpin", "Copy", "UnwindSafe", "RefUnwindSafe"];
+
+/// 境界の並び (`T: A + Send` / `dyn A + Send` / `impl A`) から、目印でない trait がちょうど 1 つならそれ。
+/// 型引数や dyn の受け手の `x.f()` は、その trait で宣言された f にしか解決されない (inherent は無い)。
+pub(crate) fn single_trait_bound<'b>(bounds: impl Iterator<Item = &'b syn::TypeParamBound>, imp: ImportLookup) -> Option<TyRef> {
+    let traits: Vec<&syn::Path> = bounds
+        .filter_map(|b| match b {
+            syn::TypeParamBound::Trait(t) => Some(&t.path),
+            _ => None,
+        })
+        .filter(|p| p.segments.last().is_some_and(|s| !MARKER_TRAITS.contains(&s.ident.to_string().as_str())))
+        .collect();
+    let [p] = traits.as_slice() else { return None };
+    let last = p.segments.last()?.ident.to_string();
+    Some(TyRef { name: unalias_of(p, last, imp), root: type_root_of(p, imp), ..Default::default() })
+}
+
+/// generics (型引数の境界 + where 句) から「型引数名 → 単一の trait 境界」を作る。
+pub(crate) fn generic_bounds(g: &syn::Generics, imp: ImportLookup) -> HashMap<String, TyRef> {
+    let mut all: HashMap<String, Vec<syn::TypeParamBound>> = HashMap::new();
+    for t in g.type_params() {
+        all.entry(t.ident.to_string()).or_default().extend(t.bounds.iter().cloned());
+    }
+    if let Some(w) = &g.where_clause {
+        for p in &w.predicates {
+            if let syn::WherePredicate::Type(pt) = p
+                && let syn::Type::Path(tp) = &pt.bounded_ty
+                && let Some(id) = tp.path.get_ident()
+                && let Some(v) = all.get_mut(&id.to_string())
+            {
+                v.extend(pt.bounds.iter().cloned());
+            }
+        }
+    }
+    all.into_iter().filter_map(|(k, v)| single_trait_bound(v.iter(), imp).map(|t| (k, t))).collect()
+}
+
 /// 1 呼び出し箇所。名前解決の材料として修飾 (`Type::` / `mod::`) も持つ。
 pub(crate) struct RawCall {
     name: String,               // 呼び先の単純名 (path 末尾 / method 名)
@@ -190,6 +228,8 @@ pub(crate) struct CallCollector {
     scopes: Vec<HashMap<String, Option<Recv>>>,
     /// 型引数の名前 (fn と impl の generics)。`x: T` の T は具体型ではないので手掛かりにしない。
     generics: HashSet<String>,
+    /// 型引数のうち trait 境界がちょうど 1 つの物 (`T: Store` の T → Store)。`x: T` の `x.f()` は Store::f。
+    bounds: HashMap<String, TyRef>,
     /// この file の `use`: 名前 → (出どころ = 先頭 seg, 元の名前)。`use std::io::Error` なら
     /// Error → ("std", "Error")、`use crate::a::Db as MyDb` なら MyDb → ("crate", "Db")。
     imports: std::rc::Rc<HashMap<String, (String, String)>>,
@@ -238,7 +278,19 @@ impl CallCollector {
     }
     /// 書いてある型 → 手掛かり。`&T` / `&mut T` / `T<..>` は T。型引数・`impl`/`dyn`・tuple 等は無し。
     fn type_recv(&self, ty: &syn::Type) -> Option<Recv> {
-        let t = ty_ref(ty, &self.imp(), &self.generics)?;
+        let imp = self.imp();
+        let t = match ty {
+            syn::Type::Reference(r) => return self.type_recv(&r.elem),
+            syn::Type::Paren(p) => return self.type_recv(&p.elem),
+            // `dyn Trait` / `impl Trait` — 境界の trait の method に解決される
+            syn::Type::TraitObject(o) => single_trait_bound(o.bounds.iter(), &imp)?,
+            syn::Type::ImplTrait(i) => single_trait_bound(i.bounds.iter(), &imp)?,
+            // 型引数 `T` — 境界がちょうど 1 つなら、その trait
+            syn::Type::Path(p) if p.qself.is_none() && p.path.segments.len() == 1 && self.generics.contains(&p.path.segments[0].ident.to_string()) => {
+                self.bounds.get(&p.path.segments[0].ident.to_string())?.clone()
+            }
+            _ => ty_ref(ty, &imp, &self.generics)?,
+        };
         Some(Recv { ty: t.name, root: t.root, ..Default::default() })
     }
     /// 式の型の手掛かり: `T { .. }` / `T::f(..)` / `x` / `self` を起点に、`.field` / `.m(..)` / `?` を
@@ -287,6 +339,12 @@ impl CallCollector {
             },
             syn::Expr::MethodCall(m) => step(self.expr_recv(&m.receiver)?, format!("m:{}", m.method)),
             syn::Expr::Reference(r) => self.expr_recv(&r.expr),
+            // `*x` — 変数 / field の参照外しは method 呼びの自動参照外しと同じ先に届く。ただし `*self` は別:
+            // `impl Matcher for &M` / `impl Sink for Box<S>` の中では Self 自体が参照 / ポインタで、外すと中身
+            // (M / S) に変わる (`(*self).find_at()` を自分自身に確定した実例)。起点が素の self なら推定しない。
+            syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => {
+                self.expr_recv(&u.expr).filter(|r| !(r.ty == "Self" && r.chain.is_empty() && r.via_fn.is_empty()))
+            }
             syn::Expr::Paren(p) => self.expr_recv(&p.expr),
             syn::Expr::Group(g) => self.expr_recv(&g.expr),
             syn::Expr::Path(p) if p.path.is_ident("self") => Some(Recv { ty: "Self".into(), ..Default::default() }),
@@ -424,9 +482,20 @@ impl<'ast> Visit<'ast> for CallCollector {
         visit::visit_block(self, node);
         self.scopes.pop();
     }
+    /// クロージャの引数は型が書いてあれば手掛かりにする (`|dir: Dir, mut cmd: TestCommand| cmd.arg(..)`)。
     fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
         self.scopes.push(HashMap::new());
-        visit::visit_expr_closure(self, node);
+        for p in &node.inputs {
+            self.visit_pat(p);
+            if let syn::Pat::Type(pt) = p
+                && let syn::Pat::Ident(pi) = &*pt.pat
+                && pi.subpat.is_none()
+            {
+                let r = self.type_recv(&pt.ty);
+                self.bind(pi.ident.to_string(), r);
+            }
+        }
+        self.visit_expr(&node.body);
         self.scopes.pop();
     }
     /// `let` は **init を先に**歩く (`let x = x.f()` の右辺の x は外の x)。その後で束縛する。
@@ -540,6 +609,7 @@ pub(crate) struct Ctx {
     container: String,     // 現在の impl 型 (method の所属)
     in_trait_impl: bool,   // `impl Trait for T` の中か (= trait 経由で呼ばれ得る method)
     impl_generics: Vec<String>, // 囲む impl の型引数 (受け手の型推定で具体型と区別する)
+    impl_bounds: HashMap<String, TyRef>, // 囲む impl の型引数の単一 trait 境界
     imports: std::rc::Rc<HashMap<String, (String, String)>>, // この file の `use` (名前 → (出どころ, 元の名前))
 }
 
@@ -624,10 +694,16 @@ pub(crate) fn record_symbol(
     if let Some(b) = body {
         let mut cc = CallCollector { imports: ctx.imports.clone(), ..Default::default() };
         cc.generics.extend(ctx.impl_generics.iter().cloned());
+        cc.bounds.extend(ctx.impl_bounds.iter().map(|(k, v)| (k.clone(), v.clone())));
         // 引数名は signature 側にあるので、body だけ歩くと束縛が漏れる。
         // (tokio の `registration` のような仮引数が「同名関数への参照」に化けていた)
         if let Some(s) = sig {
             cc.generics.extend(s.generics.type_params().map(|t| t.ident.to_string()));
+            let fb = {
+                let imp = |n: &str| ctx.imports.get(n).cloned();
+                generic_bounds(&s.generics, &imp)
+            };
+            cc.bounds.extend(fb); // fn の境界が impl の同名より内側 (上書き)
             cc.bind_params(s);
         }
         cc.visit_block(b);
@@ -952,6 +1028,11 @@ pub(crate) fn walk_item(it: &syn::Item, ctx: &mut Ctx, out: &mut FileFacts) {
             // 「誰からも呼ばれていない」に構造的に見える。区別できるよう印を付ける。
             let prev_ti = std::mem::replace(&mut ctx.in_trait_impl, i.trait_.is_some());
             let prev_g = std::mem::replace(&mut ctx.impl_generics, i.generics.type_params().map(|t| t.ident.to_string()).collect());
+            let bounds = {
+                let imp = |n: &str| ctx.imports.get(n).cloned();
+                generic_bounds(&i.generics, &imp)
+            };
+            let prev_b = std::mem::replace(&mut ctx.impl_bounds, bounds);
             for ii in &i.items {
                 if let syn::ImplItem::Fn(m) = ii {
                     let is_test = ctx.in_test || is_test_attrs(&m.attrs);
@@ -966,6 +1047,7 @@ pub(crate) fn walk_item(it: &syn::Item, ctx: &mut Ctx, out: &mut FileFacts) {
             ctx.container = prev;
             ctx.in_trait_impl = prev_ti;
             ctx.impl_generics = prev_g;
+            ctx.impl_bounds = prev_b;
         }
         // item 直下のマクロ: `criterion_group!(benches, bench_tie, …)` のように **関数の外**で
         // 定義を参照する形。CallCollector は関数本体しか歩かないので、ここを見ないと
@@ -973,7 +1055,7 @@ pub(crate) fn walk_item(it: &syn::Item, ctx: &mut Ctx, out: &mut FileFacts) {
         syn::Item::Macro(m) => {
             use syn::punctuated::Punctuated;
             if let Ok(args) = m.mac.parse_body_with(Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated) {
-                let mut cc = CallCollector::default();
+                let mut cc = CallCollector { imports: ctx.imports.clone(), ..Default::default() };
                 for e in &args {
                     visit::visit_expr(&mut cc, e);
                 }
@@ -1380,7 +1462,7 @@ pub(crate) fn extract_file(src: &str) -> Option<FileFacts> {
     // file 冒頭の inner attribute (`#![cfg(test)]`) は file 全体に効く。per-file parse では親の
     // `#[cfg(test)] mod x;` が見えないので、これを見ないと test 専用 file の helper が
     // 「test でない symbol」として出てしまう (`tests <name>` と `search test:1` が取りこぼす)。
-    let mut ctx = Ctx { module: Vec::new(), in_test: file.attrs.iter().any(is_cfg_test), container: String::new(), in_trait_impl: false, impl_generics: Vec::new(), imports: std::rc::Rc::new(file_imports(&file.items)) };
+    let mut ctx = Ctx { module: Vec::new(), in_test: file.attrs.iter().any(is_cfg_test), container: String::new(), in_trait_impl: false, impl_generics: Vec::new(), impl_bounds: HashMap::new(), imports: std::rc::Rc::new(file_imports(&file.items)) };
     walk_items(&file.items, &mut ctx, &mut out);
     Some(out)
 }

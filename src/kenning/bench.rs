@@ -798,7 +798,7 @@ fn bench_infer(root: &str, db_path: &str, baked_db: &Database) {
             Some(w) if w == format!("{}:{}", got.0, got.1) => e[1] += 1,
             Some(w) => {
                 e[2] += 1;
-                if wrong.iter().filter(|w| w.ends_with(&format!("({})", RES_NAMES.get(*res as usize).unwrap_or(&"?")))).count() < 8 {
+                if wrong.iter().filter(|w| w.ends_with(&format!("({})", RES_NAMES.get(*res as usize).unwrap_or(&"?")))).count() < std::env::var("KENNING_INFER_SHOW").ok().and_then(|v| v.parse().ok()).unwrap_or(8) {
                     wrong.push(format!("{}:{}\t{} → syn {}:{} / RA {w} ({})", key.0, key.1, key.2, got.0, got.1, RES_NAMES.get(*res as usize).unwrap_or(&"?")));
                 }
             }
