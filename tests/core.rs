@@ -1291,6 +1291,45 @@ fn qualified_name_shows_same_candidates_as_container_form() {
     assert_eq!(qualified, container, "修飾名と container 指定で結果が違う");
 }
 
+/// 同名の自由関数は container が空なので `callers <name> <container>` では絞れない。`read` と同じ
+/// `path:` / `crate:` で絞れて、要約表の「絞る」例も path: を出す (例が `(例: )` と空だった)。
+#[test]
+fn callers_narrows_same_named_free_fns_by_path() {
+    let d = tmp();
+    write_fixture(&d, "pub fn target() {}\npub fn use_local() { target(); }\n");
+    let db = d.join("k.db");
+    index(&d, &db);
+    let summary = query(&["callers", "target"], &db);
+    assert!(summary.contains("2 型が定義"), "同名 2 定義の要約表のはず:\n{summary}");
+    assert!(summary.contains("path:"), "自由関数の絞り方に path: を出すはず:\n{summary}");
+    let narrowed = query(&["callers", "target", "path:other.rs"], &db);
+    assert!(narrowed.contains("in use_local"), "path: で絞った定義の caller が出るはず:\n{narrowed}");
+    assert!(!narrowed.contains("in mid"), "lib.rs の target の caller が混ざった:\n{narrowed}");
+}
+
+/// `mod::f()` の module は file の置き場所からも決まる (`src/time/inner.rs` の f は time の配下)。子 module に
+/// 実体を置いて `pub use` で出す形 (tokio の `time::sleep`) を確定し、同じ名前の module が 2 つある
+/// (`task` と `runtime::task`) 時は道順を決められないので確定しない (tokio の yield_now で RA と照合した形)。
+#[test]
+fn module_qualified_calls_use_file_location() {
+    let d = tmp();
+    write_fixture(&d, "pub fn user() { time::later(); task::yield_now(); }\n");
+    for (p, body) in [
+        ("src/time/inner.rs", "pub fn later() {}\n"),
+        ("src/task/mod.rs", "pub fn yield_now() {}\n"),
+        ("src/runtime/task/mod.rs", "pub fn yield_now() {}\n"),
+    ] {
+        std::fs::create_dir_all(d.join(p).parent().unwrap()).unwrap();
+        std::fs::write(d.join(p), body).unwrap();
+    }
+    let db = d.join("k.db");
+    index(&d, &db);
+    let later = query(&["callers", "later"], &db);
+    assert!(later.contains("1 確実 callers"), "子 module の実体に確定しない:\n{later}");
+    let y = query(&["callers", "yield_now", "path:src/task/mod.rs"], &db);
+    assert!(y.contains("0 確実 callers"), "同名 module が 2 つあるのに確定した:\n{y}");
+}
+
 // ── changes: 前回 snapshot からの意味的な差分 ──
 
 fn update(dir: &Path, db: &Path) {
@@ -1485,14 +1524,16 @@ fn changes_ignores_snapshots_of_an_older_format() {
 #[test]
 fn changes_flags_a_duplicate_definition_that_steals_resolution() {
     let dir = tmp();
-    write_fixture(&dir, "pub fn entry() { enc(\"x\"); }\nfn enc(s: &str) -> String { s.into() }\n");
+    // 呼び出し (other.rs) と定義 (a.rs) が別 file。同じ file の定義なら重複があってもそちらに決まる (Rust の規則)。
+    write_fixture(&dir, "pub fn entry() { enc(\"x\"); }\n");
+    std::fs::write(dir.join("src/a.rs"), "pub fn enc(s: &str) -> String { s.into() }\n").unwrap();
     let db = dir.join("k.db");
     index(&dir, &db);
     query(&["changes", "--cursor", "c"], &db);
-    std::fs::write(dir.join("src/dup.rs"), "pub fn other() { enc(\"y\"); }\nfn enc(s: &str) -> String { s.to_string() }\n").unwrap();
+    std::fs::write(dir.join("src/dup.rs"), "pub fn other() {}\npub fn enc(s: &str) -> String { s.to_string() }\n").unwrap();
     update(&dir, &db);
     let out = query(&["changes", "--cursor", "c"], &db);
-    assert!(out.contains("other.rs:2\tcallers\tenc: callers 1 → 0"), "重複で確定を失ったのが出ない:\n{out}");
+    assert!(out.contains("a.rs:1\tcallers\tenc: callers 1 → 0"), "重複で確定を失ったのが出ない:\n{out}");
     assert!(out.contains("同名の定義が増えた"), "原因 (同名の定義の追加) が出ない:\n{out}");
 }
 
@@ -1560,7 +1601,7 @@ fn pick<T: Default>() -> T { T::default() }
     assert!(stats.contains("typed="), "stats に typed の内訳が出ない:\n{stats}");
 }
 
-/// 自由関数の戻り値 (`let s = sleep(..)`) と smart pointer 越し (`Box::pin(x).as_mut().f()`) の受け手も、
+/// 自由関数の戻り値 (`let s = sleep(..)`、実体が子 module で `pub use` した `time::later()` も) と smart pointer 越し (`Box::pin(x).as_mut().f()`) の受け手も、
 /// 書いてある型から確定する (tokio の `Sleep::reset` を呼ぶテストが `tests` から漏れていた形)。ただし
 /// 外から `use` した関数の戻り値と、包んだ側の method が先に当たり得る物 (Pin の `set`、trait の中の
 /// `Pin::new(self)` = Pin が実装する trait の method) は確定しない。
@@ -1578,9 +1619,12 @@ pub mod time {
         pub fn set(&mut self) {}
     }
     pub fn sleep() -> Sleep { Sleep }
+    pub mod inner { pub fn later() -> super::Sleep { super::Sleep } }
+    pub use inner::later;
 }
 pub fn make_ext() -> time::Sleep { time::Sleep }
 pub fn by_mod_fn() { let mut s = time::sleep(); s.reset(); }
+pub fn by_reexport() { let mut s = time::later(); s.reset(); }
 pub fn by_boxed() { let mut s = Box::pin(time::sleep()); s.as_mut().reset(); }
 pub fn by_arc_chain() { Arc::new(time::sleep()).reset(); }
 pub fn pin_own_name() { let mut s = Box::pin(time::sleep()); s.set(); }
@@ -1595,7 +1639,7 @@ pub trait BufExt {
     index(&d, &db);
     let out = query(&["callers", "Sleep::reset"], &db);
     let (confirmed, rest) = out.split_once("候補").unwrap_or((out.as_str(), ""));
-    for f in ["by_mod_fn", "by_boxed", "by_arc_chain"] {
+    for f in ["by_mod_fn", "by_reexport", "by_boxed", "by_arc_chain"] {
         assert!(confirmed.contains(&format!("in {f}\t")), "{f} の reset() が確定しない:\n{out}");
     }
     assert!(!confirmed.contains("in external_fn"), "外から use した関数の戻り値で確定した:\n{out}");
@@ -1799,6 +1843,7 @@ fn deref_of_self_in_pointer_impls_is_not_the_same_type() {
 
 /// `cfg_x! { .. }` のように item / impl の中身を包むマクロの中の定義も見える。見えないままだと、
 /// 同名の「見えている方」を一意と思い込んで誤確定する (tokio の cfg_rt! 等で実際に起きていた)。
+/// ここでは呼び出しと同じ file のマクロの中の `twin` が呼び先 — 見えていなければ別 file の twin.rs に確定してしまう。
 #[test]
 fn definitions_wrapped_in_item_macros_are_indexed() {
     let d = tmp();
@@ -1822,7 +1867,9 @@ pub fn caller() { hidden(); twin(); }
     assert!(query(&["def", "hidden"], &db).contains("other.rs:3"), "マクロ内の fn が見えない");
     assert!(query(&["def", "in_impl"], &db).contains("H::in_impl"), "impl 内マクロの method が見えない");
     let twin = query(&["callers", "twin"], &db);
-    assert!(twin.contains("2 型が定義 (同名)") && twin.contains("名前一致 1 件中 0 件を確定"), "同名が 2 つあるのに一意として確定:\n{twin}");
+    assert!(twin.contains("2 型が定義 (同名)"), "マクロ内の twin が見えない:\n{twin}");
+    assert!(query(&["callers", "twin", "path:other.rs"], &db).contains("in caller"), "同じ file (マクロ内) の twin に確定しない:\n{twin}");
+    assert!(!query(&["callers", "twin", "path:twin.rs"], &db).contains("in caller"), "別 file の twin に誤確定:\n{twin}");
 }
 
 /// trait 実装の method への確定先は rust-analyzer (= bake 済み) の流儀に揃える: 具体的な型への impl を

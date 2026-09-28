@@ -313,17 +313,58 @@ pub fn cmd_read(args: &[String]) {
         run_outline(&o.db, first, o.limit);
         return;
     }
-    let (mut container, mut crate_f, mut path_f) = (None, None, None);
-    for a in &o.pos[1..] {
-        match a.split_once(':') {
-            Some(("crate", v)) => crate_f = Some(v),
-            Some(("path", v)) => path_f = Some(v),
-            Some(("container", v)) => container = Some(v),
-            _ if container.is_none() => container = Some(a.as_str()),
-            _ => eprintln!("# 無視: {a} (container は 1 つ、絞るなら crate: / path:)"),
+    run_read(&o.db, first, &Narrow::parse(&o.pos[1..]), all, o.limit);
+}
+
+/// 同名定義の絞り込み `[container] [crate:X] [path:S]` (read / callers 共通)。自由関数は container が
+/// 空なので、同名が複数あれば `path:` / `crate:` でしか絞れない。
+#[derive(Default)]
+pub(crate) struct Narrow<'a> {
+    container: Option<&'a str>,
+    crate_f: Option<&'a str>,
+    path_f: Option<&'a str>,
+}
+
+impl<'a> Narrow<'a> {
+    pub(crate) fn parse(args: &'a [String]) -> Self {
+        let mut n = Narrow::default();
+        for a in args {
+            match a.split_once(':') {
+                Some(("crate", v)) => n.crate_f = Some(v),
+                Some(("path", v)) => n.path_f = Some(v),
+                Some(("container", v)) => n.container = Some(v),
+                _ if n.container.is_none() => n.container = Some(a.as_str()),
+                _ => eprintln!("# 無視: {a} (container は 1 つ、絞るなら crate: / path:)"),
+            }
         }
+        n
     }
-    run_read(&o.db, first, container, crate_f, path_f, all, o.limit);
+
+    /// 名前 (修飾名も可) に一致し、絞り込みを満たす定義。
+    pub(crate) fn defs(&self, sym_t: &Table, paths: &HashMap<EntityId, String>, name: &str) -> Vec<EntityId> {
+        let mut defs = defs_of(sym_t, name, self.container);
+        if let Some(c) = self.crate_f {
+            defs.retain(|&e| txt(sym_t.entity(e).get("crate_")) == c);
+        }
+        if let Some(p) = self.path_f {
+            defs.retain(|&e| paths.get(&ref_of(sym_t.entity(e).get("file"))).is_some_and(|f| f.contains(p)));
+        }
+        defs
+    }
+
+    /// 「(container=X, path~S)」形の注記 (絞り込みが無ければ空)。
+    pub(crate) fn describe(&self) -> String {
+        let filt: Vec<String> = [self.container.map(|c| format!("container={c}")), self.crate_f.map(|c| format!("crate={c}")), self.path_f.map(|p| format!("path~{p}"))]
+            .into_iter()
+            .flatten()
+            .collect();
+        if filt.is_empty() { String::new() } else { format!(" ({})", filt.join(", ")) }
+    }
+
+    /// container 以外の絞り込みがあるか (あれば同名が複数でも要約表にせず、絞った結果を出す)。
+    pub(crate) fn is_set(&self) -> bool {
+        self.container.is_some() || self.crate_f.is_some() || self.path_f.is_some()
+    }
 }
 
 /// `<path>:<from>-<to>` 形か。範囲 read (`sed -n 'A,Bp'` の代わり) の入口。
@@ -568,25 +609,15 @@ pub(crate) fn section_range(containers: &[(u32, String)], i: usize, lang: u32, n
 /// 一度に出す本体の上限行数。超える item は頭からここまで + 続きの Read 案内 (暴発防止)。
 pub(crate) const READ_MAX_LINES: usize = 400;
 
-pub(crate) fn run_read(db_path: &str, name: &str, container: Option<&str>, crate_f: Option<&str>, path_f: Option<&str>, all: bool, limit: usize) {
+pub(crate) fn run_read(db_path: &str, name: &str, narrow: &Narrow, all: bool, limit: usize) {
     let Some(db) = open_ro(db_path) else { return };
     let file_t = db.get_table("file").unwrap();
     let sym_t = db.get_table("sym").unwrap();
     let paths = file_paths(&file_t);
 
-    let mut defs = defs_of(&sym_t, name, container);
-    if let Some(c) = crate_f {
-        defs.retain(|&e| txt(sym_t.entity(e).get("crate_")) == c);
-    }
-    if let Some(p) = path_f {
-        defs.retain(|&e| paths.get(&ref_of(sym_t.entity(e).get("file"))).is_some_and(|f| f.contains(p)));
-    }
+    let defs = narrow.defs(&sym_t, &paths, name);
     if defs.is_empty() {
-        let filt: Vec<String> = [container.map(|c| format!("container={c}")), crate_f.map(|c| format!("crate={c}")), path_f.map(|p| format!("path~{p}"))]
-            .into_iter()
-            .flatten()
-            .collect();
-        println!("# \"{name}\" の定義が index に無い{}。", if filt.is_empty() { String::new() } else { format!(" ({})", filt.join(", ")) });
+        println!("# \"{name}\" の定義が index に無い{}。", narrow.describe());
         suggest_similar(&sym_t, &paths, name);
         return;
     }
@@ -824,33 +855,32 @@ pub(crate) fn run_search_opt(db_path: &str, facets: &[String], limit: usize, wit
 pub fn cmd_callers(args: &[String]) {
     let o = parse_opts(args);
     let Some(name) = o.pos.first() else {
-        eprintln!("usage: kenning callers <name> [container] [--db P] [--limit N]");
+        eprintln!("usage: kenning callers <name> [container] [crate:X] [path:S] [--db P] [--limit N]");
         return;
     };
-    let container = o.pos.get(1).map(String::as_str);
-    run_callers(&o.db, name, container, o.limit);
+    run_callers(&o.db, name, &Narrow::parse(&o.pos[1..]), o.limit);
 }
 
-pub(crate) fn run_callers(db_path: &str, name: &str, container: Option<&str>, limit: usize) {
+pub(crate) fn run_callers(db_path: &str, name: &str, narrow: &Narrow, limit: usize) {
     let Some(db) = open_ro(db_path) else { return };
     let file_t = db.get_table("file").unwrap();
     let sym_t = db.get_table("sym").unwrap();
     let call_t = db.get_table("call").unwrap();
     let paths = file_paths(&file_t);
 
-    let defs = defs_of(&sym_t, name, container);
+    let defs = narrow.defs(&sym_t, &paths, name);
     // 修飾名で来た時は call 側 (callee は bare name) を bare で数える。
     let bare = split_qualified(name).0;
     let name_total = call_t.where_eq("callee", bare).count().unwrap();
     if defs.is_empty() {
-        println!("# \"{name}\" の定義が index に無い。名前一致の call = {name_total} 件 (外部/未解決)");
+        println!("# \"{name}\" の定義が index に無い{}。名前一致の call = {name_total} 件 (外部/未解決)", narrow.describe());
         suggest_similar(&sym_t, &paths, name);
         return;
     }
 
     // 同名定義が多いと caller を全部出すと冗長。container 指定が無く定義が複数なら
     // まず「定義ごとの精密 caller 数」の要約表だけ出して、絞り方を促す。
-    if container.is_none() && defs.len() > 1 {
+    if !narrow.is_set() && split_qualified(name).1.is_none() && defs.len() > 1 {
         let mut rows: Vec<(usize, EntityId)> = defs
             .iter()
             .map(|&d| (call_t.where_eq("callee_sym", Value::Ref(d)).count().unwrap(), d))
@@ -865,7 +895,13 @@ pub(crate) fn run_callers(db_path: &str, name: &str, container: Option<&str>, li
             println!("  {n:>5}  {}::{name}  ({})  {path}:{}", if ct.is_empty() { "·".into() } else { ct }, txt(er.get("crate_")), num(er.get("line")));
         }
         let unresolved = name_total.saturating_sub(precise_sum);
-        println!("# 絞る: `callers {name} <container>` (例: {}) — 未確定の候補も位置付きで出る", txt(sym_t.entity(rows[0].1).get("container")));
+        let top = sym_t.entity(rows[0].1);
+        let hint = match txt(top.get("container")) {
+            // 自由関数は container が無い → 定義の file で絞る
+            c if c.is_empty() => format!("path:{}", paths.get(&ref_of(top.get("file"))).map(String::as_str).unwrap_or("?")),
+            c => c,
+        };
+        println!("# 絞る: `callers {name} <container>` / `crate:<crate>` / `path:<path の一部>` (例: `callers {name} {hint}`) — 未確定の候補も位置付きで出る");
         if unresolved > 0 {
             println!("# 名前一致 {name_total} 件中 {precise_sum} 件を確定。残り {unresolved} 件は未確定(候補、drill-in で位置表示)。");
         }

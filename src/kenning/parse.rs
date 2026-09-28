@@ -1444,6 +1444,33 @@ impl<'a> Resolver<'a> {
             None => true,
         }
     }
+    /// 定義の module の道順: file の置き場所 (`src/time/sleep.rs` → time, sleep。lib.rs / main.rs / mod.rs は
+    /// dir まで) + file 内の `mod x { }`。`#[path]` で置き場所を変えた file はずれる (その時は一致しないだけ)。
+    fn module_of(&self, d: &SymDef) -> Vec<String> {
+        let path = format!("/{}", self.files.get(&d.file).map(|f| f.1.as_str()).unwrap_or(""));
+        // src の外 (tests/ benches/ examples/ の直下) は target の根 = file の置き場所は module にならない
+        let mut segs: Vec<String> = match path.rsplit_once("/src/") {
+            Some((_, in_src)) => in_src.split('/').map(|s| s.trim_end_matches(".rs").to_string()).collect(),
+            None => Vec::new(),
+        };
+        if segs.last().is_some_and(|f| matches!(f.as_str(), "lib" | "main" | "mod")) {
+            segs.pop();
+        }
+        segs.extend(d.module.split("::").filter(|m| !m.is_empty()).map(str::to_string));
+        segs
+    }
+
+    /// 修飾つき呼び出しの出どころの crate (crate_key)。`crate::` / `self::` / `super::` / 修飾の出どころが
+    /// 空 (同じ crate の module) なら呼び出し側の crate、workspace の crate 名ならその crate。分からなければ None。
+    fn qual_crate(&self, cs: &CallSite) -> Option<String> {
+        let own = || self.files.get(&cs.file).map(|f| f.0.clone());
+        match cs.qual_root.as_str() {
+            "" | "crate" | "self" | "super" => own(),
+            r if self.local_roots.contains(&crate_key(r)) => Some(crate_key(r)),
+            _ => None,
+        }
+    }
+
     fn is_local(&self, root: &str) -> bool {
         root.is_empty() || self.local_roots.contains(&crate_key(root))
     }
@@ -1653,14 +1680,16 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
         if by_container.len() > 1 {
             return (None, R_AMBIG); // 同名 Type が別 crate に複数 → 絞れない
         }
-        // (b) module 末尾 seg 一致 = `mod::fn`。
-        let by_module: Vec<&SymDef> = cands
-            .iter()
-            .copied()
-            .filter(|d| d.module.rsplit("::").next() == Some(target))
-            .collect();
-        if by_module.len() == 1 {
-            return (Some(by_module[0].eid), R_QUALIFIED);
+        // (b) `mod::fn` — 修飾の出どころの crate (`tokio::` / `crate::` / 名前の `use`) の中で、module の道順
+        // (file の置き場所 + file 内の `mod x { }`) に修飾名を含む定義がちょうど 1 つなら、それ。子 module に
+        // 実体を置いて `pub use` で出す形 (`time::sleep` の実体は `time/sleep.rs`) もここで拾う。同じ名前の
+        // module が複数ある (`task` と `runtime::task`) なら、どちらの道順か決められないので確定しない。
+        let in_crate = |d: &SymDef| rz.qual_crate(cs).is_none_or(|c| crate_key(&d.crate_) == c);
+        let under_target = |d: &SymDef| in_crate(d) && rz.module_of(d).iter().any(|m| m == target);
+        if !shadowed(&under_target)
+            && let [d] = cands.iter().copied().filter(|d| under_target(d)).collect::<Vec<_>>().as_slice()
+        {
+            return (Some(d.eid), R_QUALIFIED);
         }
         // (c) crate 名一致 = `mycrate::fn` / `enchudb_schema::foo`。workspace の他 crate を
         // 名前で呼ぶ形は多 crate repo では普通なのに、ここが無いと全部「外部」に落ちていた。
@@ -1732,11 +1761,17 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
     if shadowed(&|d| d.kind != K_METHOD) {
         return (None, R_AMBIG);
     }
-    // 同名がちょうど 1 つなら一意解決、複数なら諦める。
+    // 同名がちょうど 1 つなら一意解決。複数でも、名前で `use` していない (出どころ = 空) 呼び出しから見て
+    // 同じ file の定義がちょうど 1 つなら、それ (自分の module の item は glob の `use` より優先される。
+    // tests/ の各 file の `fn setup()` / `fn walk()` のように、同名の helper を file ごとに持つのは普通)。
     match fns.as_slice() {
         [d] if rz.reachable_bare(cs, d) => (Some(d.eid), R_UNIQUE),
         [_] => (None, R_AMBIG),
         [] => (None, R_EXTERNAL),
+        _ if cs.qual_root.is_empty() => match fns.iter().filter(|d| d.file == cs.file).collect::<Vec<_>>().as_slice() {
+            [d] => (Some(d.eid), R_UNIQUE),
+            _ => (None, R_AMBIG),
+        },
         _ => (None, R_AMBIG),
     }
 }

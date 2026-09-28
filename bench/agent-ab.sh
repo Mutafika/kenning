@@ -1,7 +1,8 @@
 #!/bin/sh
 # 実 agent の A/B: 同じ課題を headless の claude に「kenning あり / なし」で解かせ、token・費用・正答を比べる。
 # 使い方: ./bench/agent-ab.sh [task-id...] (既定は全課題)。env: AB_REPS=回数 (既定 1) / AB_MODEL / AB_EFFORT /
-#   AB_CONDS=条件 (既定 "A B"。A=kenning+CLAUDE.md 全文 / B=kenning なし / C=kenning+短い案内 guide-slim.md)
+#   AB_CONDS=条件 (既定 "A B"。A=kenning+CLAUDE.md 全文 / B=kenning なし / C=kenning+短い案内 guide-slim.md) /
+#   AB_KENNING=試す kenning の binary (既定は PATH の物。未 install の build を他の session に影響させずに試す)
 # 課題 = bench/agent-ab/tasks/<repo>-<name>.txt、正解 = truth/<同名>.txt (path:line、cargo check で検証済み)。
 # 結果 = $AB_OUT (既定 ~/.cache/kenning-bench/agent-ab/<日時>)/<task>.<cond>.<rep>.jsonl (stream-json = 道具の
 #   呼び出しも残る) → agent-ab-score.py で集計。
@@ -14,6 +15,10 @@ OUT="${AB_OUT:-$D/agent-ab/$(date +%Y%m%d-%H%M%S)}"
 REPS="${AB_REPS:-1}"
 CONDS="${AB_CONDS:-A B}"
 mkdir -p "$OUT"
+if [ -n "$AB_KENNING" ]; then
+    mkdir -p "$OUT/bin" && ln -sf "$(cd "$(dirname "$AB_KENNING")" && pwd)/$(basename "$AB_KENNING")" "$OUT/bin/kenning"
+    PATH="$OUT/bin:$PATH"; export PATH
+fi
 
 # 全条件とも読むだけの道具。A / C は kenning の実行と案内を足す (A = 利用者が実際に置く CLAUDE.md そのまま)
 BASE_TOOLS="Read Grep Glob Bash(rg:*) Bash(grep:*) Bash(sed:*) Bash(cat:*) Bash(head:*) Bash(tail:*) Bash(find:*) Bash(ls:*) Bash(wc:*) Bash(awk:*)"
