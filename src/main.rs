@@ -131,7 +131,7 @@ const USAGE: &str = concat!(
      find <substr>                    名前の部分一致 (発見用、大小無視)\n  \
      text <term>... [-e] [--and] [--files] [path:S]  全文検索 + どの関数内かの注釈 (grep superset)\n  \
      \u{0020}                              複数語 OR / --and で全語 AND、-e 正規表現、--files で file 別件数\n  \
-     callers <name> [container]       精密 who-calls (確実 ∪ 未確定候補を位置付きで)\n  \
+     callers <name> [container] [crate:X] [path:S]  精密 who-calls (確実 ∪ 未確定候補を位置付きで)\n  \
      callees <name> [container]       X が呼ぶ先 (outgoing、callers の鏡)\n  \
      edges                            全 cross-file call edge の集計 TSV (from TAB to TAB count)\n  \
      refs <name> [container]          正確 find-all-refs (要 --scip index、読み書き型も)\n  \

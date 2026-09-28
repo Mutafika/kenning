@@ -94,7 +94,8 @@ kenning text    <term>... [-e] [--and] [--files] [path:S]
                                     table). Several terms = OR by default, --and = every term on
                                     the line (`grep X | grep Y`), -e = regex, --files = per-file
                                     hit counts (`rg -c`, for triaging a wide term), path: = dir filter
-kenning callers <name> [container]  who-calls: confirmed ∪ unresolved candidates, with positions
+kenning callers <name> [container] [crate:X] [path:S]  who-calls: confirmed ∪ unresolved candidates,
+                                    with positions (crate: / path: narrow same-named free fns)
 kenning callees <name> [container]  outgoing calls
 kenning edges                       all cross-file call edges, aggregated (from\tto\tcount TSV)
 kenning refs    <name> [container]  find-all-references (needs bake; includes type refs, read/write)
@@ -202,6 +203,15 @@ Run it yourself: `./bench/corpus.sh && ./bench/run.sh` — pinned corpora (tokio
 fixed random seed, methodology self-described next to every table. Full output:
 [bench/RESULTS.md](bench/RESULTS.md) (re-measured on v0.5.0, 2026-09-28). Resolution accuracy
 has its own suite: `kenning bench infer` (in a freshly baked repo).
+
+**Real agents, not models** ([bench/AGENT-AB.md](bench/AGENT-AB.md), `./bench/agent-ab.sh`): the byte
+ratios below model the grep route. To check what an agent actually gains, headless Claude (Opus) solved
+six tasks with and without kenning, three runs each, answers graded against ground truth built
+independently (rename + `cargo check`, and a probe that records which tests really execute). **Accuracy
+was identical** — grep-only Opus also found all 25 `JoinSet::spawn` call sites among 1,140 same-named
+`spawn` calls. What kenning bought was the route: **1.7–1.9× lower cost, half the turns, 1.7× faster**,
+with the widest gap on "which tests reach this" (grep: $0.65 / 122 s, kenning: $0.23–0.27 / ~50 s).
+A 1.5 KB tool guide beat the full 15 KB CLAUDE.md, which costs input tokens on every turn.
 
 | Suite | tokio (770 files) | ripgrep (207 files) | enchudb (352 files) | What it measures |
 |---|---|---|---|---|

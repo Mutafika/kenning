@@ -94,7 +94,8 @@ kenning text    <term>... [-e] [--and] [--files] [path:S]
                                     複数語は既定 OR / --and で全語 AND (grep X | grep Y)、
                                     -e で正規表現、--files で file 別件数だけ (rg -c 相当の
                                     triage)、path: で dir 絞り
-kenning callers <name> [container]  who-calls: 確実 ∪ 未確定候補を位置付きで
+kenning callers <name> [container] [crate:X] [path:S]  who-calls: 確実 ∪ 未確定候補を位置付きで
+                                    (同名の自由関数は crate: / path: で絞る)
 kenning callees <name> [container]  呼ぶ先 (outgoing)
 kenning edges                       全 cross-file call edge を集計 (from\tto\tcount TSV)
 kenning refs    <name> [container]  find-all-references (要 bake; 型参照・読み書きも)
@@ -193,6 +194,14 @@ kenning --version                   バージョン
 （tokio @ tokio-1.43.0）、固定乱数 seed、手法は各表の直上に自己記述。全文:
 [bench/RESULTS.md](bench/RESULTS.md)（v0.5.0 で取り直し、2026-09-28）。解決の正しさは専用のスイート
 `kenning bench infer`（焼き直した直後の repo で）で測る。
+
+**モデルではなく実物の agent** ([bench/AGENT-AB.md](bench/AGENT-AB.md), `./bench/agent-ab.sh`): 下の表の
+バイト比は grep 経路のモデル。実際の agent がどれだけ得をするかを見るため、headless の Claude (Opus) に 6 課題を
+kenning あり / なしで各 3 回解かせ、kenning と独立に作った正解 (rename + `cargo check`、実際に通ったテストを
+記録する目印) で採点した。**正答は差が無い** — grep だけの Opus も、同名 `spawn` 1,140 件から `JoinSet::spawn`
+の 25 件を全部当てる。kenning が買ったのは道のり: **費用 1.7〜1.9 分の 1、turn 半分、時間 1.7 分の 1**。差が
+一番開くのは「どのテストが届くか」(grep: $0.65 / 122 秒、kenning: $0.23〜0.27 / 約 50 秒)。案内は 1.5KB の
+短い物の方が、毎 turn input を食う CLAUDE.md 全文 (15KB) より安かった。
 
 | スイート | tokio (770 files) | ripgrep (207 files) | enchudb (352 files) | 測るもの |
 |---|---|---|---|---|

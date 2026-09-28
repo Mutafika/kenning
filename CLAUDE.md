@@ -30,7 +30,7 @@ kenning text    <term>... [-e] [--and] [--files] [path:S]  # 全文検索 + 文�
                                     #   .toml=[table])。複数語は既定 OR / `--and` で全語 AND (`grep X | grep Y`)、
                                     #   -e で正規表現 ((?-i) で大小区別)、`--files` で file 別件数だけ (`rg -c` = 広い語の
                                     #   triage)、path: で dir 絞り。末尾に `# N 件 / M files`
-kenning callers <name> [container]  # who-calls: 確実 ∪ 未確定候補を位置付き
+kenning callers <name> [container] [crate:X] [path:S]  # who-calls: 確実 ∪ 未確定候補を位置付き (同名の自由関数は path: で絞る)
 kenning callees <name> [container]  # X が呼ぶ先 (outgoing)
 kenning edges                       # 全 cross-file call edge の集計 TSV (from TAB to TAB count)。依存グラフの素材
 kenning refs    <name> [container]  # find-all-refs (要 --scip index、型/読み書きも)
@@ -124,7 +124,8 @@ repo が RUSTFLAGS 前提の custom cfg を要る場合 (tokio の `--cfg tokio_
   当て推量なので確定はしない (「確実 = 誤りなし」を保つ) が、「使われているか」には答えられる。
 - 候補の `[method-name]` = 受け手の型が分からない method 呼び (`x.f()`)。同名 method が repo に
   1 つしか無くても確定しない (std/dep の `.next()` / `.len()` を自前の定義に誤確定しないため)。
-  確定するのは `self.f()` (受け手 = 今いる impl の型) と SCIP が答えた分。bake すればここは減る。
+  確定するのは受け手の型がソースに書いてある物 (`self` / 引数・`let` の型 / `T::new()` や自由関数の戻り値 /
+  `Box::pin(x)` 越し) と SCIP が答えた分。bake すればここは減る。
 - 候補の `[external]` = SCIP または名前照合が「呼び先は repo の外 (std / 依存 crate)」と判定した物。
   同名の定義が repo にあっても、その呼び出しは別物という意味。
 - 候補の `[value-ref]` = 関数を値として渡した参照 (`map(f)` / `&f` / `Some(f)` / `S { f: g }` / `vec![f]`)。
@@ -145,8 +146,8 @@ repo が RUSTFLAGS 前提の custom cfg を要る場合 (tokio の `--cfg tokio_
 - **精度は食わせた SCIP の feature 網羅に依存 (GIGO)。** 確定 facts は rust-analyzer のもの。
 - **`stats` の率は「repo 内呼び出しのうち確定できた割合」。** std / 依存 crate への呼び出しは
   index に定義が無く構造的に解決不能なので分母から外す (混ぜると corpus の外部依存率になる —
-  tokio は call-site の 47% が外部)。実測 (v0.5.0): bake 済みで tokio 72.6% / ripgrep 92.6% / enchudb 80.5%、
-  syn 層のみだと 21〜56% (書いてある型から受け手が読めない method は確定させない分)。`stats path:<substr>` で
+  tokio は call-site の 47% が外部)。実測: bake 済みで tokio 73.7% / ripgrep 92.7% / enchudb 89.5%、
+  syn 層のみだと 29〜61% (書いてある型から受け手が読めない method は確定させない分)。`stats path:<substr>` で
   repo の一部だけの率も出る (どこなら確定を信じてよいかが分かる)。
 - **hover / 補完 / 診断 / 式の型推論は無い** (人間のエディタ用機能。Claude は Read + `cargo check` で足りる)。
 - **full 再 index (INDEX_VER 更新 / heal / 明示 index) は SCIP facts を落とす。** 精度が黙って syn 層まで
