@@ -92,6 +92,7 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
     let sym_t = db.get_table("sym").unwrap();
     let call_t = db.get_table("call").unwrap();
     let impl_t = db.get_table("impl"); // 旧 index には無い (Option)
+    let field_t = db.get_table("field");
     let t = Instant::now();
     // 走査**開始**時刻を焼く (完了時刻ではない)。理由は run_index_inner の started_at と同じ — この
     // update 中に編集されたファイルを、次のクエリの mtime 判定で必ず拾い直せるようにする (#13)。
@@ -216,7 +217,7 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
     // 4. 変更/削除ファイルの旧 facts を消去 (影響 symbol 名を集める)。
     let mut affected: HashSet<String> = HashSet::new();
     for eid in &to_remove {
-        purge_file(&sym_t, &call_t, &file_t, impl_t.as_ref(), *eid, &mut affected);
+        purge_file(&sym_t, &call_t, &file_t, impl_t.as_ref(), field_t.as_ref(), *eid, &mut affected);
     }
 
     // 5. 追加/変更ファイルを parse して新 sym を挿入 + call-site を持ち越す。
@@ -235,11 +236,17 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
     for name in acc.defs.keys() {
         affected.insert(name.clone()); // 新規定義した名前も incoming 再解決の対象
     }
+    for (_, f) in &acc.fields {
+        affected.insert(f.name.clone()); // 新しい field の型も連鎖の解決に効く
+    }
+    if let Some(ft) = &field_t {
+        insert_fields(ft, &acc.fields);
+    }
 
     // 6. 全 sym から global defs を再構築 (新旧すべて反映、再パース不要)。
     let defs = build_defs_from_table(&sym_t);
     let rs_paths: Vec<String> = file_t.where_eq("lang", LANG_RUST).find().unwrap_or_default().into_iter().map(|e| txt(file_t.entity(e).get("path"))).collect();
-    let rz = Resolver::new(&defs, rs_paths.iter().map(String::as_str));
+    let rz = Resolver::new(&defs, rs_paths.iter().map(String::as_str), load_field_types(field_t.as_ref()));
 
     // 7. incoming 再解決: 影響名を callee に持つ「既存 (=未変更ファイル) の call」を
     //    delete + 再挿入して callee_sym/res を最新化。この時点で存在する該当 call は
@@ -256,6 +263,15 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
                     targets.push(ce);
                 }
             }
+        }
+    }
+    // 連鎖 (`self.cfg.searcher().run()`) は途中の field / method のどれが変わっても解決が変わる。
+    // 手順の名前は多値なので索引で引けない → 連鎖を持つ call だけを舐めて、手順に影響名があれば解き直す。
+    for ce in call_t.where_eq("has_chain", 1u32).find().unwrap_or_default() {
+        let chain = txt(call_t.entity(ce).get("recv_chain"));
+        let hit = chain.split(' ').any(|s| s.strip_prefix("f:").or_else(|| s.strip_prefix("m:")).is_some_and(|n| affected.contains(n)));
+        if hit && seen.insert(ce) {
+            targets.push(ce);
         }
     }
     let mut reresolved = 0u64;
@@ -277,7 +293,7 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
                 self_recv: num(er.get("is_method")) == M_SELF,
                 as_value: num(er.get("res")) == R_VALUE, // 値渡し参照は再解決後も候補どまり
                 in_macro: num(er.get("res")) == R_MACRO,  // 字句走査由来も同じく候補どまり
-                recv: Recv { ty: txt(er.get("recv_ty")), via_fn: txt(er.get("recv_fn")), via_try: num(er.get("recv_try")) == 1, root: txt(er.get("recv_root")) },
+                recv: Recv { ty: txt(er.get("recv_ty")), via_fn: txt(er.get("recv_fn")), via_try: num(er.get("recv_try")) == 1, root: txt(er.get("recv_root")), chain: txt(er.get("recv_chain")) },
                 qual_root: txt(er.get("qual_root")),
                 line: num(er.get("line")),
                 col: 0,

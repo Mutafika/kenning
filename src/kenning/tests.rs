@@ -914,15 +914,6 @@ fn sweep_dead_test_dirs() {
     });
 }
 
-#[test]
-fn ret_type_and_split_generic_read_signatures() {
-    assert_eq!(ret_type("fn new() -> Self").as_deref(), Some("Self"));
-    assert_eq!(ret_type("pub fn open(p: &str, f: fn(u8) -> u8) -> io::Result<Self> where T: X").as_deref(), Some("io::Result<Self>"));
-    assert_eq!(ret_type("fn f(a: u8)"), None);
-    assert_eq!(split_generic("io::Result<Self, Box<dyn Error>>"), ("Result".into(), vec!["Self".into(), "Box<dyn Error>".into()]));
-    assert_eq!(split_generic("&mut Engine"), ("Engine".into(), vec![]));
-    assert_eq!(split_generic("Option<Self>"), ("Option".into(), vec!["Self".into()]));
-}
 
 #[test]
 fn scip_name_reads_the_descriptor_not_the_version() {

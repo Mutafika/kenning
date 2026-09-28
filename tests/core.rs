@@ -1601,3 +1601,55 @@ pub fn real_call() { let _ = select(2); symlink(); }
     let cmd = confirmed("cmd");
     assert!(!cmd.contains("in calls_method_name"), "修飾なしの cmd() を method に誤確定:\n{cmd}");
 }
+
+const CHAIN_RS: &str = r#"pub struct Db;
+impl Db { pub fn get(&self) {} }
+pub struct Other;
+impl Other { pub fn get(&self) {} }
+pub struct Svc<T> { db: Db, g: T, raw: std::fs::File }
+impl<T> Svc<T> {
+    pub fn cfg(&self) -> &Db { &self.db }
+    pub fn open_db(&self) -> Result<Db, String> { Ok(Db) }
+    pub fn io(&self) -> std::io::Error { std::io::Error::other("x") }
+    pub fn by_field(&self) { self.db.get(); }
+    pub fn by_ret(&self) { self.cfg().get(); }
+    pub fn by_let_ret(&self) { let c = self.cfg(); c.get(); }
+    pub fn by_try(&self) -> Result<(), String> { self.open_db()?.get(); Ok(()) }
+    pub fn generic_field(&self) { self.g.get(); }
+    pub fn external_ret(&self) { self.io().get(); }
+    pub fn external_field(&self) { self.raw.get(); }
+}
+"#;
+
+/// 受け手が連鎖 (`self.field` / `x.m()` / `?`) でも、1 段ずつ書いてある型をたどって確定する。
+/// 型引数の field / repo の外の型を返す段が挟まると推定をやめる。
+#[test]
+fn method_calls_through_fields_and_return_types_are_confirmed() {
+    let d = tmp();
+    write_fixture(&d, CHAIN_RS);
+    let db = d.join("k.db");
+    index(&d, &db);
+    let out = query(&["callers", "get", "Db"], &db);
+    let (confirmed, _) = out.split_once("候補").unwrap_or((out.as_str(), ""));
+    for f in ["by_field", "by_ret", "by_let_ret", "by_try"] {
+        assert!(confirmed.contains(&format!("in Svc::{f}\t")), "{f} の連鎖が確定しない:\n{out}");
+    }
+    for f in ["generic_field", "external_ret", "external_field"] {
+        assert!(!confirmed.contains(&format!("in Svc::{f}\t")), "{f} を Db::get に誤確定:\n{out}");
+    }
+}
+
+/// field の型を書き換えたら、それを通る連鎖の解決も増分 update で付け替わる。
+#[test]
+fn chain_resolution_follows_field_type_changes_incrementally() {
+    let d = tmp();
+    write_fixture(&d, CHAIN_RS);
+    let db = d.join("k.db");
+    index(&d, &db);
+    std::fs::write(d.join("src/other.rs"), CHAIN_RS.replace("db: Db, g: T", "db: Other, g: T").replace("-> &Db { &self.db }", "-> &Other { &self.db }")).unwrap();
+    update(&d, &db);
+    let on_db = query(&["callers", "get", "Db"], &db);
+    let on_other = query(&["callers", "get", "Other"], &db);
+    assert!(!on_db.split_once("候補").map(|x| x.0).unwrap_or(&on_db).contains("in Svc::by_field\t"), "型を変えたのに古い解決が残る:\n{on_db}");
+    assert!(on_other.split_once("候補").map(|x| x.0).unwrap_or(&on_other).contains("in Svc::by_field\t"), "新しい型に付け替わらない:\n{on_other}");
+}

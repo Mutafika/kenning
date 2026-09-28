@@ -94,6 +94,73 @@ pub(crate) struct Recv {
     /// 型の出どころ (path の先頭 / `use` の先頭)。repo の外 (`std` / `walkdir`) なら同名の自前の型と
     /// 結び付けない (`walkdir::DirEntry` を自前の `DirEntry` に取り違えた実例)。空 = 手掛かり無し (ローカル)。
     pub(crate) root: String,
+    /// 起点からの手順 (空白区切り): `f:<field>` / `m:<method>` / `?`。`self.cfg.searcher().run()` の受け手は
+    /// 起点 Self + `f:cfg m:searcher`。解決時に 1 段ずつ型をたどる (1 段でも絞れなければ推定しない)。
+    pub(crate) chain: String,
+}
+
+/// 連鎖の手順の上限 (長い連鎖ほど 1 段の取り違えが響くので、そこそこで諦める)。
+const CHAIN_MAX: usize = 8;
+
+/// 書いてある型 1 つ: 名前 (path 末尾、別名は元の名前) + 出どころ + 最初の型引数 (`Result<T, E>` の T)。
+/// fn の戻り値と struct の field の型として保存し、連鎖をたどる時に使う。
+#[derive(Clone, Default, Debug, PartialEq)]
+pub(crate) struct TyRef {
+    pub(crate) name: String,
+    pub(crate) root: String,
+    pub(crate) arg: String,
+    pub(crate) arg_root: String,
+}
+
+/// `use` の引き方 (名前 → (出どころ, 元の名前))。関数の中の `use` を優先したい時は重ねて渡す。
+pub(crate) type ImportLookup<'a> = &'a dyn Fn(&str) -> Option<(String, String)>;
+
+/// 型 path の出どころ (`a::b::T` なら a を `use` で引き直す、単独 `T` は `use` の先頭、無ければ空 = ローカル)。
+pub(crate) fn type_root_of(path: &syn::Path, imp: ImportLookup) -> String {
+    let first = path.segments.first().map(|s| s.ident.to_string()).unwrap_or_default();
+    if path.segments.len() == 1 {
+        return imp(&first).map(|i| i.0).unwrap_or_default();
+    }
+    match first.as_str() {
+        "crate" | "self" | "super" | "Self" => first,
+        _ => imp(&first).map(|i| i.0).unwrap_or(first),
+    }
+}
+
+/// 単独の型名が `use .. as 別名` の別名なら元の名前に戻す (定義の container は元の名前)。
+pub(crate) fn unalias_of(path: &syn::Path, last: String, imp: ImportLookup) -> String {
+    if path.segments.len() == 1
+        && let Some((_, orig)) = imp(&last)
+    {
+        return orig;
+    }
+    last
+}
+
+/// 書いてある型 → TyRef。`&T` / `&mut T` / `T<..>` は T、型引数・`impl`/`dyn`・tuple 等は None。
+pub(crate) fn ty_ref(ty: &syn::Type, imp: ImportLookup, generics: &HashSet<String>) -> Option<TyRef> {
+    match ty {
+        syn::Type::Reference(r) => ty_ref(&r.elem, imp, generics),
+        syn::Type::Paren(p) => ty_ref(&p.elem, imp, generics),
+        syn::Type::Group(g) => ty_ref(&g.elem, imp, generics),
+        syn::Type::Path(p) if p.qself.is_none() => {
+            let seg = p.path.segments.last()?;
+            let last = seg.ident.to_string();
+            if p.path.segments.len() == 1 && generics.contains(&last) {
+                return None;
+            }
+            let arg = match &seg.arguments {
+                syn::PathArguments::AngleBracketed(a) => a.args.iter().find_map(|g| match g {
+                    syn::GenericArgument::Type(t) => ty_ref(t, imp, generics),
+                    _ => None,
+                }),
+                _ => None,
+            }
+            .unwrap_or_default();
+            Some(TyRef { name: unalias_of(&p.path, last, imp), root: type_root_of(&p.path, imp), arg: arg.name, arg_root: arg.root })
+        }
+        _ => None,
+    }
 }
 
 /// 1 呼び出し箇所。名前解決の材料として修飾 (`Type::` / `mod::`) も持つ。
@@ -156,25 +223,9 @@ impl CallCollector {
             _ => self.import(&first).map(|i| i.0.clone()).unwrap_or(first),
         }
     }
-    /// 型 path の出どころ (`a::b::T` なら a を `use` で引き直す、単独 `T` は `use` の先頭)。
-    fn type_root(&self, path: &syn::Path) -> String {
-        let first = path.segments.first().map(|s| s.ident.to_string()).unwrap_or_default();
-        if path.segments.len() == 1 {
-            return self.import(&first).map(|i| i.0.clone()).unwrap_or_default();
-        }
-        match first.as_str() {
-            "crate" | "self" | "super" | "Self" => first,
-            _ => self.import(&first).map(|i| i.0.clone()).unwrap_or(first),
-        }
-    }
-    /// 単独の型名が `use .. as 別名` の別名なら元の名前に戻す (定義の container は元の名前)。
-    fn unalias(&self, path: &syn::Path, last: String) -> String {
-        if path.segments.len() == 1
-            && let Some((_, orig)) = self.import(&last)
-        {
-            return orig.clone();
-        }
-        last
+    /// この collector の `use` の引き方 (関数の中の `use` → file の `use`)。
+    fn imp(&self) -> impl Fn(&str) -> Option<(String, String)> + '_ {
+        move |n: &str| self.import(n).cloned()
     }
     fn lookup(&self, name: &str) -> Option<Recv> {
         self.scopes.iter().rev().find_map(|s| s.get(name)).cloned().flatten()
@@ -187,26 +238,27 @@ impl CallCollector {
     }
     /// 書いてある型 → 手掛かり。`&T` / `&mut T` / `T<..>` は T。型引数・`impl`/`dyn`・tuple 等は無し。
     fn type_recv(&self, ty: &syn::Type) -> Option<Recv> {
-        match ty {
-            syn::Type::Reference(r) => self.type_recv(&r.elem),
-            syn::Type::Paren(p) => self.type_recv(&p.elem),
-            syn::Type::Group(g) => self.type_recv(&g.elem),
-            syn::Type::Path(p) if p.qself.is_none() => {
-                let last = p.path.segments.last()?.ident.to_string();
-                if p.path.segments.len() == 1 && self.generics.contains(&last) {
-                    return None;
-                }
-                Some(Recv { ty: self.unalias(&p.path, last), root: self.type_root(&p.path), ..Default::default() })
-            }
-            _ => None,
-        }
+        let t = ty_ref(ty, &self.imp(), &self.generics)?;
+        Some(Recv { ty: t.name, root: t.root, ..Default::default() })
     }
-    /// `let x = <init>` の init から型の手掛かり: `T { .. }` / `T::f(..)` / `T::f(..)?` / `&..` / `y` (y の型)。
-    fn init_recv(&self, e: &syn::Expr) -> Option<Recv> {
+    /// 式の型の手掛かり: `T { .. }` / `T::f(..)` / `x` / `self` を起点に、`.field` / `.m(..)` / `?` を
+    /// 手順として積む (`let y = x.a()?;` の y、`self.cfg.run()` の受け手)。型そのものは解決時にたどる。
+    fn expr_recv(&self, e: &syn::Expr) -> Option<Recv> {
+        fn step(mut r: Recv, s: String) -> Option<Recv> {
+            if r.chain.split(' ').filter(|x| !x.is_empty()).count() >= CHAIN_MAX {
+                return None;
+            }
+            if !r.chain.is_empty() {
+                r.chain.push(' ');
+            }
+            r.chain.push_str(&s);
+            Some(r)
+        }
         match e {
             syn::Expr::Struct(s) if s.qself.is_none() => {
                 let last = s.path.segments.last()?.ident.to_string();
-                Some(Recv { ty: self.unalias(&s.path, last), root: self.type_root(&s.path), ..Default::default() })
+                let imp = self.imp();
+                Some(Recv { ty: unalias_of(&s.path, last, &imp), root: type_root_of(&s.path, &imp), ..Default::default() })
             }
             syn::Expr::Call(c) => {
                 let syn::Expr::Path(p) = &*c.func else { return None };
@@ -219,12 +271,25 @@ impl CallCollector {
                 if !q.starts_with(|c: char| c.is_ascii_uppercase()) || (segs.len() == 2 && self.generics.contains(&q)) {
                     return None;
                 }
-                Some(Recv { ty: q, via_fn: segs.last()?.ident.to_string(), via_try: false, root: self.root_of(&p.path) })
+                Some(Recv { ty: q, via_fn: segs.last()?.ident.to_string(), root: self.root_of(&p.path), ..Default::default() })
             }
-            syn::Expr::Try(t) => self.init_recv(&t.expr).filter(|r| !r.via_fn.is_empty() && !r.via_try).map(|r| Recv { via_try: true, ..r }),
-            syn::Expr::Reference(r) => self.init_recv(&r.expr),
-            syn::Expr::Paren(p) => self.init_recv(&p.expr),
-            syn::Expr::Group(g) => self.init_recv(&g.expr),
+            syn::Expr::Try(t) => {
+                let r = self.expr_recv(&t.expr)?;
+                if r.chain.is_empty() && !r.via_fn.is_empty() && !r.via_try {
+                    Some(Recv { via_try: true, ..r })
+                } else {
+                    step(r, "?".into())
+                }
+            }
+            syn::Expr::Field(f) => match &f.member {
+                syn::Member::Named(id) => step(self.expr_recv(&f.base)?, format!("f:{id}")),
+                syn::Member::Unnamed(_) => None,
+            },
+            syn::Expr::MethodCall(m) => step(self.expr_recv(&m.receiver)?, format!("m:{}", m.method)),
+            syn::Expr::Reference(r) => self.expr_recv(&r.expr),
+            syn::Expr::Paren(p) => self.expr_recv(&p.expr),
+            syn::Expr::Group(g) => self.expr_recv(&g.expr),
+            syn::Expr::Path(p) if p.path.is_ident("self") => Some(Recv { ty: "Self".into(), ..Default::default() }),
             syn::Expr::Path(p) => p.path.get_ident().and_then(|i| self.lookup(&i.to_string())),
             _ => None,
         }
@@ -326,10 +391,7 @@ impl<'ast> Visit<'ast> for CallCollector {
         // 今いる impl の型なので、その container の同名 method に健全に確定できる。
         let self_recv = matches!(&*node.receiver, syn::Expr::Path(p) if p.path.is_ident("self"));
         // それ以外は、受け手が束縛名 `x` で、その型がソースに書いてある時だけ手掛かりを持つ。
-        let recv = match &*node.receiver {
-            syn::Expr::Path(p) if !self_recv => p.path.get_ident().and_then(|i| self.lookup(&i.to_string())).unwrap_or_default(),
-            _ => Recv::default(),
-        };
+        let recv = if self_recv { Recv::default() } else { self.expr_recv(&node.receiver).unwrap_or_default() };
         self.calls.push(RawCall {
             name: node.method.to_string(),
             qualifier: None,
@@ -383,7 +445,7 @@ impl<'ast> Visit<'ast> for CallCollector {
             },
             syn::Pat::Ident(pi) if pi.subpat.is_none() => {
                 // `let x = ... else { .. }` (let-else) は refutable パターンなので init の型と x の型が違う
-                let r = node.init.as_ref().filter(|i| i.diverge.is_none()).and_then(|i| self.init_recv(&i.expr));
+                let r = node.init.as_ref().filter(|i| i.diverge.is_none()).and_then(|i| self.expr_recv(&i.expr));
                 (Some(pi.ident.to_string()), r)
             }
             _ => (None, None),
@@ -424,7 +486,7 @@ pub(crate) struct SymDef {
     container: String, // impl 型 (method) / "" (free fn)。`Type::` 修飾の突き合わせ用
     module: String,    // "a::b"。`mod::` 修飾の突き合わせ用
     crate_: String,    // 定義元 crate。`mycrate::fn` / `enchudb_schema::foo` の突き合わせ用
-    sig: String,       // シグネチャ 1 行。`let x = T::new()` の x の型を戻り値から決める
+    ret: TyRef,        // 戻り値の型。`T::new()` / `x.a()` の型を決める (出どころ付き)
 }
 
 /// Cargo の crate 名は `-`、Rust path は `_`。突き合わせ前に正規化する。
@@ -464,6 +526,7 @@ pub(crate) struct Acc {
     pub(crate) defs: HashMap<String, Vec<SymDef>>, // name → 定義群 (syn 解決用)
     pub(crate) pending: Vec<CallSite>,             // 未解決 call-site
     pub(crate) impls: Vec<ImplEdge>,               // impl Trait for Type edge
+    pub(crate) fields: Vec<(EntityId, RawField)>,  // struct の field の型 (file eid 付き、挿入は呼び側)
     pub(crate) scip: Option<Scip>,                 // Some なら SCIP 位置 join で正確解決
     pub(crate) sym_by_symbol: HashMap<String, EntityId>, // SCIP symbol 文字列 → 自 index の sym eid (0 = 複数定義に衝突)
     pub(crate) file_by_rel: HashMap<String, EntityId>,   // rel_path → file eid (SCIP ref-ingest 用)
@@ -491,6 +554,7 @@ pub(crate) struct FileFacts {
     /// item 直下のマクロ (`criterion_group!(benches, bench_tie, …)`) の中の参照。
     /// 関数の中ではないので caller となる sym が無い = caller 無しの call 行として持つ。
     pub(crate) item_calls: Vec<RawCall>,
+    pub(crate) fields: Vec<RawField>,
 }
 
 /// 1 定義 + その本体の呼び出し箇所。
@@ -509,7 +573,15 @@ pub(crate) struct RawSym {
     pub(crate) sig: String,
     pub(crate) doc: String,
     pub(crate) attrs: String, // 正規化済み属性 (`allow(dead_code) inline`)。facet `attr:` の材料
+    pub(crate) ret: TyRef,    // fn / method の戻り値の型 (連鎖 `x.a().b()` をたどる材料。無ければ空)
     pub(crate) calls: Vec<RawCall>,
+}
+
+/// struct の名前付き field 1 つとその型 (連鎖 `self.cfg.run()` をたどる材料)。
+pub(crate) struct RawField {
+    pub(crate) strukt: String,
+    pub(crate) name: String,
+    pub(crate) ty: TyRef,
 }
 
 /// `impl Trait for Type` (file eid は挿入時に付く)。
@@ -576,6 +648,15 @@ pub(crate) fn record_symbol(
         sig: sig.map(sig_text).unwrap_or_default(),
         doc: first_doc_line(attrs),
         attrs: attrs_text(attrs),
+        ret: sig.and_then(|s| match &s.output {
+            syn::ReturnType::Type(_, ty) => {
+                let generics: HashSet<String> = ctx.impl_generics.iter().cloned().chain(s.generics.type_params().map(|t| t.ident.to_string())).collect();
+                let imp = |n: &str| ctx.imports.get(n).cloned();
+                ty_ref(ty, &imp, &generics)
+            }
+            syn::ReturnType::Default => None,
+        })
+        .unwrap_or_default(),
         calls,
     });
 }
@@ -616,6 +697,10 @@ pub(crate) fn insert_file_facts(file_t: &Table, sym_t: &Table, acc: &mut Acc, ro
             .set("container", s.container.clone())
             .set("symbol", symbol.as_str())
             .set("sig", s.sig.as_str())
+            .set("ret_ty", s.ret.name.as_str())
+            .set("ret_root", s.ret.root.as_str())
+            .set("ret_arg", s.ret.arg.as_str())
+            .set("ret_arg_root", s.ret.arg_root.as_str())
             .set("doc", s.doc.as_str())
         .set("attrs", s.attrs.as_str())
             .set("line", s.line)
@@ -623,7 +708,7 @@ pub(crate) fn insert_file_facts(file_t: &Table, sym_t: &Table, acc: &mut Acc, ro
             .commit()
             .unwrap();
         // 名前解決の突き合わせ先として登録 (syn 用)。
-        acc.defs.entry(s.name).or_default().push(SymDef { eid: sym_eid, kind: s.kind, container: s.container.clone(), module: s.module, crate_: crate_name.clone(), sig: s.sig.clone() });
+        acc.defs.entry(s.name).or_default().push(SymDef { eid: sym_eid, kind: s.kind, container: s.container.clone(), module: s.module, crate_: crate_name.clone(), ret: s.ret.clone() });
         // SCIP symbol → 自 index の eid (call の正確解決に使う)。
         // **衝突したら 0 (曖昧) にする**: RA の symbol 文字列は test / example / bench の各ターゲットで
         // 同じになることがあり (enchudb には同名 `cleanup` が 108 個)、上書きすると
@@ -678,6 +763,7 @@ pub(crate) fn insert_file_facts(file_t: &Table, sym_t: &Table, acc: &mut Acc, ro
     for im in facts.impls {
         acc.impls.push(ImplEdge { trait_name: im.trait_name, type_name: im.type_name, file: file_eid, line: im.line });
     }
+    acc.fields.extend(facts.fields.into_iter().map(|f| (file_eid, f)));
 }
 
 /// parse できない macro body (`proptest! { fn f(x in strategy) { helper(); } }` のような DSL) を
@@ -801,11 +887,23 @@ pub(crate) fn walk_item(it: &syn::Item, ctx: &mut Ctx, out: &mut FileFacts) {
                 &f.attrs,
             );
         }
-        syn::Item::Struct(s) => record_symbol(
-            ctx, out, &s.ident.to_string(), K_STRUCT,
-            classify_vis(&s.vis), false, ctx.in_test, line_of(s.ident.span()), col_of(s.ident.span()), end_line_of(s), None, None,
-            &s.attrs,
-        ),
+        syn::Item::Struct(s) => {
+            record_symbol(
+                ctx, out, &s.ident.to_string(), K_STRUCT,
+                classify_vis(&s.vis), false, ctx.in_test, line_of(s.ident.span()), col_of(s.ident.span()), end_line_of(s), None, None,
+                &s.attrs,
+            );
+            // 名前付き field の型 (struct の型引数は具体型ではないので除く)。
+            let generics: HashSet<String> = s.generics.type_params().map(|t| t.ident.to_string()).collect();
+            let imp = |n: &str| ctx.imports.get(n).cloned();
+            if let syn::Fields::Named(named) = &s.fields {
+                for f in &named.named {
+                    if let (Some(id), Some(t)) = (&f.ident, ty_ref(&f.ty, &imp, &generics)) {
+                        out.fields.push(RawField { strukt: s.ident.to_string(), name: id.to_string(), ty: t });
+                    }
+                }
+            }
+        }
         syn::Item::Enum(e) => record_symbol(
             ctx, out, &e.ident.to_string(), K_ENUM,
             classify_vis(&e.vis), false, ctx.in_test, line_of(e.ident.span()), col_of(e.ident.span()), end_line_of(e), None, None,
@@ -905,10 +1003,11 @@ pub(crate) fn walk_item(it: &syn::Item, ctx: &mut Ctx, out: &mut FileFacts) {
 pub(crate) struct Resolver<'a> {
     pub(crate) defs: &'a HashMap<String, Vec<SymDef>>,
     local_roots: HashSet<String>,
+    fields: FieldTypes,
 }
 impl<'a> Resolver<'a> {
     /// `rs_paths` = index 対象の .rs (module 名 = file 名 / mod.rs の dir 名を内側に数える)。
-    pub(crate) fn new<'p>(defs: &'a HashMap<String, Vec<SymDef>>, rs_paths: impl Iterator<Item = &'p str>) -> Self {
+    pub(crate) fn new<'p>(defs: &'a HashMap<String, Vec<SymDef>>, rs_paths: impl Iterator<Item = &'p str>, fields: FieldTypes) -> Self {
         let mut local_roots: HashSet<String> = ["crate", "self", "super", "Self"].iter().map(|s| s.to_string()).collect();
         for d in defs.values().flatten() {
             local_roots.insert(crate_key(&d.crate_));
@@ -928,11 +1027,68 @@ impl<'a> Resolver<'a> {
                 None => {}
             }
         }
-        Resolver { defs, local_roots }
+        Resolver { defs, local_roots, fields }
     }
     fn is_local(&self, root: &str) -> bool {
         root.is_empty() || self.local_roots.contains(&crate_key(root))
     }
+    /// 型 `t` の関数 `f` (method なら `method` = true) の戻り値。ちょうど 1 つに絞れて、戻り値の出どころが
+    /// 内側の時だけ。`Self` (と `Result<Self>` の Self) は t に読み替える。
+    fn ret_of(&self, t: &str, f: &str, method: bool) -> Option<TyRef> {
+        let ds: Vec<&SymDef> = self.defs.get(f)?.iter().filter(|d| d.container == t && (d.kind == K_METHOD || (!method && d.kind == K_FN))).collect();
+        let [d] = ds.as_slice() else { return None };
+        let mut r = d.ret.clone();
+        if r.name.is_empty() {
+            return None;
+        }
+        if r.name == "Self" {
+            r.name = t.to_string();
+            r.root = String::new();
+        } else if !self.is_local(&r.root) && !matches!(r.name.as_str(), "Result" | "Option") {
+            return None; // repo の外の型 (次の段の method は repo に無い)
+        }
+        if r.arg == "Self" {
+            r.arg = t.to_string();
+            r.arg_root = String::new();
+        }
+        Some(r)
+    }
+}
+
+/// struct field の型の表: (struct 名, field 名) → 型 (同名 struct が複数 crate にあれば複数)。
+pub(crate) type FieldTypes = HashMap<(String, String), Vec<TyRef>>;
+
+/// 集めた field を field 表に書く (index / update 共通)。
+pub(crate) fn insert_fields(field_t: &Table, fields: &[(EntityId, RawField)]) {
+    for (file, f) in fields {
+        field_t
+            .insert()
+            .set("strukt", f.strukt.as_str())
+            .set("name", f.name.as_str())
+            .set("ty", f.ty.name.as_str())
+            .set("root", f.ty.root.as_str())
+            .set("arg", f.ty.arg.as_str())
+            .set("arg_root", f.ty.arg_root.as_str())
+            .set("file", Value::Ref(*file))
+            .commit()
+            .unwrap();
+    }
+}
+
+/// field 表 → FieldTypes (増分 update の再解決用)。旧 index で表が無ければ空。
+pub(crate) fn load_field_types(field_t: Option<&Table>) -> FieldTypes {
+    let mut m = FieldTypes::new();
+    let Some(t) = field_t else { return m };
+    for e in t.all().find().unwrap_or_default() {
+        let er = t.entity(e);
+        m.entry((txt(er.get("strukt")), txt(er.get("name")))).or_default().push(TyRef {
+            name: txt(er.get("ty")),
+            root: txt(er.get("root")),
+            arg: txt(er.get("arg")),
+            arg_root: txt(er.get("arg_root")),
+        });
+    }
+    m
 }
 
 /// 1 呼び出し箇所を定義表に突き合わせて (解決先 eid, 信頼度) を返す。推測はしない。
@@ -1044,81 +1200,52 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
     }
 }
 
-/// 受け手の型名。`Self` は caller の impl 型に、`T::f()` 由来は f の戻り値が `Self` / `T`
-/// (`?` 付きなら `Result<Self, _>` / `Option<Self>`) の時だけ T と認める。それ以外は None (推定しない)。
+/// 受け手の型名。起点 (`Self` は caller の impl 型、`T::f()` 由来は f の戻り値) から連鎖の手順を 1 段ずつ
+/// たどる。どの段でも「ちょうど 1 つに絞れる・出どころが repo の内側」でなければ None (推定しない)。
 fn recv_type_of(cs: &CallSite, rz: &Resolver) -> Option<String> {
     let r = &cs.recv;
     if r.ty.is_empty() || !rz.is_local(&r.root) {
         return None;
     }
-    let defs = rz.defs;
-    let t = if r.ty == "Self" { cs.caller_container.clone() } else { r.ty.clone() };
+    let mut t = if r.ty == "Self" { cs.caller_container.clone() } else { r.ty.clone() };
     if t.is_empty() {
         return None;
     }
-    if r.via_fn.is_empty() {
-        return Some(t);
-    }
-    let ctor: Vec<&SymDef> = defs.get(&r.via_fn)?.iter().filter(|d| d.container == t && (d.kind == K_FN || d.kind == K_METHOD)).collect();
-    let [d] = ctor.as_slice() else { return None };
-    let (name, args) = split_generic(&ret_type(&d.sig)?);
-    let is_t = |s: &str| s == "Self" || s == t;
-    let ok = if r.via_try {
-        matches!(name.as_str(), "Result" | "Option") && args.first().is_some_and(|a| is_t(&split_generic(a).0))
-    } else {
-        is_t(&name)
-    };
-    ok.then_some(t)
-}
-
-/// シグネチャ文字列の戻り値の型 (`fn f(a: A) -> R where ..` の R)。無ければ None。
-pub(crate) fn ret_type(sig: &str) -> Option<String> {
-    let open = sig.find('(')?;
-    let mut depth = 0i32;
-    let mut close = None;
-    for (i, c) in sig[open..].char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(open + i);
-                    break;
-                }
-            }
-            _ => {}
+    // 直前の段が関数の戻り値なら、その型 (`?` で中身を取るため)。
+    let mut last_ret: Option<TyRef> = None;
+    if !r.via_fn.is_empty() {
+        let ret = rz.ret_of(&t, &r.via_fn, false)?;
+        t = ret.name.clone();
+        last_ret = Some(ret);
+        if r.via_try {
+            t = unwrap_try(last_ret.take()?, rz)?;
         }
     }
-    let rest = sig[close? + 1..].trim_start().strip_prefix("->")?;
-    let rest = rest.split(" where ").next().unwrap_or(rest);
-    Some(rest.trim().to_string())
-}
-
-/// `io::Result<Self, E>` → ("Result", ["Self", "E"])。path は末尾 seg、`&` / `mut` は落とす。
-pub(crate) fn split_generic(ty: &str) -> (String, Vec<String>) {
-    let ty = ty.trim().trim_start_matches('&').trim_start_matches("mut ").trim();
-    let (head, inner) = match ty.find('<') {
-        Some(i) if ty.ends_with('>') => (&ty[..i], &ty[i + 1..ty.len() - 1]),
-        _ => (ty, ""),
-    };
-    let name = head.rsplit("::").next().unwrap_or(head).trim().to_string();
-    let mut args = Vec::new();
-    let (mut depth, mut start) = (0i32, 0usize);
-    for (i, c) in inner.char_indices() {
-        match c {
-            '<' | '(' => depth += 1,
-            '>' | ')' => depth -= 1,
-            ',' if depth == 0 => {
-                args.push(inner[start..i].trim().to_string());
-                start = i + 1;
+    for s in r.chain.split(' ').filter(|s| !s.is_empty()) {
+        if s == "?" {
+            t = unwrap_try(last_ret.take()?, rz)?;
+        } else if let Some(f) = s.strip_prefix("f:") {
+            last_ret = None;
+            let tys = rz.fields.get(&(t.clone(), f.to_string()))?;
+            let [ty] = tys.as_slice() else { return None }; // 同名 struct が複数 → 絞れない
+            if ty.name.is_empty() || !rz.is_local(&ty.root) {
+                return None;
             }
-            _ => {}
+            t = ty.name.clone();
+        } else if let Some(m) = s.strip_prefix("m:") {
+            let ret = rz.ret_of(&t, m, true)?;
+            t = ret.name.clone();
+            last_ret = Some(ret);
+        } else {
+            return None;
         }
     }
-    if !inner.trim().is_empty() {
-        args.push(inner[start..].trim().to_string());
-    }
-    (name, args)
+    Some(t)
+}
+
+/// `?` を当てた後の型: 戻り値が `Result<T, _>` / `Option<T>` の T (出どころが内側の時だけ)。
+fn unwrap_try(ret: TyRef, rz: &Resolver) -> Option<String> {
+    (matches!(ret.name.as_str(), "Result" | "Option") && !ret.arg.is_empty() && rz.is_local(&ret.arg_root)).then_some(ret.arg)
 }
 
 /// 解決済み (target, res) で call 行を挿入。解決した call だけ callee_sym を set。
@@ -1135,6 +1262,8 @@ pub(crate) fn do_insert_call(call_t: &Table, cs: &CallSite, target: Option<Entit
         .set("recv_fn", cs.recv.via_fn.as_str())
         .set("recv_try", cs.recv.via_try as u32)
         .set("recv_root", cs.recv.root.as_str())
+        .set("recv_chain", cs.recv.chain.as_str())
+        .set("has_chain", !cs.recv.chain.is_empty() as u32)
         .set("qual_root", cs.qual_root.as_str());
     if cs.caller != 0 {
         ins = ins.set("caller", Value::Ref(cs.caller)); // 0 = item 直下 (関数の外) → 未 set
@@ -1166,7 +1295,7 @@ pub(crate) fn build_defs_from_table(sym_t: &Table) -> HashMap<String, Vec<SymDef
             container: txt(er.get("container")),
             module: txt(er.get("module")),
             crate_: txt(er.get("crate_")),
-            sig: txt(er.get("sig")),
+            ret: TyRef { name: txt(er.get("ret_ty")), root: txt(er.get("ret_root")), arg: txt(er.get("ret_arg")), arg_root: txt(er.get("ret_arg_root")) },
         });
     }
     defs
@@ -1174,7 +1303,7 @@ pub(crate) fn build_defs_from_table(sym_t: &Table) -> HashMap<String, Vec<SymDef
 
 /// 1 ファイルの sym / call / impl / file 行を全消去。消えた sym の名前を `affected` に集める
 /// (他ファイルからの incoming edge を後で再解決するため)。impl_t は旧 index で無いこともある。
-pub(crate) fn purge_file(sym_t: &Table, call_t: &Table, file_t: &Table, impl_t: Option<&Table>, file_eid: EntityId, affected: &mut HashSet<String>) {
+pub(crate) fn purge_file(sym_t: &Table, call_t: &Table, file_t: &Table, impl_t: Option<&Table>, field_t: Option<&Table>, file_eid: EntityId, affected: &mut HashSet<String>) {
     for s in sym_t.all().where_ref("file", file_eid).find().unwrap() {
         affected.insert(txt(sym_t.entity(s).get("name")));
         sym_t.entity(s).delete().unwrap();
@@ -1185,6 +1314,13 @@ pub(crate) fn purge_file(sym_t: &Table, call_t: &Table, file_t: &Table, impl_t: 
     if let Some(it) = impl_t {
         for ie in it.all().where_ref("file", file_eid).find().unwrap() {
             it.entity(ie).delete().unwrap();
+        }
+    }
+    // field の型が変わると、それを通る連鎖 (`self.cfg.run()`) の解決が変わる → field 名も影響名に。
+    if let Some(ft) = field_t {
+        for fe in ft.all().where_ref("file", file_eid).find().unwrap_or_default() {
+            affected.insert(txt(ft.entity(fe).get("name")));
+            ft.entity(fe).delete().unwrap();
         }
     }
     file_t.entity(file_eid).delete().unwrap();
@@ -1240,7 +1376,7 @@ pub(crate) fn file_imports(items: &[syn::Item]) -> HashMap<String, (String, Stri
 
 pub(crate) fn extract_file(src: &str) -> Option<FileFacts> {
     let file = syn::parse_file(src).ok()?;
-    let mut out = FileFacts { loc: src.lines().count() as u32, hash: hash_u32(src), syms: Vec::new(), impls: Vec::new(), item_calls: Vec::new() };
+    let mut out = FileFacts { loc: src.lines().count() as u32, hash: hash_u32(src), syms: Vec::new(), impls: Vec::new(), item_calls: Vec::new(), fields: Vec::new() };
     // file 冒頭の inner attribute (`#![cfg(test)]`) は file 全体に効く。per-file parse では親の
     // `#[cfg(test)] mod x;` が見えないので、これを見ないと test 専用 file の helper が
     // 「test でない symbol」として出てしまう (`tests <name>` と `search test:1` が取りこぼす)。

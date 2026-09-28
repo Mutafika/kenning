@@ -253,7 +253,8 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
     let ref_cap = if scip_path.is_some() { (n_files_est * 400).max(rs_kb * 24).max(32_768) * cap_mult } else { 1_024 };
     let impl_cap = (n_files_est * 16).max(rs_kb).max(1_024) * cap_mult; // impl Trait for Type edge
     let extref_cap = if scip_path.is_some() { (n_files_est * 100).max(8_192) * cap_mult } else { 1_024 };
-    let max_entities = (file_cap + dir_cap + sym_cap + call_cap + ref_cap + impl_cap + extref_cap) * 11 / 10; // +10% 余白
+    let field_cap = sym_cap; // field 数は定義数と同程度
+    let max_entities = (file_cap + dir_cap + sym_cap + call_cap + ref_cap + impl_cap + extref_cap + field_cap) * 11 / 10; // +10% 余白
     let mut db = Database::create_growable_with_capacity(tmp, max_entities).unwrap();
     db.table("file")
         .tag("path")
@@ -277,6 +278,10 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         .tag("container")
         .tag("symbol") // SCIP グローバル一意 symbol (無指定なら "")。cross-file 同一性の鍵
         .tag("sig") // fn/method のシグネチャ 1 行 (hover 相当。他 kind は "")
+        .tag("ret_ty") // 戻り値の型 (TyRef)。受け手の連鎖 `x.a().b()` をたどる材料
+        .tag("ret_root")
+        .tag("ret_arg")
+        .tag("ret_arg_root")
         .tag("attrs") // 正規化済み属性 (`allow(dead_code) inline`)。facet `attr:` の材料
         .tag("doc") // doc コメント 1 行目 (無ければ ""。def/outline で sig と並べて出す)
         .number("line")
@@ -298,6 +303,8 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         .number("recv_try")
         .tag("recv_root")
         .tag("qual_root")
+        .tag("recv_chain") // 受け手の連鎖の手順 (`f:cfg m:searcher ?`)
+        .number("has_chain") // 連鎖あり = 増分 update で型の変化に追従して解き直す対象
         .ref_to("file", "file")
         .number("line")
         .with_capacity(call_cap)
@@ -332,6 +339,18 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         .ref_to("file", "file")
         .number("line")
         .with_capacity(impl_cap)
+        .build()
+        .unwrap();
+    // struct field の型 (受け手の連鎖 `self.cfg.run()` をたどる材料)。file 別 = 増分 update で purge/再挿入。
+    db.table("field")
+        .tag("strukt")
+        .tag("name")
+        .tag("ty")
+        .tag("root")
+        .tag("arg")
+        .tag("arg_root")
+        .ref_to("file", "file")
+        .with_capacity(field_cap)
         .build()
         .unwrap();
     // 自己記述メタ (1 行): どの root をいつ index したか。staleness 警告と `update <db>` に使う。
@@ -403,7 +422,17 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
     let mut d_indoc_method = 0u64;
     let mut d_sameline = 0u64; // 同じ行に occurrence はある = 列の対応ズレ (join の取りこぼし) // うち method 呼び (x.f())
     let mut d_samples: Vec<String> = Vec::new();
-    let rz = Resolver::new(&acc.defs, ws.rs.iter().filter_map(|p| p.to_str()));
+    if let Some(ft) = db.get_table("field") {
+        insert_fields(&ft, &acc.fields);
+    }
+    let field_types = {
+        let mut m = FieldTypes::new();
+        for (_, f) in &acc.fields {
+            m.entry((f.strukt.clone(), f.name.clone())).or_default().push(f.ty.clone());
+        }
+        m
+    };
+    let rz = Resolver::new(&acc.defs, ws.rs.iter().filter_map(|p| p.to_str()), field_types);
     for cs in &acc.pending {
         if (cs.as_value || cs.in_macro) && !acc.defs.contains_key(&cs.name) {
             continue; // 定義表に無い名前 = 局所変数 / 外部。call 表をノイズで膨らませない
@@ -484,7 +513,7 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         }
     }
     let resolve_el = t2.elapsed();
-    let resolved = res_counts[R_UNIQUE as usize] + res_counts[R_QUALIFIED as usize];
+    let resolved = res_counts[R_UNIQUE as usize] + res_counts[R_QUALIFIED as usize] + res_counts[R_TYPED as usize];
 
     // 率の分母は **外部呼び出しを除いた repo 内 call-site**。std/dep への呼び出しは index に
     // 定義が無く解決不能なので、混ぜると corpus の外部依存率を精度として報告してしまう。
