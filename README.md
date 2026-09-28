@@ -119,6 +119,12 @@ kenning search  kind:fn callers:0 namecalls:0 test:0   the one-hop version (in-d
 kenning outline <path|dir>          file structure without reading the file; a directory maps
                                     the files under it (symbol count / loc), `.` maps the repo
 kenning bake                        run rust-analyzer once, ingest SCIP → RA-grade precision
+kenning changes --since HEAD        semantic diff of uncommitted work: broken references, signature
+                                    changes (+ caller count), newly dead / unwired definitions, callers
+                                    that dropped to 0. --since takes any git ref, a sinfo snap
+                                    (`snap` / `snap:<id|label>`) or a token; --cursor <name> keeps a
+                                    moving baseline; --json for NDJSON. Cheap mid-refactor check —
+                                    `cargo check` stays the final gate
 kenning stats   [path:<substr>]     index size + resolution breakdown; path: narrows to a subtree
 kenning cache   [ls|prune]          list / prune auto-derived indexes (missing repo, old format,
                                     --older-than D, --dry-run)
@@ -143,6 +149,7 @@ wrong:
 | `KENNING_BAKE_DEFAULT_FEATURES=1` | skip `features = "all"` from the start |
 | `KENNING_BAKE_RUSTFLAGS=<flags>` | extra `RUSTFLAGS` for the rust-analyzer run — for repos whose code is behind a custom cfg that never appears in `Cargo.toml` (`--cfg tokio_unstable` moves tokio from 59.2 % to 65.0 %) |
 | `KENNING_RA=<path>` | rust-analyzer binary to use for `bake` |
+| `KENNING_AUTO_BAKE=0` | turn off auto-bake. By default a repo you have baked once is re-baked in the background (`nice`, detached — the query never waits) when a git commit or sinfo vup lands after the last bake, or 20 files changed since it, and only if the machine is idle enough (load per CPU < 1, free memory, one bake per machine, 30 min apart). `KENNING_NO_AUTO=1` also stops it |
 
 ## Design points
 
@@ -154,10 +161,21 @@ wrong:
   of resolved edges — no false positives), *candidates* (same-name call-sites not yet
   resolved — check these), and *resolved-to-other*. The union is grep-complete, the labels
   tell you which rows you can trust blindly. The tool never guesses.
-- **A method call with an unknown receiver is never confirmed.** syn cannot know the type of
-  `x` in `x.f()`, so even a repo-unique method name stays a located `[method-name]` candidate.
-  Only `self.f()` (receiver = the enclosing impl type) and whatever SCIP answers get confirmed.
-  Without that line, `.next()` / `.len()` show up as "confirmed callers" of your same-named method.
+- **Receiver types come only from what is written — and are checked against rust-analyzer.**
+  `x.f()` is confirmed only when `x`'s type can be read off the source (parameter / `let`
+  annotations, struct literals, `T::new()` returning `Self`, field types, return types, `?`, a
+  single trait bound / `dyn` / `impl Trait`) *and* Rust's method resolution could not land somewhere
+  else (a prelude type like `Vec`, an impl for `&T`, an extension trait with the same method, a
+  `self: Pin<&mut Self>` receiver, a re-exported foreign type, a `#[cfg]`-switched alternative, a
+  user macro that may rewrite `self`...). Everything else stays a located `[method-name]` candidate —
+  otherwise `.next()` / `.len()` show up as "confirmed callers" of your own same-named method.
+  `kenning bench infer` re-indexes a baked repo syn-only and compares every confirmed call with the
+  `.scip` at the same position: **0 wrong on ripgrep, tokio and kenning** (it started at 43 on ripgrep
+  and 286 on tokio — most of them syn-layer mistakes that predate inference and had never been
+  measured).
+- **Stale bakes degrade per file, never silently.** `bake` records each file's content hash; a
+  re-index uses SCIP only for files unchanged since, so answers from shifted lines are never joined
+  to today's code. Auto-bake refreshes at the next commit / vup.
 - **cfg-blind recovery.** rust-analyzer only analyzes the active cfg configuration, so SCIP
   is silent inside `#[cfg(...)]` branches that are off. `syn` sees every branch. Where SCIP
   is silent, resolution falls back to a conservative syn resolver — kenning finds impls
@@ -182,7 +200,9 @@ wrong:
 
 Run it yourself: `./bench/corpus.sh && ./bench/run.sh` — pinned corpora (tokio @ tokio-1.43.0),
 fixed random seed, methodology self-described next to every table. Full output:
-[bench/RESULTS.md](bench/RESULTS.md).
+[bench/RESULTS.md](bench/RESULTS.md). The suite tables below were measured on v0.4.x; v0.5.0
+changes syn-layer resolution (more calls confirmed, the wrong ones removed), so rerun for current
+numbers. Resolution accuracy has its own suite: `kenning bench infer` (in a freshly baked repo).
 
 | Suite | tokio (722 files) | ripgrep (100 files) | enchudb (258 files) | What it measures |
 |---|---|---|---|---|
@@ -262,12 +282,12 @@ it cannot say *which* definition a call belongs to, and has no impact/path/facet
   std / dependency crates are excluded from the denominator — see below) before → after:
   tokio 15.5 % → 59.1 %, ripgrep 23.9 % → 90.4 % (both `features = "all"`), enchudb
   18.1 % → 80.2 % — enchudb bakes with *default* features because `features = "all"` stalls
-  past the timeout there, exactly the fallback the cap exists for. The syn layer starts low
-  because it refuses to confirm a method call whose receiver type it cannot know (`x.f()`);
-  name-only confirmation would list `.next()` as a caller of your own same-named method.
-  What it drops stays as a located candidate. kenning itself, mostly free functions, reads
-  81.9 % syn-only and 86.9 % baked — only five points of headroom, because a non-inflating syn
-  layer already resolves most of what this repo is made of (`self.f()` and free functions).
+  past the timeout there, exactly the fallback the cap exists for. Without a bake, the syn
+  layer's written-type inference now reaches (bench infer, 2026-09-28): **ripgrep 55.8 %**
+  (bake 92.6 %), **kenning 81.1 %** (86.4 %), **tokio 21.8 %** (72.6 %) — with zero wrong
+  confirmations on all three. tokio stays low because much of it is generic, macro-generated or
+  cfg-switched, exactly where a syn layer that must not guess has to stay silent. What it
+  drops stays as a located candidate.
 
 ## Deliberate trade-offs — what we don't do, and what it cost
 
@@ -275,11 +295,11 @@ Every number above was bought by *not* doing something. The full ledger:
 
 | We don't do | What it bought | What it costs (measured / observed) |
 |---|---|---|
-| Type inference (`x.f()` receivers) | 0.3 s builds, 5–21 ms incremental updates, cfg-blind coverage | syn-only resolution stays at 15–28 %; precision requires `bake` (one 7–46 s / 1.1–2.3 GB RA run) |
+| Full type inference (trait solving, generic inference, std's return types) — only *written* types are used | 0.3 s builds, 5–21 ms incremental updates, cfg-blind coverage | syn-only resolution 22–81 % depending on style (tokio 22 %, ripgrep 56 %); RA-grade answers need `bake` (one 7–46 s / 1.1–2.3 GB RA run, refreshed automatically) |
 | Hover / completion / diagnostics | zero-resident, no LSP protocol | not a human editor; agents use `cargo check` for types |
 | Macro expansion | per-file parse speed | calls and impls born **of expansion** stay invisible (calls/refs written as macro arguments — `println!("{}", f())`, `criterion_group!(g, f)` — are recorded, inside a function body or at item level) |
 | Resident server / file watcher | 0 RAM, zero ops, works over SSH | a 0.8–4.4 ms stat-walk on every query (5–12 ms for the whole CLI round trip); warm-µs numbers only apply in-process |
-| Serving SCIP as-is (we position-join against live source instead) | answers always point at today's code | stale bakes shed precise facts (we hit `refs → 0` live in the Glean matchup; `upd_since_bake` warns) |
+| Serving SCIP as-is (we position-join against live source instead) | answers always point at today's code | files changed since the bake fall back to syn (per-file content hashes) until auto-bake refreshes at the next commit / vup |
 | Guessing (no fabricated resolution) | zero false positives in the confirmed set | agents still eyeball the *candidates* bucket |
 | A general query language (Angle/QL) | zero learning curve, µs answers | arbitrary relational questions (taint tracking) stay CodeQL's territory |
 | Languages other than Rust (for now) | depth (cfg recovery, trait containers) | useless in a TS/Python repo; the fact schema itself is language-neutral |

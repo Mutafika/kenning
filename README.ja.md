@@ -116,6 +116,11 @@ kenning search  kind:fn callers:0 namecalls:0 test:0   1 段だけの版 (入次
 kenning outline <path|dir>          ファイルを読まずに構造把握。dir なら配下 file の地図
                                     (symbol 数 / loc)、`.` で repo の地図
 kenning bake                        rust-analyzer を 1 回走らせ SCIP 取込 → RA 級精度
+kenning changes --since HEAD        commit していない作業の意味的な差分: 壊れた参照 / シグネチャ変更
+                                    (+ 呼び元数) / 新しく dead・繋ぎ忘れ / 呼び元が 0 になった定義。
+                                    --since は任意の git ref、sinfo の snap (`snap` / `snap:<id|label>`)、
+                                    token。--cursor <name> で動く起点、--json で NDJSON。リファクタ途中の
+                                    安い確認で、最後の関門は `cargo check`
 kenning stats   [path:<substr>]     index 規模 + 解決の内訳 (path: で repo の一部だけの率)
 kenning cache   [ls|prune]          自動 db の棚卸し / 掃除 (repo 消失・旧版、--older-than D、
                                     --dry-run)
@@ -139,6 +144,7 @@ kenning --version                   バージョン
 | `KENNING_BAKE_DEFAULT_FEATURES=1` | 最初から `features = "all"` を試さない |
 | `KENNING_BAKE_RUSTFLAGS=<flags>` | rust-analyzer 実行時に足す `RUSTFLAGS`。Cargo.toml に現れない custom cfg で囲われた repo 用 (`--cfg tokio_unstable` で tokio は 59.2% → 65.0%) |
 | `KENNING_RA=<path>` | `bake` に使う rust-analyzer binary |
+| `KENNING_AUTO_BAKE=0` | 自動 bake を止める。既定では、一度手で bake した repo は、bake 後に git の commit / sinfo の vup が進んだ時か 20 ファイル変わった時に、裏で焼き直される (`nice`・切り離し、query は待たない)。起動は空いている時だけ (CPU あたり load < 1、空きメモリ、マシンに 1 本、30 分間隔)。`KENNING_NO_AUTO=1` でも止まる |
 
 ## 設計の要点
 
@@ -148,10 +154,19 @@ kenning --version                   バージョン
   parse できない DSL マクロ（`proptest!` 等）の中の呼び出しは `[macro-token]`、
   関数を**値として渡した参照**（`map(f)` / `any(f)`）は `[value-ref]` ラベルの候補として出る —
   呼ぶのは渡した先なので確定はしないが、「使われているか」の問いには答えられる。
-- **受け手不明の method は確定させない。** `x.f()` の受け手の型は syn には分からないので、
-  同名 method が repo に 1 つしか無くても確定しない（`[method-name]` 候補として位置付きで出す）。
-  確定するのは `self.f()`（受け手 = 今いる impl の型）と SCIP が答えた分だけ。
-  この線を引かないと `.next()` / `.len()` が自前の同名 method の「確実な呼び元」として並ぶ。
+- **受け手の型は書いてある物だけ — そして rust-analyzer と突き合わせ済み。** `x.f()` を確定するのは、
+  `x` の型をソースから読める時（引数 / `let` の注釈、構造体リテラル、`Self` を返す `T::new()`、
+  field の型、戻り値の型、`?`、単一の trait 境界 / `dyn` / `impl Trait`）で、*かつ* Rust の method
+  解決が別の所に当たり得ない時だけ（`Vec` のような prelude の型、`&T` への impl、同名 method を持つ
+  拡張 trait、`self: Pin<&mut Self>`、re-export された外の型、`#[cfg]` で切り替わる代替、`self` を
+  書き換え得る自作マクロ… は確定しない）。それ以外は位置付きの `[method-name]` 候補 — この線を引かないと
+  `.next()` / `.len()` が自前の同名 method の「確実な呼び元」として並ぶ。
+  `kenning bench infer` は bake 済みの repo を syn 層だけで焼き直し、確定した全 call を同じ位置の
+  `.scip` と突き合わせる: **ripgrep・tokio・kenning で誤確定 0**（始めは ripgrep 43 件・tokio 286 件で、
+  大半は型推定より前からあった、測ったことのない syn 層の誤りだった）。
+- **古い bake は file 単位で落ちる、黙って嘘にはならない。** `bake` は各 file の内容の hash を記録し、
+  再 index では bake 後に変わっていない file にだけ SCIP を使う — 行がずれた答えを今のコードに
+  結び付けない。自動 bake が次の commit / vup で焼き直す。
 - **cfg-blind 回収。** rust-analyzer は活性な cfg 構成しか解析しないので、SCIP は off の
   `#[cfg(...)]` ブランチ内で沈黙する。`syn` は全ブランチを見る。SCIP が沈黙する所は
   保守的な syn resolver にフォールバック — kenning は rust-analyzer 自身が取りこぼす
@@ -176,7 +191,9 @@ kenning --version                   バージョン
 
 自分で回せる: `./bench/corpus.sh && ./bench/run.sh` — tag 固定の corpus
 （tokio @ tokio-1.43.0）、固定乱数 seed、手法は各表の直上に自己記述。全文:
-[bench/RESULTS.md](bench/RESULTS.md)。
+[bench/RESULTS.md](bench/RESULTS.md)。下の表は v0.4.x で測った値 — v0.5.0 で syn 層の解決が変わった
+（確定が増え、誤確定が消えた）ので、今の数字は取り直しを。解決の正しさは専用のスイート
+`kenning bench infer`（焼き直した直後の repo で）で測る。
 
 | スイート | tokio (722 files) | ripgrep (100 files) | enchudb (258 files) | 測るもの |
 |---|---|---|---|---|
@@ -250,11 +267,10 @@ call-site 検出の独立相互検証。差は: 1 問あたり中央値 54–303
   呼び出しを外した率。後述）の前→後: tokio 15.5% → 59.1%、ripgrep 23.9% → 90.4%
   （ここまで features=all）、enchudb 18.1% → 80.2% — enchudb は features=all が上限時間を
   超えて固まるため *default* features で焼く（上限が存在する理由そのもの）。
-  syn 層が低いのは受け手の型が分からない method 呼び（`x.f()`）を**確定させない**ため
-  （名前一致だけで確定すると `.next()` が自前の同名 method の呼び元として並ぶ）。
-  落とした分は位置付きの候補として残る。free fn 主体の kenning 自身は syn 層だけで 81.9%、
-  bake 後 86.9% — 伸びしろが 5 点しかないのは、水増ししていない syn 層が元から当てられる
-  形（`self.f()` と自由関数）が多いから。
+  bake 無しでも、syn 層の「書いてある型」の推定で（bench infer、2026-09-28）**ripgrep 55.8%**
+  （bake 92.6%）、**kenning 81.1%**（86.4%）、**tokio 21.8%**（72.6%）まで届く — 3 つとも誤確定 0。
+  tokio が低いのは、ジェネリクス・マクロ生成・cfg の切り替えが多く、推測しない syn 層が黙るべき
+  所がまさにそこだから。落とした分は位置付きの候補として残る。
 
 ## 設計の取引 — やらないこと、とその代償
 
@@ -262,11 +278,11 @@ call-site 検出の独立相互検証。差は: 1 問あたり中央値 54–303
 
 | やらないこと | 買ったもの | 代償（実測・実感） |
 |---|---|---|
-| 型推論（`x.f()` の受け手） | 0.3 s 構築、5–21 ms 増分、cfg 全ブランチ被覆 | syn のみの解決は 15–28% 止まり；精密は `bake`（7–46 s / 1.1–2.3 GB の RA 1 回）が要る |
+| 本格的な型推論（trait 解決・ジェネリクスの推論・std の戻り値の型）— 使うのは*書いてある*型だけ | 0.3 s 構築、5–21 ms 増分、cfg 全ブランチ被覆 | syn のみの解決は書き方次第で 22–81%（tokio 22%、ripgrep 56%）；RA 級は `bake`（7–46 s / 1.1–2.3 GB の RA 1 回、自動で焼き直し）が要る |
 | hover / 補完 / 診断 | 常駐ゼロ、LSP プロトコル不要 | 人間のエディタにはならない；型はエージェントが `cargo check` で得る |
 | マクロ展開 | per-file の parse 速度 | **展開後に**生まれる call / impl は見えない (`println!("{}", f())` / `criterion_group!(g, f)` のように引数として書かれた呼び出し・参照は関数の中でも item 直下でも拾う) |
 | 常駐サーバ / file watcher | RAM 0、運用ゼロ、SSH 先で動く | 毎クエリ 0.8–4.4 ms の stat-walk（CLI 往復まで含めて 5–12 ms）；warm-µs の数字は in-process のみ |
-| SCIP の as-is serve（代わりに live source へ位置 join） | 答えが常に今のコードを指す | 古い bake は精密 facts を落とす（Glean 戦で `refs → 0` を実地で踏んだ；`upd_since_bake` が警告） |
+| SCIP の as-is serve（代わりに live source へ位置 join） | 答えが常に今のコードを指す | bake 後に変わった file は syn 層に落ちる（file 単位の内容 hash）；自動 bake が次の commit / vup で焼き直す |
 | 推測（解決の偽装をしない） | 確実集合に誤検出ゼロ | エージェントは*候補*バケットの目視が残る |
 | 汎用クエリ言語（Angle/QL） | 学習コストゼロ、µs の答え | 任意の関係クエリ（taint tracking）は CodeQL の領分のまま |
 | Rust 以外の言語（今は） | 深さ（cfg 回収、trait コンテナ） | TS/Python repo では無力；fact schema 自体は言語中立 |
