@@ -258,7 +258,16 @@ pub fn run_bake(dir: &str) {
         eprintln!("# bake: RUSTFLAGS={rustflags} を RA に注入 (KENNING_BAKE_RUSTFLAGS)");
     }
     // RA が読む前の内容を記録 (この後で編集された file は、再利用時に SCIP を使わない)。
-    write_scip_src(&scip_path, &root_s);
+    // .scip も記録も一時 file に書き、成功してから .scip → 記録の順に置き換える。途中で読まれても
+    // 「古い .scip + 古い記録」か「新しい .scip + 古い記録」(変わった file を捨てるだけ = 安全側) にしかならない。
+    // 一時 file は `<db>.` で始める (cache prune が回収する)。
+    let scip_tmp = format!("{db}.scip-tmp-{}", std::process::id());
+    let src_tmp = format!("{db}.scip-src-tmp-{}", std::process::id());
+    let cleanup = || {
+        let _ = std::fs::remove_file(&scip_tmp);
+        let _ = std::fs::remove_file(&src_tmp);
+    };
+    write_scip_src(&src_tmp, &root_s);
     for attempt in 0..2 {
         let all = use_all && attempt == 0;
         // features=all も RUSTFLAGS も無い時だけ config を書かない (= RA の既定で焚く)。
@@ -277,7 +286,7 @@ pub fn run_bake(dir: &str) {
         } else {
             std::process::Command::new(&ra)
         };
-        cmd.args(["scip", &bake_s, "--output", &scip_path]);
+        cmd.args(["scip", &bake_s, "--output", &scip_tmp]);
         if all || !rustflags.is_empty() {
             cmd.args(["--config-path", &cfg_path]);
         }
@@ -287,6 +296,7 @@ pub fn run_bake(dir: &str) {
             Ok(st) => st,
             Err(e) => {
                 eprintln!("# bake 失敗: rust-analyzer を起動できない ({ra}): {e}");
+                cleanup();
                 std::process::exit(1);
             }
         };
@@ -304,9 +314,10 @@ pub fn run_bake(dir: &str) {
                 continue;
             }
             eprintln!("# 真因を直に見るなら: (cd {bake_s} && {ra} scip .)");
+            cleanup();
             std::process::exit(1);
         };
-        if !status.success() || !std::path::Path::new(&scip_path).exists() {
+        if !status.success() || !std::path::Path::new(&scip_tmp).exists() {
             eprintln!("# bake 失敗 (features={}, {:.0?}):", if all { "all" } else { "default" }, t_ra.elapsed());
             eprintln!("{}", ra_error_lines(&errs));
             if all {
@@ -314,10 +325,11 @@ pub fn run_bake(dir: &str) {
                 continue;
             }
             eprintln!("# 真因を直に見るなら: (cd {bake_s} && {ra} scip .)");
+            cleanup();
             std::process::exit(1);
         }
         // sanity: features=all が相互排他 cfg 等で薄い SCIP を吐いたら default で焼き直す。
-        let n_docs = std::fs::read(&scip_path)
+        let n_docs = std::fs::read(&scip_tmp)
             .ok()
             .and_then(|b| {
                 use protobuf::Message;
@@ -336,10 +348,17 @@ pub fn run_bake(dir: &str) {
     if !baked {
         eprintln!("# bake 失敗 (all/default 両方)");
         eprintln!("# 真因を直に見るなら: (cd {bake_s} && {ra} scip .)");
+        cleanup();
         std::process::exit(1);
     }
     let _ = std::fs::remove_file(&cfg_path);
     let _ = std::fs::remove_file(&stats_path);
+    // 成功した組だけを置き換える (.scip → 記録の順)
+    if std::fs::rename(&scip_tmp, &scip_path).is_err() || std::fs::rename(&src_tmp, scip_src_path(&scip_path)).is_err() {
+        eprintln!("# bake 失敗: .scip を置き換えられない ({scip_path})");
+        cleanup();
+        std::process::exit(1);
+    }
 
     // ── SCIP 込みで full 再 index → meta に bake 情報を焼く ──
     run_index(&root_s, &db, Some(&scip_path));

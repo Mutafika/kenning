@@ -33,14 +33,16 @@ pub(crate) fn scip_src_path(scip: &str) -> String {
 /// bake を始める時点の内容を記録する。SCIP の答えは (file, 行, 列) で join するので、bake 後に
 /// 行がずれた file に使うと**別の呼び出し・別の定義に確定する** (実例: 古い .scip の再利用で
 /// `depth(..)` が `insert_call` の確実 caller になった)。記録と一致する file だけ SCIP を使う。
-pub(crate) fn write_scip_src(scip: &str, root: &str) {
+/// `out` に書く (bake は一時 file に書き、RA が成功してから .scip と一緒に置き換える — 焼いている途中に
+/// 「新しい記録 + 古い .scip」の組が読まれると、ずれた答えが有効と判定される。実際に起きた)。
+pub(crate) fn write_scip_src(out: &str, root: &str) {
     let mut s = String::new();
     for p in rust_files(root) {
         if let Ok(src) = std::fs::read_to_string(&p) {
             s += &format!("{}\t{}\n", canon(&p.to_string_lossy()), hash_u32(&src));
         }
     }
-    let _ = std::fs::write(scip_src_path(scip), s);
+    let _ = std::fs::write(out, s);
 }
 
 /// 比較用の正規形 (`/tmp` ↔ `/private/tmp` のような symlink 差で別物にならないように)。
