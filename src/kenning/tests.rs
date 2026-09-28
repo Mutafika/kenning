@@ -501,6 +501,7 @@ note: run with `RUST_BACKTRACE=1` to display a backtrace
     }
 
     fn tmp_tree(name: &str) -> PathBuf {
+        sweep_dead_test_dirs();
         let d = std::env::temp_dir().join(format!("kenning-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
@@ -825,14 +826,17 @@ fn ra_config_writes_only_the_keys_that_are_set() {
     assert!(ra_config(false, "--cfg x=\"y\"").contains(r#"x=\"y\""#), "引用符を escape する");
 }
 
-/// 自動 bake の判定: 無効化が最優先、次に間隔、最後に負荷。負荷を測れなければ bake 側のメモリゲートに任せる。
+/// 自動 bake の判定: 無効化が最優先、次に間隔、別の bake 中、最後に負荷。負荷を測れなければ bake 側のメモリゲートに任せる。
 #[test]
 fn auto_bake_gate_respects_switch_interval_and_load() {
-    assert_eq!(auto_bake_gate(true, None, Some(0.1)), AutoBake::Off);
-    assert_eq!(auto_bake_gate(false, Some(60), Some(0.1)), AutoBake::Throttled(AUTO_BAKE_INTERVAL_SECS - 60));
-    assert_eq!(auto_bake_gate(false, Some(AUTO_BAKE_INTERVAL_SECS), Some(0.1)), AutoBake::Go);
-    assert_eq!(auto_bake_gate(false, None, Some(2.0)), AutoBake::Busy(2.0));
-    assert_eq!(auto_bake_gate(false, None, None), AutoBake::Go);
+    assert_eq!(auto_bake_gate(true, None, true, Some(0.1)), AutoBake::Off);
+    assert_eq!(auto_bake_gate(false, Some(60), false, Some(0.1)), AutoBake::Throttled(AUTO_BAKE_INTERVAL_SECS - 60));
+    assert_eq!(auto_bake_gate(false, Some(AUTO_BAKE_INTERVAL_SECS), false, Some(0.1)), AutoBake::Go);
+    assert_eq!(auto_bake_gate(false, None, false, Some(2.0)), AutoBake::Busy(2.0));
+    assert_eq!(auto_bake_gate(false, None, false, None), AutoBake::Go);
+    // 別 project の bake 中は「見送り」ではなく「空き待ち」: 間隔の時計より後、負荷より前に判定
+    assert_eq!(auto_bake_gate(false, None, true, Some(0.1)), AutoBake::LockBusy);
+    assert_eq!(auto_bake_gate(false, Some(60), true, Some(0.1)), AutoBake::Throttled(AUTO_BAKE_INTERVAL_SECS - 60));
 }
 
 #[test]
@@ -888,4 +892,24 @@ fn git_head_matches_rev_parse_for_loose_and_packed_refs() {
     git(&["pack-refs", "--all"]);
     assert_eq!(milestone_id(&root, "/nonexistent.db"), Some(format!("git:{}", git(&["rev-parse", "HEAD"]))), "packed-refs");
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// 過去の実行が残した `kenning-test-<name>-<pid>` を消す (途中で落ちた test は後片付けを飛ばす)。
+/// pid が生きている物 (並列実行中の他の test process) には触らない。1 process で 1 回。
+fn sweep_dead_test_dirs() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let me = std::process::id().to_string();
+        let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else { return };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.starts_with("kenning-test-") {
+                continue;
+            }
+            let Some(pid) = name.rsplit('-').next() else { continue };
+            if pid != me && !pid_alive(pid) {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    });
 }

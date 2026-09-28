@@ -222,6 +222,9 @@ pub fn run_bake(dir: &str) {
 
     // ── 直列化 lock ──
     let Some(_lock) = BakeLock::acquire(&cache) else { std::process::exit(3) };
+    // 節目は**焼き始め**の時点で取る。完了時に取ると、焼いている間の vup を「焼き済み」と記録してしまい、
+    // その分が次の判定で焼き直されない。
+    let milestone_at_start = milestone_id(&root_s, &db);
 
     let Some(ra) = find_ra() else {
         eprintln!("# rust-analyzer が見つからない。`rustup component add rust-analyzer` か env KENNING_RA で指定を。");
@@ -363,7 +366,7 @@ pub fn run_bake(dir: &str) {
     // 自動 bake が同じ workspace を焼けるように覚えておく (root 直下が cargo project でない repo 用)。
     let _ = std::fs::write(bake_dir_marker(&db), &bake_s);
     // この bake が「どの節目 (vup / commit) の時点か」を覚える。次にこれが進んだら焼き直す。
-    if let Some(m) = milestone_id(&root_s, &db) {
+    if let Some(m) = milestone_at_start {
         let _ = std::fs::write(bake_milestone_marker(&db), m);
     }
     eprintln!("# 精密 facts 有効: refs / callers が RA 同等精度に (`kenning refs <name>`)");
@@ -392,23 +395,37 @@ pub(crate) enum AutoBake {
     Off,
     /// 前回起動からまだ間隔が空いていない (残り秒)。
     Throttled(u64),
+    /// 別の bake (別 project 含む。lock はマシンに 1 つ) が進行中。間隔の時計は進めず、次の query で再判定。
+    LockBusy,
     /// 負荷が高い (1 CPU あたりの load)。
     Busy(f64),
     Go,
 }
 
-/// 判定だけ (副作用なし = テスト可能)。`since_last` = 前回起動からの秒、`load` = 1 CPU あたりの load。
-pub(crate) fn auto_bake_gate(off: bool, since_last: Option<u64>, load: Option<f64>) -> AutoBake {
+/// 判定だけ (副作用なし = テスト可能)。`since_last` = 前回起動からの秒、`lock_busy` = 別の bake が進行中、
+/// `load` = 1 CPU あたりの load。
+pub(crate) fn auto_bake_gate(off: bool, since_last: Option<u64>, lock_busy: bool, load: Option<f64>) -> AutoBake {
     if off {
         return AutoBake::Off;
     }
     if let Some(s) = since_last.filter(|s| *s < AUTO_BAKE_INTERVAL_SECS) {
         return AutoBake::Throttled(AUTO_BAKE_INTERVAL_SECS - s);
     }
+    if lock_busy {
+        return AutoBake::LockBusy;
+    }
     match load {
         Some(l) if l >= AUTO_BAKE_MAX_LOAD_PER_CPU => AutoBake::Busy(l),
         _ => AutoBake::Go, // 測れない時は bake 側の空きメモリゲートに任せる
     }
+}
+
+/// マシン共通の bake lock (`<cache>/bake.lock`) を生きた process が持っていればその pid。
+/// 死んだ残骸は「空き」扱い (bake 側が回収する)。
+fn bake_lock_holder(db: &str) -> Option<String> {
+    let cache = Path::new(db).parent()?;
+    let pid = std::fs::read_to_string(cache.join("bake.lock")).ok()?.trim().to_string();
+    pid_alive(&pid).then_some(pid)
 }
 
 /// `KENNING_AUTO_BAKE=0` (または全自動停止 `KENNING_NO_AUTO`) で無効。自動 bake の子自身も起こさない。
@@ -447,9 +464,12 @@ fn auto_bake_with(db: &str, dir: &str, head: String) {
     let log = auto_bake_log(db);
     let since_last = std::fs::metadata(&log).ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).map(|d| d.as_secs());
     let off = auto_bake_off();
-    match auto_bake_gate(off, since_last, if off { None } else { load_per_cpu() }) {
+    let busy_pid = if off { None } else { bake_lock_holder(db) };
+    match auto_bake_gate(off, since_last, busy_pid.is_some(), if off { None } else { load_per_cpu() }) {
         AutoBake::Off => eprintln!("{head} → `kenning bake` 推奨 (自動 bake は無効: KENNING_AUTO_BAKE=0)"),
         AutoBake::Throttled(rest) => eprintln!("{head} → 自動 bake は起動済み / 間隔待ち (あと {} 分、ログ {log})", rest.div_ceil(60)),
+        // 起動しない = log を作らない = 30 分の時計を進めない → 空いたら次の query ですぐ焼く (列は作らない)。
+        AutoBake::LockBusy => eprintln!("{head} → 別の bake が進行中 (pid {}) → 空いたら次の query で起動", busy_pid.unwrap_or_default()),
         AutoBake::Busy(l) => eprintln!("{head} → 負荷が高い (load/CPU {l:.2}) ので自動 bake は見送り。`kenning bake` 推奨"),
         AutoBake::Go => {
             let target = std::fs::read_to_string(bake_dir_marker(db)).ok().map(|s| s.trim().to_string()).filter(|s| Path::new(s).is_dir()).unwrap_or_else(|| dir.to_string());

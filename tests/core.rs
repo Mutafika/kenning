@@ -73,8 +73,28 @@ const OTHER_RS: &str = "pub fn caller() {\n    target();\n}\n";
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// 過去の実行が残した fixture を消す (test は失敗・中断で後片付けを飛ばすので、放置すると溜まる —
+/// 実際に 534 個 / 6.6GB 溜めてディスクを埋めた)。名前の pid が生きていない物だけ = 並列実行中の他の
+/// test process には触らない。1 process で 1 回。
+fn sweep_dead_fixtures() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let me = std::process::id().to_string();
+        let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else { return };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(pid) = name.strip_prefix("kenning_it_").and_then(|r| r.split('_').next()) else { continue };
+            let alive = pid == me || Command::new("kill").args(["-0", pid]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+            if !alive {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    });
+}
+
 /// Fresh, empty temp dir with a `src/` subdir.
 fn tmp() -> PathBuf {
+    sweep_dead_fixtures();
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let p = std::env::temp_dir().join(format!("kenning_it_{}_{}", std::process::id(), n));
     let _ = std::fs::remove_dir_all(&p);
