@@ -1,23 +1,42 @@
 #!/usr/bin/env python3
-"""agent-ab.sh の結果を集計: 条件 (A=kenning あり / B=なし) ごとの token・費用・turn・時間・正答 (recall/precision)。
-使い方: python3 bench/agent-ab-score.py <結果 dir>"""
+"""agent-ab.sh の結果を集計: 条件ごとの token・費用・turn・時間・道具の呼び出し・正答 (recall/precision)。
+使い方: python3 bench/agent-ab-score.py <結果 dir>
+
+正解 truth/<task>.txt の行形式で採点が変わる:
+  `path:line`      — 回答の `ANSWER:` 以降の path:line と集合比較 (呼び出し箇所など)
+  `path<TAB>name`  — 回答の 1 行に path と name が両方あれば一致 (テスト関数など、行番号の流儀に依らない)"""
 import json, os, re, sys, statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TRUTH = os.path.join(HERE, "agent-ab", "truth")
 CORPUS = os.environ.get("KENNING_BENCH_DIR", os.path.expanduser("~/.cache/kenning-bench"))
 LOC = re.compile(r"([\w./-]+\.rs):(\d+)")
+ROOT = re.compile(r"^.*?/kenning-bench/[^/]+/")
+
+
+def rel(p):
+    return ROOT.sub("", p).lstrip("./")
+
+
+def answer_tail(text):
+    return text.rsplit("ANSWER:", 1)[-1] if "ANSWER:" in text else ""
 
 
 def answer_locs(text):
     """`ANSWER:` 以降の path:line を repo 相対に正規化して集合で返す。"""
-    tail = text.rsplit("ANSWER:", 1)[-1] if "ANSWER:" in text else ""
-    out = set()
-    for p, ln in LOC.findall(tail):
-        p = re.sub(r"^.*?/kenning-bench/[^/]+/", "", p).lstrip("./")
-        out.add(f"{p}:{ln}")
-    return out
+    return {f"{rel(p)}:{ln}" for p, ln in LOC.findall(answer_tail(text))}
+
+
+def answer_names(text, truth):
+    """name 形式の正解のうち、回答の同じ行に path と name が揃って出た物。回答の行数も返す。"""
+    lines = [rel(l.strip()) for l in answer_tail(text).splitlines() if l.strip()]
+    hit = set()
+    for t in truth:
+        path, name = t.split("\t")
+        if any(path in l and re.search(rf"\b{re.escape(name)}\b", l) for l in lines):
+            hit.add(t)
+    return hit, len(lines)
 
 
 def in_doc(task, loc):
@@ -34,52 +53,89 @@ def truth_of(task):
     f = os.path.join(TRUTH, task + ".txt")
     if not os.path.exists(f):
         return None
-    return {l.strip() for l in open(f) if l.strip()}
+    return {l.rstrip("\n") for l in open(f) if l.strip()}
+
+
+def load(path):
+    """stream-json (.jsonl) か json (.json) から (最終 result, 道具の呼び出し Counter)。"""
+    tools = Counter()
+    if path.endswith(".json"):
+        return json.load(open(path)), tools
+    result = None
+    for line in open(path):
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") == "result":
+            result = ev
+        elif ev.get("type") == "assistant":
+            for c in ev.get("message", {}).get("content", []):
+                if c.get("type") != "tool_use":
+                    continue
+                name = c.get("name", "?")
+                if name == "Bash":
+                    name = (c.get("input", {}).get("command", "").split() or ["?"])[0]
+                tools[name] += 1
+    if result is None:
+        raise ValueError("result 無し")
+    return result, tools
 
 
 def main(d):
     rows = defaultdict(list)  # (task, cond) -> [metrics]
     for name in sorted(os.listdir(d)):
-        m = re.match(r"(.+)\.([AB])\.(\d+)\.json$", name)
+        m = re.match(r"(.+)\.([A-Z])\.(\d+)\.jsonl?$", name)
         if not m:
             continue
         task, cond = m.group(1), m.group(2)
         try:
-            j = json.load(open(os.path.join(d, name)))
-        except (json.JSONDecodeError, OSError):
+            j, tools = load(os.path.join(d, name))
+        except (ValueError, OSError, json.JSONDecodeError):
             print(f"# 壊れた結果: {name}", file=sys.stderr)
             continue
         u = j.get("usage", {})
         tok_in = u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + u.get("cache_read_input_tokens", 0)
-        got = answer_locs(j.get("result", ""))
+        text = j.get("result", "")
         truth = truth_of(task)
         rec = prec = None
-        if truth:
-            got = {l for l in got if l in truth or not in_doc(task, l)}
+        if truth and all("\t" in t for t in truth):
+            hit, n = answer_names(text, truth)
+            rec = len(hit) / len(truth)
+            prec = len(hit) / n if n else 0.0
+        elif truth:
+            got = {l for l in answer_locs(text) if l in truth or not in_doc(task, l)}
             hit = len(got & truth)
             rec = hit / len(truth)
             prec = hit / len(got) if got else 0.0
         rows[(task, cond)].append(dict(
             cost=j.get("total_cost_usd", 0.0), tin=tok_in, tout=u.get("output_tokens", 0),
             turns=j.get("num_turns", 0), sec=j.get("duration_ms", 0) / 1000, rec=rec, prec=prec,
-            err=j.get("is_error", False)))
+            tools=tools))
 
     med = lambda xs: statistics.median(xs) if xs else float("nan")
-    print("| task | cond | n | input tok | output tok | cost $ | turns | sec | recall | precision |")
-    print("|---|---|---|---|---|---|---|---|---|---|")
+    print("| task | cond | n | input tok | output tok | cost $ | turns | sec | recall | precision | 道具 (run 平均) |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|")
     tot = defaultdict(lambda: defaultdict(float))
     for (task, cond), ms in sorted(rows.items()):
         g = lambda k: med([m[k] for m in ms if m[k] is not None])
         rp = lambda k: f"{g(k):.0%}" if any(m[k] is not None for m in ms) else "-"
+        tc = sum((m["tools"] for m in ms), Counter())
+        tl = " ".join(f"{k} {v / len(ms):.1f}" for k, v in tc.most_common(4)) or "-"
         print(f"| {task} | {cond} | {len(ms)} | {g('tin'):,.0f} | {g('tout'):,.0f} | {g('cost'):.2f} | "
-              f"{g('turns'):.0f} | {g('sec'):.0f} | {rp('rec')} | {rp('prec')} |")
-        for k in ("cost", "tin", "turns", "sec"):
+              f"{g('turns'):.0f} | {g('sec'):.0f} | {rp('rec')} | {rp('prec')} | {tl} |")
+        for k in ("cost", "tin", "tout", "turns", "sec"):
             tot[cond][k] += g(k)
-    if "A" in tot and "B" in tot:
-        a, b = tot["A"], tot["B"]
-        print(f"\n合計 (課題ごとの中央値の和): 費用 A ${a['cost']:.2f} vs B ${b['cost']:.2f} "
-              f"(B/A {b['cost'] / a['cost']:.1f}x)、input token B/A {b['tin'] / a['tin']:.1f}x、"
-              f"turn B/A {b['turns'] / a['turns']:.1f}x、時間 B/A {b['sec'] / a['sec']:.1f}x")
+    if "B" in tot:
+        b = tot["B"]
+        for c in sorted(tot):
+            if c == "B":
+                continue
+            a = tot[c]
+            print(f"\n{c} vs B (課題ごとの中央値の和): 費用 ${a['cost']:.2f} vs ${b['cost']:.2f} "
+                  f"(B/{c} {b['cost'] / a['cost']:.2f}x)、input token B/{c} {b['tin'] / a['tin']:.2f}x、"
+                  f"output token B/{c} {b['tout'] / a['tout']:.2f}x、turn B/{c} {b['turns'] / a['turns']:.2f}x、"
+                  f"時間 B/{c} {b['sec'] / a['sec']:.2f}x")
 
 
 if __name__ == "__main__":
