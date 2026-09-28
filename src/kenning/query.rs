@@ -873,7 +873,7 @@ pub(crate) fn run_callers(db_path: &str, name: &str, container: Option<&str>, li
     }
 
     // 名前一致する全 call を 1 度引く (確実/候補の切り分けに使う)。
-    let name_matches = call_t.where_eq("callee", name).find().unwrap();
+    let name_matches = call_t.where_eq("callee", bare).find().unwrap();
     // callee ident をラベル整形するクロージャ (caller sym → "Container::name")。
     let caller_label = |c: EntityId| -> (String, u32, String) {
         let er = call_t.entity(c);

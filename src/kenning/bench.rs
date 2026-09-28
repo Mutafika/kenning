@@ -758,11 +758,14 @@ fn bench_infer(root: &str, db_path: &str, baked_db: &Database) {
     // 正解は .scip から直接読む (bake 済み db は増分 update で syn 層の答えが混ざるので使わない)。
     // Scip::load は bake 後に内容が変わった file を捨てる = 残るのは正解として信じてよい file だけ。
     let scip = Scip::load(&scip_path, root);
-    let mut def_at: HashMap<&str, (String, u32)> = HashMap::new(); // symbol → 定義位置 (rel, 1-indexed)
+    // symbol → 定義位置 (rel, 1-indexed)。None = 同じ symbol が複数の定義を持つ (test / example の target 間で
+    // 同名の関数が衝突する) → RA の答えは当てにならないので正解に使わない (index 側も確定に使わない規則)。
+    let mut def_at: HashMap<&str, Option<(String, u32)>> = HashMap::new();
     let mut on_line: HashMap<(String, u32), Vec<&str>> = HashMap::new(); // (rel, 1-indexed) → 参照 symbol
     for o in &scip.occ {
         if o.roles & 1 == 1 {
-            def_at.insert(o.symbol.as_str(), (o.rel_path.clone(), o.line0 + 1));
+            let at = (o.rel_path.clone(), o.line0 + 1);
+            def_at.entry(o.symbol.as_str()).and_modify(|d| if d.as_ref() != Some(&at) { *d = None }).or_insert(Some(at));
         } else if !o.symbol.starts_with("local ") {
             on_line.entry((o.rel_path.clone(), o.line0 + 1)).or_default().push(o.symbol.as_str());
         }
@@ -787,7 +790,8 @@ fn bench_infer(root: &str, db_path: &str, baked_db: &Database) {
         syms.dedup();
         let ra_says = match syms.as_slice() {
             [s] => match def_at.get(s) {
-                Some((r, l)) => Some(format!("{}/{r}:{l}", root.trim_end_matches('/'))),
+                Some(Some((r, l))) => Some(format!("{}/{r}:{l}", root.trim_end_matches('/'))),
+                Some(None) => None, // target 間の衝突 = 判定不能
                 // repo の crate の symbol なのに定義が読めない = 定義側の file が bake 後に変わった → 判定不能
                 None if local_crates.contains(&scip_package(s).replace('-', "_")) => None,
                 None => Some("repo の外 (std / 依存)".to_string()),

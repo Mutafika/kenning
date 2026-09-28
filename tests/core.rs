@@ -1245,7 +1245,7 @@ fn stats_separates_external_calls_from_the_resolve_rate() {
 /// 受け手の型が分からない method 呼び (`d.ping()`) を名前一致だけで確定すると、std/dep の
 /// 同名 method (`.next()` / `.len()`) を自前の定義の caller として並べてしまう。
 /// **確定するのは `self.f()` と、受け手の型がソースに書いてある物だけ**、他は候補どまり —
-/// これが「確実 = 誤りなし」の境界。ここでの `d` は free fn の戻り値で、型はどこにも書いていない。
+/// これが「確実 = 誤りなし」の境界。ここでの `d` は添字 `v[0]` の値で、式の型推論なしには分からない。
 #[test]
 fn only_self_receiver_method_calls_are_confirmed() {
     let d = tmp();
@@ -1256,8 +1256,7 @@ fn only_self_receiver_method_calls_are_confirmed() {
              pub fn ping(&self) {}\n\
              pub fn go(&self) { self.ping(); }\n\
          }\n\
-         fn make_d() -> D { D }\n\
-         pub fn outside() { let d = make_d(); d.ping(); }\n",
+         pub fn outside(v: Vec<D>) { v[0].ping(); }\n",
     );
     let db = d.join("k.db");
     index(&d, &db);
@@ -1267,6 +1266,29 @@ fn only_self_receiver_method_calls_are_confirmed() {
     assert!(!confirmed.contains("in outside"), "受け手不明の d.ping() を確定してはいけない:\n{out}");
     assert!(candidates.contains("in outside"), "確定しない呼び出しは候補に残すはず:\n{out}");
     assert!(candidates.contains("[method-name]"), "候補の理由をラベルで出すはず:\n{out}");
+}
+
+/// 出力に出た修飾名 (`D::ping`) はそのまま引数に渡せる約束 — `callers ping D` と同じ候補が出ること。
+/// call 側は bare name で持っているので、修飾名のまま名前一致を引くと候補が黙って 0 件になっていた
+/// (tokio の `Sleep::reset` で「候補未確定 0」と出て、`tests` の取りこぼしを隠した)。
+#[test]
+fn qualified_name_shows_same_candidates_as_container_form() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        "pub struct D;\n\
+         impl D {\n\
+             pub fn ping(&self) {}\n\
+             pub fn go(&self) { self.ping(); }\n\
+         }\n\
+         pub fn outside(v: Vec<D>) { v[0].ping(); }\n",
+    );
+    let db = d.join("k.db");
+    index(&d, &db);
+    let qualified = query(&["callers", "D::ping"], &db);
+    let container = query(&["callers", "ping", "D"], &db);
+    assert!(qualified.contains("in outside"), "修飾名でも候補が出るはず:\n{qualified}");
+    assert_eq!(qualified, container, "修飾名と container 指定で結果が違う");
 }
 
 // ── changes: 前回 snapshot からの意味的な差分 ──
@@ -1515,11 +1537,12 @@ pub fn by_struct_lit() { let db = Db {}; db.get(); }
 pub fn by_ctor() { let db = Db::new(); db.get(); }
 pub fn by_try_ctor() -> Result<(), String> { let db = Db::open("x")?; db.get(); Ok(()) }
 pub fn not_self_ret() { let o = Db::peer(); o.get(); }
-pub fn shadowed(db: &Db) { let db = make(); db.get(); }
+pub fn shadowed(db: &Db) { let db = pick::<Other>(); db.get(); }
 pub fn generic<T>(db: T) { let _ = db; }
 pub fn generic_call<Db2: Fn()>(db: Db2) { db.get(); }
 pub fn inner_scope(db: &Db) { { let db = make(); let _ = db; } db.get(); }
 fn make() -> Db { Db }
+fn pick<T: Default>() -> T { T::default() }
 "#,
     );
     let db = d.join("k.db");
@@ -1535,6 +1558,52 @@ fn make() -> Db { Db }
     assert!(rest.contains("in shadowed"), "シャドーイングで型が分からない呼び出しは候補に残るはず:\n{out}");
     let stats = query(&["stats"], &db);
     assert!(stats.contains("typed="), "stats に typed の内訳が出ない:\n{stats}");
+}
+
+/// 自由関数の戻り値 (`let s = sleep(..)`) と smart pointer 越し (`Box::pin(x).as_mut().f()`) の受け手も、
+/// 書いてある型から確定する (tokio の `Sleep::reset` を呼ぶテストが `tests` から漏れていた形)。ただし
+/// 外から `use` した関数の戻り値と、包んだ側の method が先に当たり得る物 (Pin の `set`、trait の中の
+/// `Pin::new(self)` = Pin が実装する trait の method) は確定しない。
+#[test]
+fn free_fn_returns_and_smart_pointer_receivers_are_confirmed() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"use std::sync::Arc;
+use ext::make_ext;
+pub mod time {
+    pub struct Sleep;
+    impl Sleep {
+        pub fn reset(&mut self) {}
+        pub fn set(&mut self) {}
+    }
+    pub fn sleep() -> Sleep { Sleep }
+}
+pub fn make_ext() -> time::Sleep { time::Sleep }
+pub fn by_mod_fn() { let mut s = time::sleep(); s.reset(); }
+pub fn by_boxed() { let mut s = Box::pin(time::sleep()); s.as_mut().reset(); }
+pub fn by_arc_chain() { Arc::new(time::sleep()).reset(); }
+pub fn pin_own_name() { let mut s = Box::pin(time::sleep()); s.set(); }
+pub fn external_fn() { let mut s = make_ext(); s.reset(); }
+pub trait BufExt {
+    fn consume(&mut self) {}
+    fn via_pin(&mut self) where Self: Unpin { std::pin::Pin::new(self).consume(); }
+}
+"#,
+    );
+    let db = d.join("k.db");
+    index(&d, &db);
+    let out = query(&["callers", "Sleep::reset"], &db);
+    let (confirmed, rest) = out.split_once("候補").unwrap_or((out.as_str(), ""));
+    for f in ["by_mod_fn", "by_boxed", "by_arc_chain"] {
+        assert!(confirmed.contains(&format!("in {f}\t")), "{f} の reset() が確定しない:\n{out}");
+    }
+    assert!(!confirmed.contains("in external_fn"), "外から use した関数の戻り値で確定した:\n{out}");
+    assert!(rest.contains("in external_fn"), "確定しない呼び出しは候補に残るはず:\n{out}");
+    let consume = query(&["callers", "BufExt::consume"], &db);
+    assert!(!consume.split_once("候補").map_or(consume.as_str(), |x| x.0).contains("in BufExt::via_pin"), "trait の中の Pin::new(self) を trait 自身の method に確定した:\n{consume}");
+    let set = query(&["callers", "Sleep::set"], &db);
+    assert!(!set.split_once("候補").map_or(set.as_str(), |x| x.0).contains("in pin_own_name"), "Pin::set に先に当たる s.set() を確定した:\n{set}");
 }
 
 /// 出どころが repo の外 (`walkdir::DirEntry` / `use std::io::Error`) の型名は、同名の自前の型と

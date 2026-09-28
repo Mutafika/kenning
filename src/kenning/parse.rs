@@ -102,6 +102,23 @@ pub(crate) struct Recv {
 /// 連鎖の手順の上限 (長い連鎖ほど 1 段の取り違えが響くので、そこそこで諦める)。
 const CHAIN_MAX: usize = 8;
 
+/// 受け手が自由関数の戻り値だった印 (`Recv.ty` = 印 + 修飾ヒント。`time::sleep(..)` なら `fn:time`)。
+/// 型名になり得ない文字を含むので、どの型名とも一致しない。
+const FREE_FN_RECV: &str = "fn:";
+
+/// 中身の method に自動参照外しで届く std の smart pointer と、1 引数で包む constructor。
+const SMART_PTRS: &[&str] = &["Box", "Pin", "Arc", "Rc"];
+const SMART_PTR_CTORS: &[&str] = &["new", "pin"];
+
+/// smart pointer で包んだ受け手では、中身の method より先に当たり得る名前 (Pin の inherent method と、
+/// Box / Pin / Arc / Rc が中身に応じて実装する std trait の method)。包んだ受け手のこの名前は推定しない。
+const SMART_PTR_METHODS: &[&str] = &[
+    "as_mut", "as_ref", "set", "get_mut", "get_ref", "into_inner", "into_ref", "get_unchecked_mut",
+    "map_unchecked", "map_unchecked_mut", "as_deref", "as_deref_mut", "clone", "poll", "poll_next", "next",
+    "next_back", "deref", "deref_mut", "fmt", "eq", "ne", "cmp", "partial_cmp", "hash", "borrow", "borrow_mut",
+    "drop", "into_iter", "to_string", "to_owned", "into", "try_into", "call", "call_mut", "call_once",
+];
+
 /// 書いてある型 1 つ: 名前 (path 末尾、別名は元の名前) + 出どころ + 最初の型引数 (`Result<T, E>` の T)。
 /// fn の戻り値と struct の field の型として保存し、連鎖をたどる時に使う。
 #[derive(Clone, Default, Debug, PartialEq)]
@@ -264,6 +281,18 @@ impl CallCollector {
     fn is_bound(&self, name: &str) -> bool {
         self.scopes.iter().any(|s| s.contains_key(name))
     }
+    /// 関数呼び `a::b::f(..)` の (修飾ヒント = 末尾手前 seg (Type / module、単一 seg なら None), 出どころ)。
+    /// 修飾なしの f がこの body の束縛なら出どころは LOCAL_BINDING_ROOT (`let f = |..| ..; f()` はクロージャ)。
+    fn call_quals(&self, path: &syn::Path) -> (Option<String>, String) {
+        let segs = &path.segments;
+        let qualifier = (segs.len() >= 2).then(|| segs[segs.len() - 2].ident.to_string());
+        let root = match segs.last() {
+            Some(last) if segs.len() == 1 && self.is_bound(&last.ident.to_string()) => LOCAL_BINDING_ROOT.to_string(),
+            _ => self.root_of(path),
+        };
+        (qualifier, root)
+    }
+
     /// path (`T` / `a::T` / `a::T::f` の型部分まで) の出どころ。複数 seg は先頭 seg を `use` で引き直す
     /// (`use std::fs;` の後の `fs::DirEntry` は std)。単独の名前は `use` にあればその先頭、無ければ空 (ローカル)。
     /// 末尾 seg (関数名) は見ない: `path` が `T::f` なら T の出どころ。
@@ -330,16 +359,24 @@ impl CallCollector {
             }
             syn::Expr::Call(c) => {
                 let syn::Expr::Path(p) = &*c.func else { return None };
+                if p.qself.is_some() {
+                    return None;
+                }
                 let segs = &p.path.segments;
-                if p.qself.is_some() || segs.len() < 2 {
-                    return None;
+                let f = segs.last()?.ident.to_string();
+                let (qualifier, root) = self.call_quals(&p.path);
+                match qualifier {
+                    // `Box::pin(x)` / `Arc::new(x)` — 包んだ中身の method に自動参照外しで届く。包んだ印を手順に積む
+                    Some(q) if SMART_PTRS.contains(&q.as_str()) && SMART_PTR_CTORS.contains(&f.as_str()) && c.args.len() == 1 => {
+                        step(self.expr_recv(&c.args[0])?, format!("w:{q}"))
+                    }
+                    // `T::f(..)` — 型っぽい修飾 (大文字始まり / Self)。型引数 `T::new()` は中身が分からない
+                    Some(q) if q.starts_with(|c: char| c.is_ascii_uppercase()) => {
+                        (!(segs.len() == 2 && self.generics.contains(&q))).then(|| Recv { ty: q, via_fn: f, root, ..Default::default() })
+                    }
+                    // 自由関数 `f(..)` / `module::f(..)` — 戻り値の型は解決時に呼び先を 1 つに絞れた時だけ使う
+                    q => Some(Recv { ty: format!("{FREE_FN_RECV}{}", q.unwrap_or_default()), via_fn: f, root, ..Default::default() }),
                 }
-                let q = segs[segs.len() - 2].ident.to_string();
-                // 型っぽい修飾 (大文字始まり / Self) だけ。`module::f()` は戻り値の型が分からない。
-                if !q.starts_with(|c: char| c.is_ascii_uppercase()) || (segs.len() == 2 && self.generics.contains(&q)) {
-                    return None;
-                }
-                Some(Recv { ty: q, via_fn: segs.last()?.ident.to_string(), root: self.root_of(&p.path), ..Default::default() })
             }
             syn::Expr::Try(t) => {
                 let r = self.expr_recv(&t.expr)?;
@@ -433,17 +470,7 @@ impl<'ast> Visit<'ast> for CallCollector {
         if let syn::Expr::Path(p) = &*node.func {
             let segs = &p.path.segments;
             if let Some(last) = segs.last() {
-                // 末尾手前 seg を修飾ヒントに (Type / module)。単一 seg なら None。
-                let qualifier = if segs.len() >= 2 {
-                    Some(segs[segs.len() - 2].ident.to_string())
-                } else {
-                    None
-                };
-                let qual_root = if segs.len() == 1 && self.is_bound(&last.ident.to_string()) {
-                    LOCAL_BINDING_ROOT.to_string() // `let f = |..| ..; f()` — 呼んでいるのはクロージャ
-                } else {
-                    self.root_of(&p.path)
-                };
+                let (qualifier, qual_root) = self.call_quals(&p.path);
                 self.calls.push(RawCall {
                     name: last.ident.to_string(),
                     qualifier,
@@ -1492,11 +1519,19 @@ impl<'a> Resolver<'a> {
     fn ret_of(&self, t: &str, f: &str, method: bool) -> Option<TyRef> {
         let ds: Vec<&SymDef> = self.defs.get(f)?.iter().filter(|d| d.container == t && (d.kind == K_METHOD || (!method && d.kind == K_FN))).collect();
         let [d] = ds.as_slice() else { return None };
+        self.ret_from(d, t)
+    }
+
+    /// 定義 `d` の戻り値 (`Self` は `t` に読み替え。t が空 = 自由関数なら `Self` は推定しない)。
+    fn ret_from(&self, d: &SymDef, t: &str) -> Option<TyRef> {
         let mut r = d.ret.clone();
         if r.name.is_empty() {
             return None;
         }
         if r.name == "Self" {
+            if t.is_empty() {
+                return None;
+            }
             r.name = t.to_string();
             r.root = String::new();
         } else if !self.is_local_ty(&r.root, &r.name) && !matches!(r.name.as_str(), "Result" | "Option") {
@@ -1664,7 +1699,7 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
             }
         }
         // 受け手の型がソースに書いてあれば、その型の同名 method がちょうど 1 つの時だけ確定する。
-        if let Some(t) = recv_type_of(cs, rz) {
+        if let Some((t, wrapped)) = recv_type_of(cs, rz) {
             // trait 境界の受け手 (t が trait): 同名 method を宣言する**拡張 trait** (全型向けの impl を持つ) が
             // あれば、どちらが呼ばれるかは境界の外で決まる → 推定しない (AsyncBufRead / AsyncBufReadExt の consume)
             if rz.traits.contains(&t)
@@ -1674,6 +1709,7 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
             }
             let by_ty: Vec<&SymDef> = cands.iter().copied().filter(|d| d.container == t).collect();
             if let [d] = by_ty.as_slice()
+                && !(wrapped && (!d.impl_trait.name.is_empty() || rz.traits.contains(&t) || SMART_PTR_METHODS.contains(&cs.name.as_str())))
                 && !shadowed(&|x| x.container == t)
                 && rz.method_unshadowed(&cands, d, &t)
             {
@@ -1707,29 +1743,53 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
 
 /// 受け手の型名。起点 (`Self` は caller の impl 型、`T::f()` 由来は f の戻り値) から連鎖の手順を 1 段ずつ
 /// たどる。どの段でも「ちょうど 1 つに絞れる・出どころが repo の内側」でなければ None (推定しない)。
-fn recv_type_of(cs: &CallSite, rz: &Resolver) -> Option<String> {
+/// 戻り値の 2 つ目 = 受け手が smart pointer で包まれたまま (`Box::pin(x).f()`)。包んだ受け手では、包んだ側の
+/// method が先に当たり得るので、呼び先は中身の inherent method に限る (resolve_call で見る)。中身が trait
+/// (trait の中の `Pin::new(self)`) なら、Pin が実装する trait の method に当たる (tokio の consume で RA と照合)。
+fn recv_type_of(cs: &CallSite, rz: &Resolver) -> Option<(String, bool)> {
     let r = &cs.recv;
-    if r.ty.is_empty() || !rz.is_local_ty(&r.root, &r.ty) {
-        return None;
-    }
-    let mut t = if r.ty == "Self" { cs.caller_container.clone() } else { r.ty.clone() };
-    if t.is_empty() {
-        return None;
-    }
     // 直前の段が関数の戻り値なら、その型 (`?` で中身を取るため)。
     let mut last_ret: Option<TyRef> = None;
-    if !r.via_fn.is_empty() {
-        let ret = rz.ret_of(&t, &r.via_fn, false)?;
-        t = ret.name.clone();
+    let mut t = if let Some(q) = r.ty.strip_prefix(FREE_FN_RECV) {
+        let ret = free_fn_ret(cs, q, rz)?;
+        let t = ret.name.clone();
         last_ret = Some(ret);
-        if r.via_try {
-            t = unwrap_try(last_ret.take()?, rz)?;
+        t
+    } else {
+        if r.ty.is_empty() || !rz.is_local_ty(&r.root, &r.ty) {
+            return None;
         }
+        let t = if r.ty == "Self" { cs.caller_container.clone() } else { r.ty.clone() };
+        if t.is_empty() {
+            return None;
+        }
+        if r.via_fn.is_empty() {
+            t
+        } else {
+            let ret = rz.ret_of(&t, &r.via_fn, false)?;
+            let t = ret.name.clone();
+            last_ret = Some(ret);
+            t
+        }
+    };
+    if r.via_try {
+        t = unwrap_try(last_ret.take()?, rz)?;
     }
+    let mut wrapped = false;
     for s in r.chain.split(' ').filter(|s| !s.is_empty()) {
         if s == "?" {
             t = unwrap_try(last_ret.take()?, rz)?;
+        } else if let Some(w) = s.strip_prefix("w:") {
+            if rz.types.contains(w) {
+                return None; // 自前の同名型 (std の smart pointer ではない)
+            }
+            if last_ret.as_ref().is_some_and(|r| !rz.is_local_ty(&r.root, &r.name)) {
+                return None; // 包む前が std の Result / Option のまま
+            }
+            last_ret = None;
+            wrapped = true;
         } else if let Some(f) = s.strip_prefix("f:") {
+            wrapped = false;
             last_ret = None;
             let tys = rz.fields.get(&(t.clone(), f.to_string()))?;
             let [ty] = tys.as_slice() else { return None }; // 同名 struct が複数 → 絞れない
@@ -1738,16 +1798,48 @@ fn recv_type_of(cs: &CallSite, rz: &Resolver) -> Option<String> {
             }
             t = ty.name.clone();
         } else if let Some(m) = s.strip_prefix("m:") {
+            if wrapped && matches!(m, "as_mut" | "as_ref") {
+                continue; // `Pin<Box<T>>::as_mut()` / `Box::as_ref()` — 中身への参照 (まだ包まれている扱い)
+            }
+            if wrapped && SMART_PTR_METHODS.contains(&m) {
+                return None;
+            }
             let ret = rz.ret_of(&t, m, true)?;
             t = ret.name.clone();
             last_ret = Some(ret);
+            wrapped = false;
         } else {
             return None;
         }
     }
     // 連鎖の最後が戻り値の Result / Option / Vec 等 (`?` を当てていない) なら std の型
     let ext_tail = last_ret.as_ref().is_some_and(|r| !rz.is_local_ty(&r.root, &r.name));
-    (!ext_tail).then_some(t)
+    (!ext_tail).then_some((t, wrapped))
+}
+
+/// 受け手が自由関数の戻り値 (`let s = time::sleep(..); s.reset()`) — 呼び先を関数呼びと同じ規則で 1 つに絞れた時
+/// だけ、その定義に書いてある戻り値の型。外から `use` した関数や同名の自由関数が複数なら推定しない。
+fn free_fn_ret(cs: &CallSite, qualifier: &str, rz: &Resolver) -> Option<TyRef> {
+    let r = &cs.recv;
+    let probe = CallSite {
+        caller: cs.caller,
+        caller_container: cs.caller_container.clone(),
+        file: cs.file,
+        rel_path: cs.rel_path.clone(),
+        name: r.via_fn.clone(),
+        qualifier: (!qualifier.is_empty()).then(|| qualifier.to_string()),
+        is_method: false,
+        self_recv: false,
+        as_value: false,
+        in_macro: false,
+        recv: Recv::default(),
+        qual_root: r.root.clone(),
+        line: cs.line,
+        col: cs.col,
+    };
+    let (Some(e), _) = resolve_call(&probe, rz) else { return None };
+    let d = rz.defs.get(&r.via_fn)?.iter().find(|d| d.eid == e && d.kind == K_FN)?;
+    rz.ret_from(d, "")
 }
 
 /// `?` を当てた後の型: 戻り値が `Result<T, _>` / `Option<T>` の T (出どころが内側の時だけ)。
