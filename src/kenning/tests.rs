@@ -378,6 +378,12 @@ use super::*;
         assert_eq!(got[3], (7, "設計原則 > 別の節".to_string()));
         // `#` 直後に空白が無いものは見出しではない (Rust の属性や C の #include を拾わない)
         assert_eq!(got.len(), 4);
+
+        // code block の中の `# コメント` は見出しではない (CLAUDE.md の bash 例のコメントが目次に混ざっていた)。
+        // ``` の中の ~~~ は閉じない
+        let fenced = "# 使い方\n```bash\n# comment\n~~~\n# still code\n```\n## 次\n";
+        let got = text_containers(LANG_MD, fenced);
+        assert_eq!(got, vec![(1, "使い方".to_string()), (7, "使い方 > 次".to_string())]);
     }
 
     #[test]

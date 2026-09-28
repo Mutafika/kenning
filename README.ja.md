@@ -129,8 +129,10 @@ kenning --version                   バージョン
 ```
 
 出力は stdout の決定的な `path:line<TAB>詳細` 行（進捗は stderr）— 各行はそのまま
-ファイルリーダに渡せる。repo には `CLAUDE.md` が同梱され、Claude 系エージェントが
-プロンプトなしで正しいサブコマンドを選べる。
+ファイルリーダに渡せる。repo には短い `CLAUDE.md`（約 2KB）が同梱され、Claude 系エージェントが
+プロンプトなしで正しいサブコマンドを選べる — 自分の agent の指示にそのまま写せばいい。全文の
+リファレンスは [docs/GUIDE.md](docs/GUIDE.md) で、必要な時だけ読ませる（全文は毎 turn input を食うので
+短い方が安い — 下の実 agent の A/B）。
 
 索引対象は rg と同じ規約 — `.gitignore` / `.ignore` と隠しディレクトリを尊重し、`target/` と
 `node_modules/` は常に除外。自動の判断が合わない時だけ使う上書き:

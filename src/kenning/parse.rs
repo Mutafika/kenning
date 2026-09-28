@@ -2185,11 +2185,24 @@ pub(crate) fn text_containers(lang: u32, src: &str) -> Vec<(u32, String)> {
     let mut out = Vec::new();
     // (深さ, 見出し/キー) のスタック。md は heading level、yaml は indent 幅を深さに使う。
     let mut stack: Vec<(usize, String)> = Vec::new();
+    // md の code block (``` / ~~~) の中の `# ` はシェルのコメント等で、見出しではない。開いた印で閉じる。
+    let mut fence: Option<&str> = None;
     for (i, raw) in src.lines().enumerate() {
         let ln = (i + 1) as u32;
         match lang {
             LANG_MD => {
                 let t = raw.trim_start();
+                if let Some(mark) = ["```", "~~~"].into_iter().find(|m| t.starts_with(m)) {
+                    fence = match fence {
+                        Some(open) if open == mark => None,
+                        None => Some(mark),
+                        keep => keep,
+                    };
+                    continue;
+                }
+                if fence.is_some() {
+                    continue;
+                }
                 let level = t.bytes().take_while(|&b| b == b'#').count();
                 if level == 0 || level > 6 || !t[level..].starts_with(' ') {
                     continue;

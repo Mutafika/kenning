@@ -133,8 +133,10 @@ kenning --version                   version
 ```
 
 Output is deterministic `path:line<TAB>detail` rows on stdout (progress goes to stderr) —
-each line can be fed straight into a file reader. A `CLAUDE.md` ships with the repo so
-Claude-family agents pick the right subcommand without prompting.
+each line can be fed straight into a file reader. A short `CLAUDE.md` (~2 KB) ships with the repo so
+Claude-family agents pick the right subcommand without prompting — copy it into your own agent
+instructions; the full reference lives in [docs/GUIDE.md](docs/GUIDE.md) and is read on demand
+(short beats full: the full guide costs input tokens on every turn, see the agent A/B below).
 
 Indexing follows ripgrep's rules — `.gitignore` / `.ignore` and hidden directories are respected,
 `target/` and `node_modules/` are always excluded. Overrides, for when the automatic behaviour is

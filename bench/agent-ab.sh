@@ -1,7 +1,8 @@
 #!/bin/sh
 # 実 agent の A/B: 同じ課題を headless の claude に「kenning あり / なし」で解かせ、token・費用・正答を比べる。
 # 使い方: ./bench/agent-ab.sh [task-id...] (既定は全課題)。env: AB_REPS=回数 (既定 1) / AB_MODEL / AB_EFFORT /
-#   AB_CONDS=条件 (既定 "A B"。A=kenning+CLAUDE.md 全文 / B=kenning なし / C=kenning+短い案内 guide-slim.md) /
+#   AB_CONDS=条件 (既定 "A B"。A=kenning+全文の案内 docs/GUIDE.md / B=kenning なし / C=kenning+短い案内
+#   guide-slim.md / D=kenning+repo 直下の CLAUDE.md = 利用者に配る案内) /
 #   AB_KENNING=試す kenning の binary (既定は PATH の物。未 install の build を他の session に影響させずに試す)
 # 課題 = bench/agent-ab/tasks/<repo>-<name>.txt、正解 = truth/<同名>.txt (path:line、cargo check で検証済み)。
 # 結果 = $AB_OUT (既定 ~/.cache/kenning-bench/agent-ab/<日時>)/<task>.<cond>.<rep>.jsonl (stream-json = 道具の
@@ -20,7 +21,7 @@ if [ -n "$AB_KENNING" ]; then
     PATH="$OUT/bin:$PATH"; export PATH
 fi
 
-# 全条件とも読むだけの道具。A / C は kenning の実行と案内を足す (A = 利用者が実際に置く CLAUDE.md そのまま)
+# 全条件とも読むだけの道具。A / C / D は kenning の実行と案内を足す
 BASE_TOOLS="Read Grep Glob Bash(rg:*) Bash(grep:*) Bash(sed:*) Bash(cat:*) Bash(head:*) Bash(tail:*) Bash(find:*) Bash(ls:*) Bash(wc:*) Bash(awk:*)"
 
 run() { # task cond rep
@@ -28,7 +29,8 @@ run() { # task cond rep
     repo=$D/${t%%-*}
     tools="$BASE_TOOLS"; extra=""
     case $c in
-        A) tools="$tools Bash(kenning:*)"; extra="$(cat "$KB/CLAUDE.md")" ;;
+        A) tools="$tools Bash(kenning:*)"; extra="$(cat "$KB/docs/GUIDE.md")" ;;
+        D) tools="$tools Bash(kenning:*)"; extra="$(cat "$KB/CLAUDE.md")" ;;
         C) tools="$tools Bash(kenning:*)"; extra="$(cat "$KB/bench/agent-ab/guide-slim.md")" ;;
     esac
     (cd "$repo" && claude -p "$(cat "$KB/bench/agent-ab/tasks/$t.txt")" \

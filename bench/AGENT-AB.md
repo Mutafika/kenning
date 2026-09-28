@@ -9,7 +9,7 @@
 
 | 条件 | 道具 | 案内 (system prompt に追記) |
 |---|---|---|
-| **A** | Read / Grep / Glob / 読むだけの Bash (rg grep sed cat head tail find ls wc awk) + **kenning** | kenning の CLAUDE.md 全文 (~15KB、利用者が実際に置く物) |
+| **A** | Read / Grep / Glob / 読むだけの Bash (rg grep sed cat head tail find ls wc awk) + **kenning** | 全文の案内 (~15KB。当時の CLAUDE.md、今は `docs/GUIDE.md`) |
 | **B** | Read / Grep / Glob / 読むだけの Bash | なし |
 | **C** | A と同じ | 短い案内 `agent-ab/guide-slim.md` (~1.5KB) |
 
@@ -58,6 +58,23 @@ input token は B/A 1.01x (A は CLAUDE.md 全文の固定費を毎 turn 払う)
 
 合計: **B は A の 1.69 倍、C の 1.91 倍の費用**。turn B/A 2.00x・B/C 1.89x、時間 B/A 1.71x・B/C 1.70x。
 input token B/A 1.15x、B/C 1.72x。
+
+### 3 回目 — 案内の長さ (B / C / D、commit b59e5dd の build)
+
+D = CLAUDE.md を短くした版 (日本語 ~2.1KB、要点 + 詳細は `docs/GUIDE.md` を必要な節だけ読む)。
+
+| 課題 | B 費用 / turn / 秒 | C 費用 / turn / 秒 | D 費用 / turn / 秒 |
+|---|---|---|---|
+| tokio-add-permits | $0.18 / 4 / 82 | $0.05 / 5 / 13 | $0.06 / 5 / 19 |
+| tokio-joinset-spawn | $0.16 / 6 / 30 | $0.20 / 11 / 39 | $0.19 / 13 / 39 |
+| enchudb-oplog-open | $0.10 / 6 / 23 | $0.08 / 4 / 21 | $0.09 / 5 / 21 |
+| enchudb-leafstore-insert | $0.22 / 10 / 33 | $0.12 / 5 / 23 | $0.13 / 6 / 25 |
+| tokio-sleep-reset-tests | $0.62 / 18 / 118 | $0.16 / 7 / 44 | $0.28 / 9 / 48 |
+| tokio-block-on-park | $0.25 / 14 / 39 | $0.15 / 5 / 28 | $0.15 / 6 / 32 |
+
+合計: **B は C の 2.03 倍、D の 1.70 倍の費用**。時間 B/C 1.94x・B/D 1.77x。正答は全条件 100% (テスト特定の precision は
+C / D とも 65% = 静的に届く上位集合)。案内の長さ別の B との費用比 (3 回の実測): 全文 15KB (A) 1.50x / 1.69x、
+日本語 2.1KB (D) 1.70x、英語 1.5KB (C) 1.77x / 1.91x / 2.03x。
 
 ## 読み方 (正直な所)
 
