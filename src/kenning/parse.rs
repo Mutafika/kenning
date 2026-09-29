@@ -725,6 +725,9 @@ pub(crate) struct FileFacts {
     pub(crate) cond_mods: Vec<String>,
     /// この file で宣言した子 module の名前 (`#[path]` で file 名と違う名前でも repo の内側の名前)。
     pub(crate) mod_names: Vec<String>,
+    /// cfg 付きの `use` が持ってくる名前 (`name@出どころ`)。出どころが repo の外なら、その名前の自前の定義は
+    /// build の設定で外の実体と入れ替わる (tokio の `#[cfg(not(..))] use std::sync::Condvar` ↔ parking_lot 版)。
+    pub(crate) cfg_uses: Vec<String>,
 }
 
 /// 1 定義 + その本体の呼び出し箇所。
@@ -861,6 +864,7 @@ pub(crate) fn insert_file_facts(file_t: &Table, sym_t: &Table, acc: &mut Acc, ro
         .set("gated_mods", facts.gated_mods.join(" ").as_str())
         .set("cond_mods", facts.cond_mods.join(" ").as_str())
         .set("mod_names", facts.mod_names.join(" ").as_str())
+        .set("cfg_uses", facts.cfg_uses.join(" ").as_str())
         .commit()
         .unwrap();
     let rel_path = rel_of(path_s, root);
@@ -1303,6 +1307,13 @@ pub(crate) fn walk_item(it: &syn::Item, ctx: &mut Ctx, out: &mut FileFacts) {
                 scan_tokens_for_calls(m.mac.tokens.clone(), &mut out.item_calls);
             }
         }
+        syn::Item::Use(u) if u.attrs.iter().any(is_cfg_cond) => {
+            let mut imp = HashMap::new();
+            use_tree_imports(&u.tree, None, &mut imp);
+            let mut names: Vec<String> = imp.into_iter().map(|(name, (root, _))| format!("{name}@{root}")).collect();
+            names.sort();
+            out.cfg_uses.extend(names);
+        }
         syn::Item::Mod(m) => {
             let entry = mod_decl_entry(m);
             out.mod_names.push(m.ident.to_string());
@@ -1359,6 +1370,8 @@ pub(crate) struct Resolver<'a> {
     gated_files: HashSet<EntityId>,
     /// cfg 付きで宣言された module の file → その範囲の番号。範囲の外からは確定しない。
     cond_region: HashMap<EntityId, usize>,
+    /// cfg 付きの `use` で repo の外から持ってくる名前 (条件付きの自前の定義と入れ替わり得る)。
+    cfg_ext_names: HashSet<String>,
 }
 
 /// `use` せずに使える prelude の型。出どころが空 (= use していない) のこれらは std の型 (repo に同名の
@@ -1427,22 +1440,33 @@ impl<'a> Resolver<'a> {
         for ext in ["std", "core", "alloc"] {
             local_roots.remove(ext);
         }
-        Resolver { defs, local_roots, fields, files, traits, for_all_traits, types, gated_files, cond_region }
+        // cfg 付きの use で repo の外から持ってくる名前 = 条件付きの自前の定義と入れ替わり得る名前
+        let mut cfg_ext_names: HashSet<String> = HashSet::new();
+        for e in file_t.where_eq("lang", LANG_RUST).find().unwrap_or_default() {
+            for u in txt(file_t.entity(e).get("cfg_uses")).split(' ').filter(|u| !u.is_empty()) {
+                if let Some((name, root)) = u.split_once('@')
+                    && !local_roots.contains(&crate_key(root))
+                {
+                    cfg_ext_names.insert(name.to_string());
+                }
+            }
+        }
+        Resolver { defs, local_roots, fields, files, traits, for_all_traits, types, gated_files, cond_region, cfg_ext_names }
     }
     /// 呼び出し元 (file) から定義 `d` を確定先にしてよいか。cfg 付きの定義 / 条件付き module の中の定義は、
     /// 同じ file / 同じ条件付き module の中からの呼び出しだけ (外からは cfg 付きの re-export 越しに別の実体に
     /// 切り替わり得る)。代用品 (`cfg_not_*!`) はどこからも確定しない。
-    fn live_for(&self, caller_file: EntityId, d: &SymDef) -> bool {
+    ///
+    /// ただし入れ替わる相手が無ければ条件付きでも外から確定する: 同じ名前 (method なら型名) を cfg 付きの
+    /// `use` で repo の外から持ってくる枝が無い = feature で有る / 無いが切り替わるだけ (tokio の `cfg_rt!` の
+    /// 中の JoinSet)。loom 等の test から JoinSet::spawn が 1 件も確定しなかった。
+    fn live_for(&self, caller_file: EntityId, name: &str, d: &SymDef) -> bool {
         if d.gated || self.gated_files.contains(&d.file) {
             return false;
         }
-        if d.cond && caller_file != d.file {
-            return false;
-        }
-        match self.cond_region.get(&d.file) {
-            Some(r) => self.cond_region.get(&caller_file) == Some(r),
-            None => true,
-        }
+        let in_region = !(d.cond && caller_file != d.file)
+            && self.cond_region.get(&d.file).is_none_or(|r| self.cond_region.get(&caller_file) == Some(r));
+        in_region || !(self.cfg_ext_names.contains(name) || self.cfg_ext_names.contains(&d.container))
     }
     /// 定義の module の道順: file の置き場所 (`src/time/sleep.rs` → time, sleep。lib.rs / main.rs / mod.rs は
     /// dir まで) + file 内の `mod x { }`。`#[path]` で置き場所を変えた file はずれる (その時は一致しないだけ)。
@@ -1617,7 +1641,7 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
     // 代用品 (`cfg_not_*!`) と、外から見た cfg 付きの定義は確定先にしない (build の設定で別の実体になり得る)。
     // 外した候補は「確定先にしない」だけで、残りを一意にする根拠にはしない (外した方が本当の呼び先かも
     // しれない)。下の各段で「外した候補にも当てはまる物があれば確定しない」を見る。
-    let (live, excluded): (Vec<SymDef>, Vec<SymDef>) = all_cands.iter().cloned().partition(|d| rz.live_for(cs.file, d));
+    let (live, excluded): (Vec<SymDef>, Vec<SymDef>) = all_cands.iter().cloned().partition(|d| rz.live_for(cs.file, &cs.name, d));
     if !excluded.is_empty() && live.iter().all(|d| d.kind != K_FN && d.kind != K_METHOD) {
         return (None, R_AMBIG);
     }
@@ -2021,7 +2045,7 @@ pub(crate) fn file_imports(items: &[syn::Item]) -> HashMap<String, (String, Stri
 
 pub(crate) fn extract_file(src: &str) -> Option<FileFacts> {
     let file = syn::parse_file(src).ok()?;
-    let mut out = FileFacts { loc: src.lines().count() as u32, hash: hash_u32(src), syms: Vec::new(), impls: Vec::new(), item_calls: Vec::new(), fields: Vec::new(), gated_mods: Vec::new(), live_mods: Vec::new(), cond_mods: Vec::new(), mod_names: Vec::new() };
+    let mut out = FileFacts { loc: src.lines().count() as u32, hash: hash_u32(src), syms: Vec::new(), impls: Vec::new(), item_calls: Vec::new(), fields: Vec::new(), gated_mods: Vec::new(), live_mods: Vec::new(), cond_mods: Vec::new(), mod_names: Vec::new(), cfg_uses: Vec::new() };
     // file 冒頭の inner attribute (`#![cfg(test)]`) は file 全体に効く。per-file parse では親の
     // `#[cfg(test)] mod x;` が見えないので、これを見ないと test 専用 file の helper が
     // 「test でない symbol」として出てしまう (`tests <name>` と `search test:1` が取りこぼす)。

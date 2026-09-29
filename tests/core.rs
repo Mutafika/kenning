@@ -1344,6 +1344,33 @@ fn callers_lists_where_other_same_named_calls_resolved() {
     assert!(!row.contains("C::dup"), "行き先は free fn の dup のはず: {row}");
 }
 
+/// `#[cfg(..)] mod x;` の中の定義 (条件付き) も、外の実体と入れ替わる枝が無ければ外から確定する
+/// (tokio の `cfg_rt!` の中の JoinSet — loom の test から spawn が 1 件も確定しなかった)。同じ名前を cfg 付きの
+/// `use` で repo の外 (std) から持ってくる枝があれば入れ替わり得るので確定しない (parking_lot::Condvar ↔ std)。
+#[test]
+fn cond_defs_are_confirmed_unless_an_external_cfg_alternative_exists() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        "use crate::rt::JoinSet;\nuse crate::pl::Condvar;\n\
+         pub fn user() { let s = JoinSet::new(); s.spawn(); let c = Condvar::new(); c.notify_all(); }\n",
+    );
+    std::fs::write(
+        d.join("src/lib.rs"),
+        "#[cfg(feature = \"rt\")]\nmod rt;\n#[cfg(feature = \"pl\")]\nmod pl;\n\
+         #[cfg(not(feature = \"pl\"))]\nuse std::sync::Condvar;\nmod other;\n",
+    )
+    .unwrap();
+    std::fs::write(d.join("src/rt.rs"), "pub struct JoinSet;\nimpl JoinSet {\n    pub fn new() -> Self { JoinSet }\n    pub fn spawn(&self) {}\n}\n").unwrap();
+    std::fs::write(d.join("src/pl.rs"), "pub struct Condvar;\nimpl Condvar {\n    pub fn new() -> Self { Condvar }\n    pub fn notify_all(&self) {}\n}\n").unwrap();
+    let db = d.join("k.db");
+    index(&d, &db);
+    let spawn = query(&["callers", "JoinSet::spawn"], &db);
+    assert!(spawn.contains("1 確実 callers"), "入れ替わる相手の無い条件付きの定義に確定しない:\n{spawn}");
+    let notify = query(&["callers", "Condvar::notify_all"], &db);
+    assert!(notify.contains("0 確実 callers"), "std と入れ替わり得る定義に確定した:\n{notify}");
+}
+
 // ── changes: 前回 snapshot からの意味的な差分 ──
 
 fn update(dir: &Path, db: &Path) {
@@ -2029,6 +2056,8 @@ cfg_x! { #[path = "native.rs"] mod imp; }
 cfg_not_x! { #[path = "shim.rs"] mod imp; }
 #[cfg(feature = "fast")]
 mod fast;
+#[cfg(not(feature = "fast"))]
+use slowcrate::Fast;
 pub fn use_native(n: &imp::Native) { n.get(); }
 pub fn use_shim(s: &imp::Shim) { s.get(); }
 pub fn use_fast(f: &fast::Fast) { f.run(); }
@@ -2044,7 +2073,7 @@ pub fn use_fast(f: &fast::Fast) { f.run(); }
     assert!(confirmed(&["callers", "get", "Native"]).contains("in use_native\t"), "#[path] の native 側は確定するはず");
     assert!(!confirmed(&["callers", "get", "Shim"]).contains("in use_shim\t"), "cfg_not 側 (#[path] = shim.rs) に確定");
     let run = confirmed(&["callers", "run", "Fast"]);
-    assert!(!run.contains("in use_fast\t"), "cfg 付き module の中の定義に外から確定:\n{run}");
+    assert!(!run.contains("in use_fast\t"), "cfg で外の実体 (slowcrate::Fast) と入れ替わる定義に外から確定:\n{run}");
     assert!(run.contains("in Fast::inner\t"), "同じ module の中からは確定するはず:\n{run}");
 }
 

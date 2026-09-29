@@ -265,6 +265,7 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         .tag("gated_mods") // cfg_not_*! の中で宣言した子 module (空白区切り、`name` / `name@path`)
         .tag("cond_mods") // #[cfg(..)] 付きで宣言した子 module (同上)
         .tag("mod_names") // 宣言した子 module の名前 (#[path] で file 名と違っても repo の内側の名前)
+        .tag("cfg_uses") // cfg 付きの use が持ってくる名前 (空白区切り、`name@出どころ`)
         .with_capacity(file_cap)
         .build()
         .unwrap();
