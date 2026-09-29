@@ -1330,6 +1330,20 @@ fn module_qualified_calls_use_file_location() {
     assert!(y.contains("0 確実 callers"), "同名 module が 2 つあるのに確定した:\n{y}");
 }
 
+/// 別の同名 sym に確定した呼び出しも、行き先の定義ごとの件数を出す (件数だけだと agent は grep で
+/// 数え直していた)。ここでは method `C::dup` に絞った時、free fn `dup` 側に確定した呼び出しがそこに出る。
+#[test]
+fn callers_lists_where_other_same_named_calls_resolved() {
+    let d = tmp();
+    write_fixture(&d, "pub fn free_user() { crate::dup(); }\n");
+    let db = d.join("k.db");
+    index(&d, &db);
+    let out = query(&["callers", "C::dup"], &db);
+    assert!(out.contains("件は別の同名 sym に確定"), "別の同名に確定した分の内訳が無い:\n{out}");
+    let row = out.lines().find(|l| l.contains("lib.rs:") && l.trim_start().starts_with(|c: char| c.is_ascii_digit()) && l.contains("dup")).unwrap_or_else(|| panic!("行き先の定義の行が無い:\n{out}"));
+    assert!(!row.contains("C::dup"), "行き先は free fn の dup のはず: {row}");
+}
+
 // ── changes: 前回 snapshot からの意味的な差分 ──
 
 fn update(dir: &Path, db: &Path) {

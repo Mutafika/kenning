@@ -964,8 +964,31 @@ pub(crate) fn run_callers(db_path: &str, name: &str, narrow: &Narrow, limit: usi
             println!("    … (+{} 件省略、--limit で全部)", cand.len() - limit);
         }
     }
+    // 別の同名 sym に確定した分も、行き先の定義ごとの件数を出す。件数だけだと「本当に全部か」を
+    // grep で数え直すことになる (実 agent の A/B で kenning ありでも grep に戻った一番の理由)。
+    if other > 0 {
+        let mut to: HashMap<EntityId, usize> = HashMap::new();
+        for &c in &name_matches {
+            if let Some(Value::Ref(e)) = call_t.entity(c).get("callee_sym")
+                && !defs.contains(&e)
+            {
+                *to.entry(e).or_default() += 1;
+            }
+        }
+        let mut to: Vec<(usize, EntityId)> = to.into_iter().map(|(e, n)| (n, e)).collect();
+        to.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        println!("  ↳ {other} 件は別の同名 sym に確定 (行き先の定義ごと。位置は `callers <その修飾名>`):");
+        for (n, e) in to.iter().take(limit) {
+            let er = sym_t.entity(*e);
+            let path = paths.get(&ref_of(er.get("file"))).map(String::as_str).unwrap_or("?");
+            println!("    {n:>5}  {}  {path}:{}", sym_qual(&sym_t, *e), num(er.get("line")));
+        }
+        if to.len() > limit {
+            println!("    … (+{} 定義省略)", to.len() - limit);
+        }
+    }
     println!(
-        "# 名前一致 {name_total} = 確実 {precise_sum} + 候補未確定 {} + 別の同名 sym に確定 {other}",
+        "# 名前一致 {name_total} = 確実 {precise_sum} + 候補未確定 {} + 別の同名 sym に確定 {other} — 名前 `{bare}` の呼び出し箇所は全部この 3 つのどれか (grep で数え直さなくていい)",
         cand.len()
     );
     // 0 件で終わる trait 実装 method は「使われていない」ではなく **trait 経由で呼ばれる** だけ。
