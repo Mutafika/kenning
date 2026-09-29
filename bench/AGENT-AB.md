@@ -76,6 +76,27 @@ D = CLAUDE.md を短くした版 (日本語 ~2.1KB、要点 + 詳細は `docs/GU
 C / D とも 65% = 静的に届く上位集合)。案内の長さ別の B との費用比 (3 回の実測): 全文 15KB (A) 1.50x / 1.69x、
 日本語 2.1KB (D) 1.70x、英語 1.5KB (C) 1.77x / 1.91x / 2.03x。
 
+### 4 回目 — Haiku (探索の subagent が使う model、v0.5.1)
+
+`AB_MODEL=claude-haiku-4-5-20251001`、B (grep のみ) と D (kenning + CLAUDE.md)。
+
+| 課題 | B 費用 / turn / 秒 / input | D 費用 / turn / 秒 / input | 正答 B → D |
+|---|---|---|---|
+| tokio-add-permits | $0.15 / 29 / 82 / 512k | $0.05 / 5 / 32 / 78k | recall 100 → 100%、precision 80 → 100% |
+| tokio-joinset-spawn | $0.19 / 24 / 100 / 815k | $0.09 / 12 / 57 / 267k | 100 → 100% |
+| enchudb-oplog-open | $0.05 / 4 / 16 / 89k | $0.03 / 2 / 17 / 32k | recall 100 → 96% |
+| enchudb-leafstore-insert | $0.19 / 38 / 89 / 957k | $0.04 / 3 / 39 / 46k | recall 93 → 100% |
+| tokio-sleep-reset-tests | $0.33 / 46 / 156 / 1.78M | $0.02 / 2 / 22 / 29k | recall 89 → 74% |
+| tokio-block-on-park | $0.36 / 57 / 198 / 2.02M | $0.24 / 39 / 145 / 1.11M | 8 段中 6〜8 → 全 run 8 |
+
+合計: **B は D の 2.74 倍の費用、input token 3.95 倍、turn 3.14 倍、時間 2.05 倍**。Opus より差が大きい —
+Haiku は grep だけだと Read / Grep を 24〜57 回往復し、1 課題で input 2M token に達する。正答も B の方が
+崩れる (取りこぼし・余計な行・経路の途中で止まる)。
+
+逆に **D がテストの特定で 74% に落ちた**のは、Haiku が `kenning tests` の出力をそのまま答えにしたから
+(kenning 自体が 35 本中 24 本しか静的に辿れない — generic / `tokio::pin!` / trait 経由)。Opus は grep で
+補って 100% にしていた。弱い model ほど kenning の答えが最終回答になる = kenning の取りこぼしがそのまま出る。
+
 ## 読み方 (正直な所)
 
 - **正答は差が無い。** grep だけの Opus も 1,140 件の同名 `spawn` から 25 件を全部当てる。kenning の価値は
