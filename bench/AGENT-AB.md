@@ -97,6 +97,24 @@ Haiku は grep だけだと Read / Grep を 24〜57 回往復し、1 課題で i
 (kenning 自体が 35 本中 24 本しか静的に辿れない — generic / `tokio::pin!` / trait 経由)。Opus は grep で
 補って 100% にしていた。弱い model ほど kenning の答えが最終回答になる = kenning の取りこぼしがそのまま出る。
 
+### 5 回目 — grep に戻った理由を潰した後 (D、Haiku / Opus、commit 8441d22 + 条件付き定義の修正)
+
+kenning ありの run で agent が grep に戻った ~310 回を分類した。多い順に (1) `callers` の後に取りこぼしを
+grep で数え直す (別の同名に確定した分の行き先が見えなかった)、(2) 別名 (`use X as Y`) の確認、(3) 同名の定義を
+`grep -n "fn X" -A5` で読む、(4) kenning の本当の穴 (`tests` の取りこぼし) の補完。(1) は行き先を定義ごとに出し、
+(3) は案内に `read <name> path:` を足し、(4) の一部 (cfg_rt! の中の定義に外から確定しなかった) を直した。
+
+| 課題 | Haiku D (前 → 後) | 正答 (前 → 後) |
+|---|---|---|
+| tokio-joinset-spawn | $0.09 / 12 turn → **$0.03 / 2 turn** (kenning 1 回) | recall 100% → 100% (途中の版では 76%) |
+| tokio-add-permits | $0.05 / 5 → $0.01 / 2 | 100% → 100% |
+| enchudb-leafstore-insert | $0.04 / 3 → $0.03 / 2 | 100% → 100% |
+| tokio-sleep-reset-tests | $0.02 / 2 → $0.02 / 2 | recall 74% → 74% (kenning の `tests` が 35 本中 26 本 — Haiku はそのまま答える) |
+
+Haiku は kenning の出力を 1 回見てそのまま答えるようになった (grep だけだと同じ課題に 24〜46 turn)。その分、
+**kenning の答えの穴がそのまま正答率になる**: 残る穴は trait 経由 (`Stream::poll_next`) と、generic /
+`tokio::pin!` 越しの受け手。
+
 ## 読み方 (正直な所)
 
 - **正答は差が無い。** grep だけの Opus も 1,140 件の同名 `spawn` から 25 件を全部当てる。kenning の価値は
