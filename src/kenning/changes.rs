@@ -664,7 +664,7 @@ fn print_changes(changes: &[Change], since: &str, token: Option<&str>, limit: us
         println!("{p}:{l}\t{}\t{}", c.kind(), c.detail());
     }
     if shown.len() > limit {
-        println!("… (+{} 件省略、--limit {} で全部)", shown.len() - limit, shown.len());
+        println!("{}", omitted(shown.len(), limit));
     }
     let hidden = changes.len() - shown.len();
     if hidden > 0 {

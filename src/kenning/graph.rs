@@ -232,7 +232,7 @@ pub fn cmd_refs(args: &[String]) {
             println!("    {p}:{ln}\t[{}]", role_name(*role));
         }
         if rows.len() > o.limit {
-            println!("    … (+{} 件省略)", rows.len() - o.limit);
+            println!("    {}", omitted(rows.len(), o.limit));
         }
     }
     // refs は SCIP 確定のみ = 精密だが cfg 非活性/未解析域は落ちる。superset が要るなら find/grep。
@@ -657,7 +657,7 @@ pub(crate) fn print_sym_layer(sym_t: &Table, paths: &HashMap<EntityId, String>, 
         println!("{indent}{}", fmt_sym(sym_t, paths, *e));
     }
     if rows.len() > limit {
-        println!("{indent}… (+{} 件省略、--limit で全部)", rows.len() - limit);
+        println!("{indent}{}", omitted(rows.len(), limit));
     }
 }
 
@@ -782,7 +782,7 @@ pub(crate) fn run_tests(db_path: &str, name: &str, narrow: &Narrow, limit: usize
         println!("  [{tag}] {}", fmt_sym(&sym_t, &paths, *e));
     }
     if rows.len() > limit {
-        println!("  … (+{} 件省略、--limit で全部)", rows.len() - limit);
+        println!("  {}", omitted(rows.len(), limit));
     }
     if rows.is_empty() {
         let how = if follow_value { "確定 edge + 値渡し参照 + 候補 edge" } else { "確定 edge のみ。候補 edge は `--confirmed-only` 無しで" };
@@ -796,9 +796,12 @@ pub(crate) fn run_tests(db_path: &str, name: &str, narrow: &Narrow, limit: usize
         (true, n) => format!("経路に値渡し参照 {n} sym を含む。確定だけなら `--confirmed-only`"),
     };
     println!("# {name} に届くテスト: [dN] 確定 {} 件 ({how})", tests.len());
+    if rows.len() > limit {
+        println!("# ⚠ 上の一覧は {limit} 件で切れている — 答えにするなら `--limit 0` で全 {} 件を出す", rows.len());
+    }
     if follow_value {
         println!(
-            "# [cN] 候補経由 {} 件 = 名前一致どまりの edge (trait 経由 / 受け手の型不明) を N 本通って届く。静的に届き得るのは [d]+[c] で全部 — 回すなら両方 (安全側)、絞るなら [c] を読んで判断",
+            "# [cN] 候補経由 {} 件 = 名前一致どまりの edge (trait 経由 / 受け手の型不明) を N 本通って届く。届くテストの答え = [d] と [c] の全部 (静的に届き得るのはこれで全部。[c] を外すと trait 経由のテストを落とす)",
             cand.len()
         );
         print_wide(&sym_t, &wide);
@@ -877,6 +880,44 @@ pub(crate) fn run_path(db_path: &str, from: &str, to: &str) {
         println!("  {}{}\t{}:{}", if i == 0 { "" } else { "→ " }, sym_qual(&sym_t, e), path, num(er.get("line")));
     }
     println!("# {} hops (確定 edge のみ・最短)", chain.len() - 1);
+    // 終点の名前が同名の定義を複数持つ (`park`) と、最短経路は最初の 1 つで止まる。実際にはそこから同名の
+    // 定義へ委譲が続くこと (`Context::park` → `Driver::park` → `TimeDriver::park` → …) が多いので、終点から
+    // 確定 edge で届く同名の定義を木で続けて出す (enum で振り分ける先は枝分かれ)。
+    if tgts.len() > 1 {
+        let mut seen: HashSet<EntityId> = chain.iter().copied().collect();
+        let mut rows: Vec<(usize, EntityId)> = Vec::new();
+        same_name_tree(&call_t, &tgts, t, 1, &mut seen, &mut rows);
+        if !rows.is_empty() {
+            for (d, e) in rows.iter().take(PATH_TAIL_MAX) {
+                let er = sym_t.entity(*e);
+                let path = paths.get(&ref_of(er.get("file"))).map(String::as_str).unwrap_or("?");
+                println!("  {}→ {}\t{}:{}", "  ".repeat(*d), sym_qual(&sym_t, *e), path, num(er.get("line")));
+            }
+            let more = rows.len().saturating_sub(PATH_TAIL_MAX);
+            println!(
+                "# 続き: 終点から同名 `{to}` の定義へ {} 個委譲が続く (確定 edge、字下げ = 段、同じ字下げの並び = 振り分け先){}",
+                rows.len(),
+                if more > 0 { format!("。+{more} 省略") } else { String::new() }
+            );
+        }
+    }
+}
+
+/// `path` の続きに出す同名の委譲の上限 (枝分かれが広い名前で出力を埋めない)。
+pub(crate) const PATH_TAIL_MAX: usize = 32;
+
+/// `s` が確定 edge で呼ぶ `tgts` (同名の定義) を深さ優先で積む (行きがけ順 = そのまま木の表示順)。
+fn same_name_tree(call_t: &Table, tgts: &HashSet<EntityId>, s: EntityId, depth: usize, seen: &mut HashSet<EntityId>, out: &mut Vec<(usize, EntityId)>) {
+    let mut next: Vec<EntityId> = direct_callees(call_t, s).into_iter().filter(|c| tgts.contains(c)).collect();
+    next.sort();
+    next.dedup();
+    for c in next {
+        if out.len() >= PATH_TAIL_MAX * 2 || !seen.insert(c) {
+            continue;
+        }
+        out.push((depth, c));
+        same_name_tree(call_t, tgts, c, depth + 1, seen, out);
+    }
 }
 
 /// sym eid → "Container::name" (経路の compact ラベル)。

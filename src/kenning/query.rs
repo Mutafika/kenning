@@ -120,8 +120,14 @@ pub(crate) fn print_syms(sym_t: &Table, paths: &HashMap<EntityId, String>, eids:
         println!("{line}");
     }
     if rows.len() > limit {
-        println!("… (+{} 件省略、--limit {} で全部)", rows.len() - limit, rows.len());
+        println!("{}", omitted(rows.len(), limit));
     }
+}
+
+/// 表示を `limit` で切った時の 1 行。**そのまま打てる件数**を出す (「--limit で全部」だけだと agent が切れた
+/// 一覧をそのまま答えにする — 実 agent の A/B で Haiku が 84 件中 50 件で答えた)。
+pub(crate) fn omitted(total: usize, limit: usize) -> String {
+    format!("… (+{} 件省略 — 全 {total} 件は `--limit {total}` か `--limit 0`)", total.saturating_sub(limit))
 }
 
 /// `--db <path>` / `--limit <n>` を抜き取り、残りを位置引数として返す。
@@ -140,7 +146,8 @@ pub(crate) fn parse_opts(args: &[String]) -> Opts {
     while i < args.len() {
         match args[i].as_str() {
             "--db" => { i += 1; if let Some(v) = args.get(i) { db = Some(v.clone()); } }
-            "--limit" => { i += 1; if let Some(v) = args.get(i) { limit = v.parse().unwrap_or(50); } }
+            // `--limit 0` = 上限なし (慣習。0 件表示にすると「全部出す」つもりの指定が黙って空になる)
+            "--limit" => { i += 1; if let Some(v) = args.get(i) { limit = match v.parse() { Ok(0) => usize::MAX, Ok(n) => n, Err(_) => 50 }; } }
             // `-x` を黙って位置引数 (= 検索語 / 名前) にすると、typo した flag が「効いたように見えて
             // 効いていない」結果を返す (search は未知 facet を警告するのにここだけ素通りだった)。
             other if other.starts_with('-') && other.len() > 1 && !other[1..].starts_with(|c: char| c.is_ascii_digit()) => {
@@ -680,7 +687,7 @@ pub(crate) fn print_file_hits(file_t: &Table, paths: &HashMap<EntityId, String>,
         println!("{p}\t{} loc", num(file_t.entity(*e).get("loc")));
     }
     if fhits.len() > limit {
-        println!("… (+{} 件省略、--limit で全部)", fhits.len() - limit);
+        println!("{}", omitted(fhits.len(), limit));
     }
 }
 
@@ -933,7 +940,7 @@ pub(crate) fn run_callers(db_path: &str, name: &str, narrow: &Narrow, limit: usi
             println!("{}", append_src(format!("    {p}:{ln}\tin {cq}"), src.line(p, *ln)));
         }
         if rows.len() > limit {
-            println!("    … (+{} 件省略)", rows.len() - limit);
+            println!("    {}", omitted(rows.len(), limit));
         }
     }
 
@@ -961,7 +968,7 @@ pub(crate) fn run_callers(db_path: &str, name: &str, narrow: &Narrow, limit: usi
             println!("{}", append_src(base, src.line(p, *ln)));
         }
         if cand.len() > limit {
-            println!("    … (+{} 件省略、--limit で全部)", cand.len() - limit);
+            println!("    {}", omitted(cand.len(), limit));
         }
     }
     // 別の同名 sym に確定した分も、行き先の定義ごとの件数を出す。件数だけだと「本当に全部か」を
@@ -1127,7 +1134,7 @@ pub(crate) fn run_callees(db_path: &str, name: &str, container: Option<&str>, li
             println!("    {p}:{ln}\t→ {}  (×{n})", sym_qual(&sym_t, *t));
         }
         if rows.len() > limit {
-            println!("    … (+{} 件省略)", rows.len() - limit);
+            println!("    {}", omitted(rows.len(), limit));
         }
         if !external.is_empty() {
             let mut ext: Vec<(&String, &usize)> = external.iter().collect();
@@ -1173,7 +1180,7 @@ pub(crate) fn run_impls(db_path: &str, name: &str, limit: usize) {
             println!("  {p}:{ln}\t{n}");
         }
         if rows.len() > limit {
-            println!("  … (+{} 件省略、--limit で全部)", rows.len() - limit);
+            println!("  {}", omitted(rows.len(), limit));
         }
     };
     let as_trait = impl_t.where_eq("trait_name", name).find().unwrap();
@@ -1523,7 +1530,7 @@ pub(crate) fn run_outline(db_path: &str, path_arg: &str, limit: usize) {
             println!("{path}:{l}\t{c}");
         }
         if containers.len() > limit {
-            println!("… (+{} 件省略、--limit で全部)", containers.len() - limit);
+            println!("{}", omitted(containers.len(), limit));
         }
         return;
     }
@@ -1575,7 +1582,7 @@ pub(crate) fn outline_dir(file_t: &Table, sym_t: &Table, paths: &HashMap<EntityI
         }
     }
     if files.len() > limit {
-        println!("… (+{} 件省略、--limit で全部)", files.len() - limit);
+        println!("{}", omitted(files.len(), limit));
     }
 }
 

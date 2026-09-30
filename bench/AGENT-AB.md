@@ -141,6 +141,29 @@ rust-analyzer との突き合わせは 4 repo とも誤確定 0 のまま。比�
   正解の 8 段は driver の enum を `match` で振り分ける先 (`Driver::park` → time / io driver) まで続き、そこは
   静的な呼び出しグラフの外。Haiku はここで Read / grep を 50 turn 往復する。
 
+### 7 回目 — パターン束縛の型 / `path` の同名委譲 / 切れた一覧の案内 (D、Haiku / Opus、INDEX_VER 29)
+
+6 回目で「静的な呼び出しグラフの外」と書いた block-on-park の残りは誤りだった — `match self { E::V(x) => x.park() }`
+の x の型は variant の定義に書いてある。(a) enum variant / tuple struct の field 型を field 表に載せ、パターン
+`E::V(x)` / `E::V { f }` / `Self::V(x)` / `T(x)` と `self.0` の受け手をたどる (`use E::*` の後の `V(x)` は同名の
+tuple struct と取り違え得るので確定しない)。syn 層の typed 確定: tokio +39 / ripgrep +32 / enchudb +116、RA との
+突き合わせは 4 repo とも誤確定 0。(b) `path X park` が最初の `park` で止まる時、終点から同名の定義へ続く委譲
+(enum の振り分け先を含む) を木で出す。(c) `--limit` で切れた一覧は「全 N 件は `--limit N` か `--limit 0`」と打てる
+形で出し、`--limit 0` = 上限なし。
+
+| 課題 | Haiku 6 回目 → 7 回目 | Opus 6 回目 → 7 回目 |
+|---|---|---|
+| tokio-block-on-park | $0.32 / 51 turn → $0.30 / 46 turn。答えは 3 run とも io driver の `turn` まで | $0.17 / 7 → $0.15 / 5。3 run とも `io::Driver::turn` まで |
+| tokio-sleep-reset-tests | $0.05 / 4 / 100% → (b 前) 74% → (c 後) **$0.05 / 3 / 100%** | $0.22 / 8 / 100% → $0.26 / 8 / 100% |
+| 他の 4 課題 | 同じ ($0.01〜0.03 / 2 turn / grep 0) | 同じ (正答 100%) |
+
+- **テスト特定が 74% に戻ったのは kenning の出力の切れ方。** 既定の `--limit 50` で 84 件中 50 件が表示され、
+  Haiku はそれをそのまま答えにした (「--limit で全部」の案内だけでは件数が分からない)。(c) の後は 3 run とも 100%。
+- **block-on-park で Haiku がまだ Read を 20 回するのは、問いが実行時の枝を聞いているから。** `path Runtime::block_on
+  Driver::turn` は 11 段を 1 回で出すが、最短は `park_yield` 経由 — 「future が ready でない時」の `park` の枝かは
+  本文を読んで決めるしかない。kenning の穴ではない。
+- Opus の grep 系は 6 回目と同じ (16〜17 回、癖)。
+
 ## 読み方 (正直な所)
 
 - **正答は差が無い。** grep だけの Opus も 1,140 件の同名 `spawn` から 25 件を全部当てる。kenning の価値は

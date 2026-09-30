@@ -42,7 +42,8 @@ kenning impact  <name> [container] [path:S] [--confirmed-only]  # 変えると�
                                     #   (map(f)、名前が一意な時) と候補経由 (名前一致どまりの edge 1 本) も出す。
                                     #   確定 edge だけなら --confirmed-only
 kenning tests   <name> [container] [path:S]  # これに届くテスト = impact ∩ is_test (変更後に何を回すか。[d]=確定 / [c1]=候補経由)
-kenning path    <from> <to>         # from→to の呼び出し経路
+kenning path    <from> <to>         # from→to の呼び出し経路 (最短)。to が同名複数 (`park`) なら、終点から同名の定義へ
+                                    #   続く委譲 (enum の振り分け先を含む) を木で続けて出す
 kenning search  kind:method vis:pub container:Engine calls:unwrap path:engine.rs  # faceted AND
 kenning search  reachable:0         # **消せる候補はこれ**: live root (pub / #[test] / trait 実装 / main /
                                     #   item 直下マクロ) から到達しない定義。鎖や相互再帰で繋がった dead な塊も

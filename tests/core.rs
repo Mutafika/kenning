@@ -2228,4 +2228,75 @@ fn direct() { inner(); }
     // callers と同じ絞り込み (path: / crate:) が効く。同名の自由関数を tests / impact で選べないと grep に戻る。
     assert!(query(&["tests", "inner", "path:src/other.rs"], &db).contains("[d1]"), "tests が path: で絞れない");
     assert!(query(&["impact", "inner", "path:nope.rs"], &db).contains("path~nope.rs"), "impact の絞り込み注記が無い");
+    // 切れた一覧は「そのまま打てる件数」を出す。`--limit 0` = 上限なし (0 件ではない)。
+    let cut = query(&["tests", "inner", "--limit", "1"], &db);
+    assert!(cut.contains("`--limit 0`") && cut.contains("切れている"), "切れた時の案内が無い:\n{cut}");
+    assert_eq!(query(&["tests", "inner", "--limit", "0"], &db).lines().filter(|l| l.starts_with("  [")).count(), 2, "--limit 0 で全部出るはず");
+}
+
+/// `match` / `if let` のパターンで束縛した変数の型は、enum の variant / tuple struct の定義に書いてある
+/// (`match self { E::V(x) => x.f() }`)。enum で振り分ける呼び出しを確定させる。`use E::*` の後の `V(x)` は
+/// 同名の tuple struct と取り違え得るので確定しない。
+#[test]
+fn pattern_bindings_take_the_variant_field_type() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"pub struct Io;
+impl Io { pub fn park(&self) {} }
+pub struct Th;
+impl Th { pub fn park(&self) {} }
+pub enum Stack { On(Io), Off { th: Th } }
+impl Stack {
+    pub fn park(&self) {
+        match self {
+            Stack::On(v) => v.park(),
+            Self::Off { th } => th.park(),
+        }
+    }
+}
+pub struct Wrap(pub Io);
+impl Wrap { pub fn go(&self) { self.0.park(); } }
+pub struct Pair(pub Io);
+pub fn by_tuple(w: Pair) { let Pair(inner) = w; inner.park(); }
+pub enum Other { Wrap(Th) }
+pub fn glob(o: Other) { use Other::*; match o { Wrap(t) => t.park() } }
+"#,
+    );
+    let db = d.join("k.db");
+    index(&d, &db);
+    let confirmed = |args: &[&str]| query(args, &db).split("候補").next().unwrap_or("").to_string();
+    let io = confirmed(&["callers", "park", "Io"]);
+    assert!(io.contains("in Stack::park\t"), "E::V(x) の x を variant の field 型で確定するはず:\n{io}");
+    assert!(io.contains("in Wrap::go\t"), "self.0 を tuple struct の field 型で確定するはず:\n{io}");
+    assert!(io.contains("in by_tuple\t"), "let T(x) = .. の x を確定するはず:\n{io}");
+    assert!(!io.contains("in glob\t"), "variant の Wrap(t) を tuple struct Wrap の field に誤確定:\n{io}");
+    assert!(confirmed(&["callers", "park", "Th"]).contains("in Stack::park\t"), "Self::V {{ f }} の f を確定するはず");
+}
+
+/// `path <from> <name>` の name が同名の定義を複数持つと、最短経路は最初の 1 つで止まる。そこから確定 edge で
+/// 同名の定義へ委譲が続く分 (`Context::park` → `Driver::park` → enum の振り分け先) を木で続けて出す。
+#[test]
+fn path_continues_through_same_named_delegation() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"pub struct Leaf;
+impl Leaf { pub fn park(&self) {} }
+pub struct Other;
+impl Other { pub fn park(&self) {} }
+pub enum Mid { A(Leaf), B(Other) }
+impl Mid { pub fn park(&self) { match self { Mid::A(l) => l.park(), Mid::B(o) => o.park() } } }
+pub struct Top { m: Mid }
+impl Top { pub fn park(&self) { self.m.park(); } }
+pub fn entry(t: &Top) { t.park(); }
+"#,
+    );
+    let db = d.join("k.db");
+    index(&d, &db);
+    let out = query(&["path", "entry", "park"], &db);
+    let (head, tail) = out.split_once("hops").unwrap_or((&out, ""));
+    assert!(head.contains("Top::park"), "最短経路は最初の park まで:\n{out}");
+    assert!(tail.contains("Mid::park") && tail.contains("Leaf::park") && tail.contains("Other::park"), "同名の委譲の続きが無い:\n{out}");
+    assert!(tail.contains("続き"), "続きの件数行が無い:\n{out}");
 }

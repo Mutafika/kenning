@@ -94,7 +94,7 @@ pub(crate) struct Recv {
     /// 型の出どころ (path の先頭 / `use` の先頭)。repo の外 (`std` / `walkdir`) なら同名の自前の型と
     /// 結び付けない (`walkdir::DirEntry` を自前の `DirEntry` に取り違えた実例)。空 = 手掛かり無し (ローカル)。
     pub(crate) root: String,
-    /// 起点からの手順 (空白区切り): `f:<field>` / `m:<method>` / `?`。`self.cfg.searcher().run()` の受け手は
+    /// 起点からの手順 (空白区切り): `f:<field>` / `p:<field>` (パターン `T(x)` 由来) / `m:<method>` / `?`。`self.cfg.searcher().run()` の受け手は
     /// 起点 Self + `f:cfg m:searcher`。解決時に 1 段ずつ型をたどる (1 段でも絞れなければ推定しない)。
     pub(crate) chain: String,
 }
@@ -141,6 +141,17 @@ pub(crate) fn type_root_of(path: &syn::Path, imp: ImportLookup) -> String {
     match first.as_str() {
         "crate" | "self" | "super" | "Self" => first,
         _ => imp(&first).map(|i| i.0).unwrap_or(first),
+    }
+}
+
+/// struct / enum variant の field の型を field 表に積む。名前付きは field 名、tuple は番号 (`0` / `1`)。
+/// `prefix` = enum の variant なら `"<Variant>."`、struct なら空。型引数の field は具体型ではないので除く。
+fn push_fields(out: &mut FileFacts, owner: &str, prefix: &str, fields: &syn::Fields, imp: ImportLookup, generics: &HashSet<String>) {
+    for (i, f) in fields.iter().enumerate() {
+        let name = f.ident.as_ref().map(|id| id.to_string()).unwrap_or_else(|| i.to_string());
+        if let Some(t) = ty_ref(&f.ty, imp, generics) {
+            out.fields.push(RawField { strukt: owner.to_string(), name: format!("{prefix}{name}"), ty: t });
+        }
     }
 }
 
@@ -313,6 +324,39 @@ impl CallCollector {
         (qualifier, root)
     }
 
+    /// パターンの path (`E::V` / `Self::V` / `T` / `m::T`) と field 名から、束縛 `p` の型の手掛かりを付ける。
+    /// 末尾の手前が型 (大文字始まり / Self) なら enum の variant、そうでなければ struct そのもの。
+    fn bind_pat_field(&mut self, path: &syn::Path, p: &syn::Pat, field: &str) {
+        let syn::Pat::Ident(pi) = p else { return };
+        let segs = &path.segments;
+        let (Some(last), true) = (segs.last(), pi.subpat.is_none()) else { return };
+        let imp = self.imp();
+        let r = match segs.len() {
+            n if n >= 2 && segs[n - 2].ident == "Self" && n == 2 => {
+                Recv { ty: "Self".into(), root: self.self_root.clone(), chain: format!("f:{}.{field}", last.ident), ..Default::default() }
+            }
+            n if n >= 2 && segs[n - 2].ident.to_string().starts_with(|c: char| c.is_ascii_uppercase()) => {
+                let e = segs[n - 2].ident.to_string();
+                // `E::V` の出どころは E の `use` (先頭 seg を crate 名として読まない)。`m::E::V` は先頭 seg から
+                let (ty, root) = if n == 2 {
+                    (self.unalias(&e), imp(&e).map(|i| i.0).unwrap_or_default())
+                } else {
+                    (e, type_root_of(path, &imp))
+                };
+                Recv { ty, root, chain: format!("f:{}.{field}", last.ident), ..Default::default() }
+            }
+            _ => {
+                let t = last.ident.to_string();
+                if !t.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    return;
+                }
+                // `p:` = パターン由来の field (解決時に同名の variant があれば諦める。`use E::*` の後の `V(x)`)
+                Recv { ty: unalias_of(path, t, &imp), root: type_root_of(path, &imp), chain: format!("p:{field}"), ..Default::default() }
+            }
+        };
+        drop(imp);
+        self.bind(pi.ident.to_string(), Some(r));
+    }
     /// path (`T` / `a::T` / `a::T::f` の型部分まで) の出どころ。複数 seg は先頭 seg を `use` で引き直す
     /// (`use std::fs;` の後の `fs::DirEntry` は std)。単独の名前は `use` にあればその先頭、無ければ空 (ローカル)。
     /// 末尾 seg (関数名) は見ない: `path` が `T::f` なら T の出どころ。
@@ -408,7 +452,7 @@ impl CallCollector {
             }
             syn::Expr::Field(f) => match &f.member {
                 syn::Member::Named(id) => step(self.expr_recv(&f.base)?, format!("f:{id}")),
-                syn::Member::Unnamed(_) => None,
+                syn::Member::Unnamed(i) => step(self.expr_recv(&f.base)?, format!("f:{}", i.index)),
             },
             syn::Expr::MethodCall(m) => {
                 if self.self_wrapped && matches!(&*m.receiver, syn::Expr::Path(p) if p.path.is_ident("self")) {
@@ -549,6 +593,32 @@ impl<'ast> Visit<'ast> for CallCollector {
         self.locals.insert(node.ident.to_string()); // let / 引数 / for / match / closure の束縛
         self.bind(node.ident.to_string(), None); // 型は不明として外の同名を隠す (型付きは呼び側で上書き)
         visit::visit_pat_ident(self, node);
+    }
+    /// `E::V(x)` / `Self::V(x)` / `T(x)` の x に、定義に書いてある field の型を手掛かりとして付ける
+    /// (既定の巡回で「型不明」に束縛した後で上書き)。`..` より後ろは番号がずれるので見ない。
+    fn visit_pat_tuple_struct(&mut self, node: &'ast syn::PatTupleStruct) {
+        visit::visit_pat_tuple_struct(self, node);
+        if node.qself.is_some() {
+            return;
+        }
+        for (i, p) in node.elems.iter().enumerate() {
+            if matches!(p, syn::Pat::Rest(_)) {
+                break;
+            }
+            self.bind_pat_field(&node.path, p, &i.to_string());
+        }
+    }
+    /// `E::V { f, g: y }` / `T { f }` — 名前付き field の束縛。
+    fn visit_pat_struct(&mut self, node: &'ast syn::PatStruct) {
+        visit::visit_pat_struct(self, node);
+        if node.qself.is_some() {
+            return;
+        }
+        for fp in &node.fields {
+            if let syn::Member::Named(id) = &fp.member {
+                self.bind_pat_field(&node.path, &fp.pat, &id.to_string());
+            }
+        }
     }
     /// 関数の中の `use`。ブロック境界は見ない (関数全体に効かせる = 近似、出どころの判定にだけ使う)。
     fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
@@ -1204,19 +1274,22 @@ pub(crate) fn walk_item(it: &syn::Item, ctx: &mut Ctx, out: &mut FileFacts) {
             // 名前付き field の型 (struct の型引数は具体型ではないので除く)。
             let generics: HashSet<String> = s.generics.type_params().map(|t| t.ident.to_string()).collect();
             let imp = |n: &str| ctx.imports.get(n).cloned();
-            if let syn::Fields::Named(named) = &s.fields {
-                for f in &named.named {
-                    if let (Some(id), Some(t)) = (&f.ident, ty_ref(&f.ty, &imp, &generics)) {
-                        out.fields.push(RawField { strukt: s.ident.to_string(), name: id.to_string(), ty: t });
-                    }
-                }
+            push_fields(out, &s.ident.to_string(), "", &s.fields, &imp, &generics);
+        }
+        syn::Item::Enum(e) => {
+            record_symbol(
+                ctx, out, &e.ident.to_string(), K_ENUM,
+                classify_vis(&e.vis), false, ctx.in_test, line_of(e.ident.span()), col_of(e.ident.span()), end_line_of(e), None, None,
+                &e.attrs,
+            );
+            // variant の field は `<Variant>.<field|番号>` として enum の field に載せる (`.` は field 名に使えないので
+            // 本物の field と混ざらない)。`match self { E::V(x) => x.f() }` の x の型をたどる材料。
+            let generics: HashSet<String> = e.generics.type_params().map(|t| t.ident.to_string()).collect();
+            let imp = |n: &str| ctx.imports.get(n).cloned();
+            for v in &e.variants {
+                push_fields(out, &e.ident.to_string(), &format!("{}.", v.ident), &v.fields, &imp, &generics);
             }
         }
-        syn::Item::Enum(e) => record_symbol(
-            ctx, out, &e.ident.to_string(), K_ENUM,
-            classify_vis(&e.vis), false, ctx.in_test, line_of(e.ident.span()), col_of(e.ident.span()), end_line_of(e), None, None,
-            &e.attrs,
-        ),
         syn::Item::Const(c) => record_symbol(
             ctx, out, &c.ident.to_string(), K_CONST,
             classify_vis(&c.vis), false, ctx.in_test, line_of(c.ident.span()), col_of(c.ident.span()), end_line_of(c), None, None,
@@ -1392,6 +1465,8 @@ pub(crate) struct Resolver<'a> {
     cond_region: HashMap<EntityId, usize>,
     /// cfg 付きの `use` で repo の外から持ってくる名前 (条件付きの自前の定義と入れ替わり得る)。
     cfg_ext_names: HashSet<String>,
+    /// enum の variant の名前。`use E::*` の後の `V(x)` は variant なので、同名の tuple struct の field に取り違えない。
+    variants: HashSet<String>,
 }
 
 /// `use` せずに使える prelude の型。出どころが空 (= use していない) のこれらは std の型 (repo に同名の
@@ -1471,7 +1546,8 @@ impl<'a> Resolver<'a> {
                 }
             }
         }
-        Resolver { defs, local_roots, fields, files, traits, for_all_traits, types, gated_files, cond_region, cfg_ext_names }
+        let variants = fields.keys().filter_map(|(_, f)| f.split_once('.').map(|(v, _)| v.to_string())).collect();
+        Resolver { defs, local_roots, fields, files, traits, for_all_traits, types, gated_files, cond_region, cfg_ext_names, variants }
     }
     /// 呼び出し元 (file) から定義 `d` を確定先にしてよいか。cfg 付きの定義 / 条件付き module の中の定義は、
     /// 同じ file / 同じ条件付き module の中からの呼び出しだけ (外からは cfg 付きの re-export 越しに別の実体に
@@ -1867,9 +1943,12 @@ fn recv_type_of(cs: &CallSite, rz: &Resolver) -> Option<(String, bool)> {
             }
             last_ret = None;
             wrapped = true;
-        } else if let Some(f) = s.strip_prefix("f:") {
+        } else if let Some((pat, f)) = s.strip_prefix("f:").map(|f| (false, f)).or_else(|| s.strip_prefix("p:").map(|f| (true, f))) {
             wrapped = false;
             last_ret = None;
+            if pat && rz.variants.contains(&t) {
+                return None; // パターン `V(x)` の V は同名の enum variant かもしれない (`use E::*`)
+            }
             let tys = rz.fields.get(&(t.clone(), f.to_string()))?;
             let [ty] = tys.as_slice() else { return None }; // 同名 struct が複数 → 絞れない
             if ty.name.is_empty() || !rz.is_local_ty(&ty.root, &ty.name) {
