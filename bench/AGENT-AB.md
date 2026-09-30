@@ -115,6 +115,32 @@ Haiku は kenning の出力を 1 回見てそのまま答えるようになっ�
 **kenning の答えの穴がそのまま正答率になる**: 残る穴は trait 経由 (`Stream::poll_next`) と、generic /
 `tokio::pin!` 越しの受け手。
 
+### 6 回目 — `tests` / `impact` に候補経由の層、`use .. as` の別名 (D、Haiku / Opus、INDEX_VER 28)
+
+5 回目の残り 2 つを潰した。(a) `tests` / `impact` は確定 edge だけを辿っていた — `callers` が ⚠候補に出している
+呼び出し (受け手の型不明 / trait 経由) を 1 本まで通って届く物を `[c1]` として同じ出力に並べる (同名定義が多く候補が
+64 を超える名前は辿らず `#` 行に名前を出す、`Drop::drop` は名前で呼べないので除外)。(b) `use a::f as g` の `g()` が
+`callers f` の名前一致から丸ごと漏れていた (別名 fn / `{self as aa}` / 別名の型の関連関数) — 元の名前で持つ。
+rust-analyzer との突き合わせは 4 repo とも誤確定 0 のまま。比較の相手は 5 回目 (同じ課題・同じ 3 run、前日)。
+
+| 課題 | Haiku 前 → 後 (費用 / turn / recall) | Opus 前 → 後 (費用 / turn / grep 系の回数) |
+|---|---|---|
+| tokio-sleep-reset-tests | $0.02 / 2 / **74%** → $0.05 / 4 / **100%** (precision 58 → 42%) | $0.20 / 8 / 2.3 → $0.22 / 8 / 3.0 |
+| tokio-joinset-spawn | $0.03 / 2 / 100% → $0.03 / 2 / 100% | $0.19 / 8 / 4.7 → $0.19 / 5 / 3.3 |
+| tokio-add-permits | $0.01 / 2 / 100% → 同じ | $0.04 / 4 / 1.7 → $0.05 / 4 / 2.0 |
+| enchudb-oplog-open | $0.03 / 2 / 96% → 同じ | $0.07 / 4 / 1.0 → $0.09 / 5 / 0.7 |
+| enchudb-leafstore-insert | $0.03 / 2 / 100% → $0.04 / 2 / 100% | $0.11 / 4 / 1.7 → $0.11 / 6 / 3.3 |
+| tokio-block-on-park | $0.29 / 44 → $0.32 / 51 (grep 系 6 → 16) | $0.18 / 6 / 3.3 → $0.17 / 7 / 4.0 |
+
+- **Haiku のテスト特定が 74% → 100%。** kenning 1 回の出力 ([d] 45 + [c1] 39) をそのまま答えて届く。precision は
+  静的に届き得る上位集合を全部挙げる分だけ下がる (回すテストとしては安全側)。Haiku は block-on-park 以外で grep 0 回。
+- **Opus の grep 系は減らなかった** (課題あたり合計 14.7 → 16.3 回、3 run の揺れの内)。中身を読むと kenning の穴では
+  なく癖: `sed -n A,Bp` で行を切り出す (block-on-park の大半。`read <path>:A-B` がある)、`.md` を含む語の検索
+  (`text` がある)、`callers` の答えの `grep add_permits(` での数え直し。機能を足しても 0 にはならない種類。
+- **block-on-park は別の穴。** `path Runtime::block_on park` は最初の `park` (`Context::park`、4 段) で止まる。
+  正解の 8 段は driver の enum を `match` で振り分ける先 (`Driver::park` → time / io driver) まで続き、そこは
+  静的な呼び出しグラフの外。Haiku はここで Read / grep を 50 turn 往復する。
+
 ## 読み方 (正直な所)
 
 - **正答は差が無い。** grep だけの Opus も 1,140 件の同名 `spawn` から 25 件を全部当てる。kenning の価値は

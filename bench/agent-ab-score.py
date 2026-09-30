@@ -56,6 +56,10 @@ def truth_of(task):
     return {l.rstrip("\n") for l in open(f) if l.strip()}
 
 
+# kenning の代わりに打たれた検索・行切り出し (Read は kenning の後でも普通に使うので数えない)。
+GREP_LIKE = ("Grep", "rg", "grep", "sed", "awk")
+
+
 def load(path):
     """stream-json (.jsonl) か json (.json) から (最終 result, 道具の呼び出し Counter)。"""
     tools = Counter()
@@ -114,16 +118,18 @@ def main(d):
             tools=tools))
 
     med = lambda xs: statistics.median(xs) if xs else float("nan")
-    print("| task | cond | n | input tok | output tok | cost $ | turns | sec | recall | precision | 道具 (run 平均) |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|")
+    print("| task | cond | n | input tok | output tok | cost $ | turns | sec | recall | precision | grep 系 (run 平均) | 道具 (run 平均) |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     tot = defaultdict(lambda: defaultdict(float))
     for (task, cond), ms in sorted(rows.items()):
         g = lambda k: med([m[k] for m in ms if m[k] is not None])
         rp = lambda k: f"{g(k):.0%}" if any(m[k] is not None for m in ms) else "-"
         tc = sum((m["tools"] for m in ms), Counter())
         tl = " ".join(f"{k} {v / len(ms):.1f}" for k, v in tc.most_common(4)) or "-"
+        gr = sum(tc[k] for k in GREP_LIKE) / len(ms)
         print(f"| {task} | {cond} | {len(ms)} | {g('tin'):,.0f} | {g('tout'):,.0f} | {g('cost'):.2f} | "
-              f"{g('turns'):.0f} | {g('sec'):.0f} | {rp('rec')} | {rp('prec')} | {tl} |")
+              f"{g('turns'):.0f} | {g('sec'):.0f} | {rp('rec')} | {rp('prec')} | {gr:.1f} | {tl} |")
+        tot[cond]["grep"] += gr
         for k in ("cost", "tin", "tout", "turns", "sec"):
             tot[cond][k] += g(k)
     if "B" in tot:
@@ -136,6 +142,8 @@ def main(d):
                   f"(B/{c} {b['cost'] / a['cost']:.2f}x)、input token B/{c} {b['tin'] / a['tin']:.2f}x、"
                   f"output token B/{c} {b['tout'] / a['tout']:.2f}x、turn B/{c} {b['turns'] / a['turns']:.2f}x、"
                   f"時間 B/{c} {b['sec'] / a['sec']:.2f}x")
+    for c in sorted(tot):
+        print(f"\n{c}: grep 系の呼び出し 課題あたり合計 {tot[c]['grep']:.1f} 回 (run 平均の和)")
 
 
 if __name__ == "__main__":

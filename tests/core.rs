@@ -2154,3 +2154,78 @@ impl Cell { pub fn new(x: u8) -> Self { let _ = x; Cell } }
     assert!(!confirmed(&["callers", "consume", "Rdr"]).contains("in ext\t"), "拡張 trait の consume があるのに実装に確定");
     assert!(!confirmed(&["callers", "new", "Cell"]).contains("in m::mk\t") && !confirmed(&["callers", "new", "Cell"]).contains("in mk\t"), "マクロの中で use した std の Cell を自前に確定");
 }
+
+/// `use .. as 別名` で呼んだ関数・型・module は元の名前の call として数える。別名のままだと `callers target`
+/// の名前一致から丸ごと漏れ、「呼び出し箇所は全部この 3 つのどれか」が嘘になる (agent が grep に戻る理由の 2 番目)。
+#[test]
+fn renamed_imports_are_counted_under_the_original_name() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"pub mod a {
+    pub fn helper() {}
+    pub struct Store;
+    impl Store { pub fn open() -> Self { Store } }
+}
+use self::a::helper as hlp;
+use self::a::Store as S2;
+use self::a::{self as aa};
+pub fn by_fn_alias() { hlp(); }
+pub fn by_type_alias() { let _ = S2::open(); }
+pub fn by_mod_alias() { aa::helper(); }
+pub fn local_shadow() { let hlp = || (); hlp(); }
+"#,
+    );
+    let db = d.join("k.db");
+    index(&d, &db);
+    let h = query(&["callers", "helper"], &db);
+    assert!(h.contains("in by_fn_alias") && h.contains("in by_mod_alias"), "別名で呼んだ helper が漏れた:\n{h}");
+    assert!(!h.contains("in local_shadow"), "同名の束縛 (クロージャ) を別名の関数と取り違えた:\n{h}");
+    let o = query(&["callers", "open", "Store"], &db);
+    assert!(o.split("候補").next().unwrap_or("").contains("in by_type_alias"), "別名の型の関連関数は確定するはず:\n{o}");
+}
+
+/// `tests` / `impact` は確定 edge で届かない分を「候補経由」[c1] として同じ出力に並べる。trait 経由
+/// (外部 trait の method を generic に呼ぶ包み) で呼ばれる実装に届くテストを、agent が grep で補わなくていいように。
+/// `Drop::drop` は名前で呼べない (E0040) ので、`drop(x)` を候補にしない。
+#[test]
+fn tests_lists_tests_reached_only_through_candidate_edges() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"pub fn inner() {}
+pub struct Timer;
+impl Iterator for Timer {
+    type Item = u8;
+    fn next(&mut self) -> Option<u8> { inner(); None }
+}
+pub struct Wrap<I>(pub I);
+impl<I: Iterator> Wrap<I> {
+    pub fn step(&mut self) { let _ = self.0.next(); }
+}
+pub struct Guard;
+impl Drop for Guard { fn drop(&mut self) { inner(); } }
+pub struct Other;
+impl Other { pub fn next(&self) {} } // 同名があると名前一意の値参照では辿れない = 候補 edge の出番
+#[test]
+fn through_trait() { let mut w = Wrap(Timer); w.step(); }
+#[test]
+fn only_drops() { let v = vec![1u8]; drop(v); }
+#[test]
+fn direct() { inner(); }
+"#,
+    );
+    let db = d.join("k.db");
+    index(&d, &db);
+    let out = query(&["tests", "inner"], &db);
+    let row = |n: &str| out.lines().find(|l| l.contains(&format!("fn {n} "))).unwrap_or("").to_string();
+    assert!(row("direct").contains("[d1]"), "確定で届くテストは [d]:\n{out}");
+    assert!(row("through_trait").contains("[c1]"), "trait 経由で届くテストは [c1] に出るはず:\n{out}");
+    assert!(row("only_drops").is_empty(), "drop(x) を Drop::drop の呼び出し候補にした:\n{out}");
+    assert!(out.contains("候補経由"), "候補経由の件数行が無い:\n{out}");
+    let imp = query(&["impact", "inner"], &db);
+    assert!(imp.contains("候補経由") && imp.contains("through_trait"), "impact にも候補経由の層が出るはず:\n{imp}");
+    // callers と同じ絞り込み (path: / crate:) が効く。同名の自由関数を tests / impact で選べないと grep に戻る。
+    assert!(query(&["tests", "inner", "path:src/other.rs"], &db).contains("[d1]"), "tests が path: で絞れない");
+    assert!(query(&["impact", "inner", "path:nope.rs"], &db).contains("path~nope.rs"), "impact の絞り込み注記が無い");
+}

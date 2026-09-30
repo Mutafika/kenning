@@ -536,6 +536,102 @@ pub(crate) fn direct_callers(call_t: &Table, s: EntityId) -> Vec<EntityId> {
         .collect()
 }
 
+/// 候補経由で辿る時、候補 edge を何本まで重ねるか。1 本ごとに「名前一致だけ」の推測が 1 回入るので、
+/// 重ねるほど見当違いが混ざる。tokio `tests Sleep::reset` で実行時の正解 35 本は全部 1 本以内
+/// (1 本 = 候補 39 件、2 本 = 491 件でほぼ全部ノイズ)。
+pub(crate) const CAND_HOPS_MAX: u32 = 1;
+/// 1 つの sym の候補 caller がこれを超えたら辿らない (名前を出して `callers` に回す)。同名定義が多い
+/// 名前 (`spawn` 111 / `block_on` 217) は、未確定の呼び出しが全部の同名定義の候補になって結果を埋める。
+/// trait 経由で要る物は小さい (tokio の `Stream::poll_next` 実装 31)。
+pub(crate) const CAND_FANOUT_MAX: usize = 64;
+
+/// s を **呼んでいるかもしれない** caller (確定しなかった edge)。`callers` の ⚠候補と同じ集合 =
+/// 名前一致で callee_sym が無い呼び出し。加えて trait 実装の method は trait 経由で呼ばれるので:
+/// - 外部 trait の実装 (`impl Stream for X` の `poll_next`) → `[external]` に落ちた同名の呼び出しも候補
+/// - repo の trait の実装 → trait の宣言 (`T::f`) に確定した呼び出しも候補 (動的 dispatch の行き先)
+pub(crate) fn cand_callers(call_t: &Table, sym_t: &Table, s: EntityId) -> Vec<EntityId> {
+    let er = sym_t.entity(s);
+    let name = txt(er.get("name"));
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let tr = txt(er.get("impl_trait"));
+    if tr == "Drop" {
+        return Vec::new(); // `x.drop()` は書けない (E0040)。`drop(x)` は std::mem::drop
+    }
+    let mut out: Vec<EntityId> = call_t
+        .where_eq("callee", name.as_str())
+        .find()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|&c| {
+            let ce = call_t.entity(c);
+            !matches!(ce.get("callee_sym"), Some(Value::Ref(_))) && (num(ce.get("res")) != R_EXTERNAL || !tr.is_empty())
+        })
+        .map(|c| ref_of(call_t.entity(c).get("caller")))
+        .collect();
+    if !tr.is_empty() {
+        for d in sym_t.where_eq("name", name.as_str()).find().unwrap_or_default() {
+            let de = sym_t.entity(d);
+            if d != s && txt(de.get("container")) == tr && txt(de.get("impl_trait")).is_empty() {
+                out.extend(direct_callers(call_t, d));
+            }
+        }
+    }
+    out.retain(|&c| c != 0); // caller 未 set (item 直下のマクロ引数など) は辿れない
+    out
+}
+
+/// 確定 edge だけでは届かず、候補 edge を 1〜`CAND_HOPS_MAX` 本通って初めて届く caller。
+/// 0-1 BFS (確定 / 値参照 edge = 0、候補 edge = 1。値参照も辿る = `--confirmed-only` でない時だけ呼ぶ) で候補の本数を最小にした到達。`reached` = 確定側で
+/// 届いた sym (起点含む)。返り値 = ((sym, 通った候補 edge の本数) — 本数が少ないほど確からしい,
+/// 候補が多すぎて辿らなかった (sym, 候補数))。
+pub(crate) fn cand_reach(call_t: &Table, sym_t: &Table, reached: &HashSet<EntityId>) -> CandReach {
+    let mut wide: Vec<(EntityId, usize)> = Vec::new();
+    let mut hops: HashMap<EntityId, u32> = reached.iter().map(|&e| (e, 0)).collect();
+    let mut dq: std::collections::VecDeque<EntityId> = reached.iter().copied().collect();
+    while let Some(s) = dq.pop_front() {
+        let h = hops[&s];
+        let mut free = direct_callers(call_t, s);
+        free.extend(value_ref_callers(call_t, sym_t, s));
+        for c in free {
+            if hops.get(&c).is_none_or(|&x| x > h) {
+                hops.insert(c, h);
+                dq.push_front(c);
+            }
+        }
+        if h >= CAND_HOPS_MAX {
+            continue;
+        }
+        let cc = cand_callers(call_t, sym_t, s);
+        if cc.len() > CAND_FANOUT_MAX {
+            wide.push((s, cc.len()));
+            continue;
+        }
+        for c in cc {
+            if hops.get(&c).is_none_or(|&x| x > h + 1) {
+                hops.insert(c, h + 1);
+                dq.push_back(c);
+            }
+        }
+    }
+    wide.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    (hops.into_iter().filter(|(e, h)| *h > 0 && !reached.contains(e)).collect(), wide)
+}
+
+/// `cand_reach` の返り値: (候補経由で届いた (sym, 本数), 候補が多すぎて辿らなかった (sym, 候補数))。
+pub(crate) type CandReach = (Vec<(EntityId, u32)>, Vec<(EntityId, usize)>);
+
+/// 辿らなかった sym を名前で出す (黙って切ると「候補も全部見た」と誤読される)。
+pub(crate) fn print_wide(sym_t: &Table, wide: &[(EntityId, usize)]) {
+    if wide.is_empty() {
+        return;
+    }
+    let list: Vec<String> = wide.iter().take(5).map(|&(e, n)| format!("{} ({n})", sym_qual(sym_t, e))).collect();
+    let more = if wide.len() > 5 { format!(" 他 {}", wide.len() - 5) } else { String::new() };
+    println!("# 候補 caller が {CAND_FANOUT_MAX} 超で辿っていない: {}{more} — 同名定義が多い名前。要るなら `callers <その修飾名>` の⚠", list.join(", "));
+}
+
 /// s が確定 edge で呼ぶ直接 callee の sym eid 群 (前方)。
 pub(crate) fn direct_callees(call_t: &Table, s: EntityId) -> Vec<EntityId> {
     call_t
@@ -573,22 +669,22 @@ pub fn cmd_impact(args: &[String]) {
     let rest: Vec<String> = args.iter().filter(|a| *a != "--confirmed-only").cloned().collect();
     let o = parse_opts(&rest);
     let Some(name) = o.pos.first() else {
-        eprintln!("usage: kenning impact <name> [container] [--confirmed-only] [--db P] [--limit N]");
+        eprintln!("usage: kenning impact <name> [container] [crate:X] [path:S] [--confirmed-only] [--db P] [--limit N]");
         return;
     };
-    run_impact(&o.db, name, o.pos.get(1).map(String::as_str), o.limit, follow_value);
+    run_impact(&o.db, name, &Narrow::parse(&o.pos[1..]), o.limit, follow_value);
 }
 
-pub(crate) fn run_impact(db_path: &str, name: &str, container: Option<&str>, limit: usize, follow_value: bool) {
+pub(crate) fn run_impact(db_path: &str, name: &str, narrow: &Narrow, limit: usize, follow_value: bool) {
     let Some(db) = open_ro(db_path) else { return };
     let file_t = db.get_table("file").unwrap();
     let sym_t = db.get_table("sym").unwrap();
     let call_t = db.get_table("call").unwrap();
     let paths = file_paths(&file_t);
 
-    let defs = defs_of(&sym_t, name, container);
+    let defs = narrow.defs(&sym_t, &paths, name);
     if defs.is_empty() {
-        println!("# \"{name}\" の定義が index に無い{}。", container.map(|c| format!(" (container={c})")).unwrap_or_default());
+        println!("# \"{name}\" の定義が index に無い{}。", narrow.describe());
         suggest_similar(&sym_t, &paths, name);
         return;
     }
@@ -601,12 +697,30 @@ pub(crate) fn run_impact(db_path: &str, name: &str, container: Option<&str>, lim
         println!("  depth {} ({} sym){}:", i + 1, layer.len(), if i == 0 { " = 直接 callers" } else { "" });
         print_sym_layer(&sym_t, &paths, layer, limit, "    ");
     }
+    let (cand, wide) = if follow_value { cand_only(&call_t, &sym_t, &defs, &by_depth) } else { Default::default() };
+    let cand: Vec<EntityId> = cand.into_iter().map(|(e, _)| e).collect();
+    if !cand.is_empty() {
+        println!("  候補経由 ({} sym = 名前一致どまりの edge を {CAND_HOPS_MAX} 本まで通って届く。要確認):", cand.len());
+        print_sym_layer(&sym_t, &paths, &cand, limit, "    ");
+    }
     let via = match (follow_value, via_value) {
         (false, _) => " (確定 edge のみ = 影響の下界。候補/未解決 edge は未算入 → `callers` で確認)".to_string(),
-        (true, 0) => " (確定 edge のみで到達。名前一致どまりの候補 edge は未算入 → `callers` で確認)".to_string(),
+        (true, 0) => " (確定 edge のみ)".to_string(),
         (true, n) => format!(" (うち {n} sym は値渡し参照 `map(f)` 経由 = 確定 edge ではない。確定だけなら `--confirmed-only`)"),
     };
-    println!("# 推移的 callers: {total} sym{via}");
+    if follow_value {
+        println!("# 推移的 callers: {total} sym{via} + 候補経由 {} sym — 両方で名前一致の呼び出しを {CAND_HOPS_MAX} 段まで辿った (grep で足さなくていい)", cand.len());
+        print_wide(&sym_t, &wide);
+    } else {
+        println!("# 推移的 callers: {total} sym{via}");
+    }
+}
+
+/// 確定側の BFS (`layers`) で届かず、候補 edge を通って初めて届く sym と、その本数。impact / tests 共用。
+pub(crate) fn cand_only(call_t: &Table, sym_t: &Table, defs: &[EntityId], layers: &[Vec<EntityId>]) -> CandReach {
+    let mut reached: HashSet<EntityId> = defs.iter().copied().collect();
+    reached.extend(layers.iter().flatten().copied());
+    cand_reach(call_t, sym_t, &reached)
 }
 
 /// `tests <name> [container]` — この sym を (推移的に) 呼ぶテスト = impact ∩ is_test。
@@ -616,25 +730,25 @@ pub fn cmd_tests(args: &[String]) {
     let rest: Vec<String> = args.iter().filter(|a| *a != "--confirmed-only").cloned().collect();
     let o = parse_opts(&rest);
     let Some(name) = o.pos.first() else {
-        eprintln!("usage: kenning tests <name> [container] [--confirmed-only] [--db P] [--limit N]");
+        eprintln!("usage: kenning tests <name> [container] [crate:X] [path:S] [--confirmed-only] [--db P] [--limit N]");
         return;
     };
-    run_tests(&o.db, name, o.pos.get(1).map(String::as_str), o.limit, follow_value);
+    run_tests(&o.db, name, &Narrow::parse(&o.pos[1..]), o.limit, follow_value);
 }
 
 /// `cargo test -- <filter...>` のヒントに載せる最大テスト数 (多すぎたら cargo test 全部が早い)。
 pub(crate) const TESTS_HINT_MAX: usize = 8;
 
-pub(crate) fn run_tests(db_path: &str, name: &str, container: Option<&str>, limit: usize, follow_value: bool) {
+pub(crate) fn run_tests(db_path: &str, name: &str, narrow: &Narrow, limit: usize, follow_value: bool) {
     let Some(db) = open_ro(db_path) else { return };
     let file_t = db.get_table("file").unwrap();
     let sym_t = db.get_table("sym").unwrap();
     let call_t = db.get_table("call").unwrap();
     let paths = file_paths(&file_t);
 
-    let defs = defs_of(&sym_t, name, container);
+    let defs = narrow.defs(&sym_t, &paths, name);
     if defs.is_empty() {
-        println!("# \"{name}\" の定義が index に無い{}。", container.map(|c| format!(" (container={c})")).unwrap_or_default());
+        println!("# \"{name}\" の定義が index に無い{}。", narrow.describe());
         suggest_similar(&sym_t, &paths, name);
         return;
     }
@@ -651,28 +765,46 @@ pub(crate) fn run_tests(db_path: &str, name: &str, container: Option<&str>, limi
             }
         }
     }
-    if tests.is_empty() {
-        println!("# {name} に届くテストなし ({}。候補 edge の見逃しは `callers {name}` の⚠で確認)", if follow_value { "確定 edge + 値渡し参照" } else { "確定 edge のみ" });
-        return;
-    }
-    tests.sort_by_key(|&(d, e)| {
+    // 候補経由 = 確定では届かず、名前一致どまりの edge を通って届くテスト (trait 経由・受け手の型が
+    // 分からない method 呼び)。確定だけを答えにすると agent がその穴を grep で埋めに行くので、同じ出力に並べる。
+    let (cand, wide) = if follow_value { cand_only(&call_t, &sym_t, &defs, &layers) } else { Default::default() };
+    let mut cand: Vec<(u32, EntityId)> =
+        cand.into_iter().filter(|&(e, _)| num(sym_t.entity(e).get("is_test")) == 1).map(|(e, h)| (h, e)).collect();
+    let by_pos = |&(d, e): &(u32, EntityId)| {
         let er = sym_t.entity(e);
         (d, paths.get(&ref_of(er.get("file"))).cloned().unwrap_or_default(), num(er.get("line")))
-    });
-    for (d, e) in tests.iter().take(limit) {
-        println!("  [d{d}] {}", fmt_sym(&sym_t, &paths, *e));
+    };
+    tests.sort_by_key(by_pos);
+    cand.sort_by_key(by_pos);
+    let rows: Vec<(String, EntityId)> =
+        tests.iter().map(|&(d, e)| (format!("d{d}"), e)).chain(cand.iter().map(|&(h, e)| (format!("c{h}"), e))).collect();
+    for (tag, e) in rows.iter().take(limit) {
+        println!("  [{tag}] {}", fmt_sym(&sym_t, &paths, *e));
     }
-    if tests.len() > limit {
-        println!("  … (+{} 件省略、--limit で全部)", tests.len() - limit);
+    if rows.len() > limit {
+        println!("  … (+{} 件省略、--limit で全部)", rows.len() - limit);
+    }
+    if rows.is_empty() {
+        let how = if follow_value { "確定 edge + 値渡し参照 + 候補 edge" } else { "確定 edge のみ。候補 edge は `--confirmed-only` 無しで" };
+        println!("# {name} に届くテストなし ({how})");
+        print_wide(&sym_t, &wide);
+        return;
     }
     let how = match (follow_value, via_value) {
         (false, _) => "確定 edge のみ = 下界".to_string(),
-        (true, 0) => "確定 edge のみで到達 = 下界".to_string(),
+        (true, 0) => "確定 edge のみ".to_string(),
         (true, n) => format!("経路に値渡し参照 {n} sym を含む。確定だけなら `--confirmed-only`"),
     };
-    println!("# {name} に届くテスト: {} 件 ({how})", tests.len());
+    println!("# {name} に届くテスト: [dN] 確定 {} 件 ({how})", tests.len());
+    if follow_value {
+        println!(
+            "# [cN] 候補経由 {} 件 = 名前一致どまりの edge (trait 経由 / 受け手の型不明) を N 本通って届く。静的に届き得るのは [d]+[c] で全部 — 回すなら両方 (安全側)、絞るなら [c] を読んで判断",
+            cand.len()
+        );
+        print_wide(&sym_t, &wide);
+    }
     // そのまま貼れる実行ヒント (libtest は複数 filter を OR で受ける)。
-    let names: Vec<String> = tests.iter().map(|&(_, e)| txt(sym_t.entity(e).get("name"))).collect::<HashSet<_>>().into_iter().collect();
+    let names: Vec<String> = rows.iter().map(|(_, e)| txt(sym_t.entity(*e).get("name"))).collect::<HashSet<_>>().into_iter().collect();
     if names.len() <= TESTS_HINT_MAX {
         let mut ns = names;
         ns.sort();

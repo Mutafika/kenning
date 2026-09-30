@@ -281,11 +281,31 @@ impl CallCollector {
     fn is_bound(&self, name: &str) -> bool {
         self.scopes.iter().any(|s| s.contains_key(name))
     }
+    /// path の先頭 seg が `use .. as 別名` の別名なら元の名前に戻す (`tgt()` → target、`S2::open` → Store、
+    /// `aa::f` → a)。call.callee は元の名前で持たないと `callers target` の名前一致から丸ごと漏れる。
+    /// この body の束縛 (`let tgt = ..`) は別物なので戻さない。
+    fn unalias(&self, seg: &str) -> String {
+        match self.import(seg) {
+            Some((_, orig)) if !self.is_bound(seg) => orig.clone(),
+            _ => seg.to_string(),
+        }
+    }
+    /// 呼び先の (単純名, 修飾ヒント) を別名を戻して取る。別名が効くのは先頭 seg だけ (`use` で入る名前)。
+    fn callee_of(&self, path: &syn::Path) -> Option<(String, Option<String>)> {
+        let segs = &path.segments;
+        let last = segs.last()?.ident.to_string();
+        let lead = path.leading_colon.is_none();
+        Some(match segs.len() {
+            1 if lead => (self.unalias(&last), None),
+            2 if lead => (last, Some(self.unalias(&segs[0].ident.to_string()))),
+            n => (last, (n >= 2).then(|| segs[n - 2].ident.to_string())),
+        })
+    }
     /// 関数呼び `a::b::f(..)` の (修飾ヒント = 末尾手前 seg (Type / module、単一 seg なら None), 出どころ)。
     /// 修飾なしの f がこの body の束縛なら出どころは LOCAL_BINDING_ROOT (`let f = |..| ..; f()` はクロージャ)。
     fn call_quals(&self, path: &syn::Path) -> (Option<String>, String) {
         let segs = &path.segments;
-        let qualifier = (segs.len() >= 2).then(|| segs[segs.len() - 2].ident.to_string());
+        let qualifier = self.callee_of(path).and_then(|c| c.1);
         let root = match segs.last() {
             Some(last) if segs.len() == 1 && self.is_bound(&last.ident.to_string()) => LOCAL_BINDING_ROOT.to_string(),
             _ => self.root_of(path),
@@ -363,7 +383,7 @@ impl CallCollector {
                     return None;
                 }
                 let segs = &p.path.segments;
-                let f = segs.last()?.ident.to_string();
+                let f = self.callee_of(&p.path)?.0;
                 let (qualifier, root) = self.call_quals(&p.path);
                 match qualifier {
                     // `Box::pin(x)` / `Arc::new(x)` — 包んだ中身の method に自動参照外しで届く。包んだ印を手順に積む
@@ -449,9 +469,9 @@ impl CallCollector {
         if n == "self" || n == "Self" || n == "_" {
             return;
         }
-        let qualifier = (segs.len() >= 2).then(|| segs[segs.len() - 2].ident.to_string());
+        let Some((name, qualifier)) = self.callee_of(&p.path) else { return };
         self.calls.push(RawCall {
-            name: n,
+            name,
             qualifier,
             is_method: false,
             self_recv: false,
@@ -469,10 +489,10 @@ impl<'ast> Visit<'ast> for CallCollector {
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*node.func {
             let segs = &p.path.segments;
-            if let Some(last) = segs.last() {
+            if let (Some(last), Some((name, _))) = (segs.last(), self.callee_of(&p.path)) {
                 let (qualifier, qual_root) = self.call_quals(&p.path);
                 self.calls.push(RawCall {
-                    name: last.ident.to_string(),
+                    name,
                     qualifier,
                     is_method: false,
                     self_recv: false,
@@ -2001,10 +2021,15 @@ pub(crate) fn index_one_file(file_t: &Table, sym_t: &Table, acc: &mut Acc, root:
 /// file 内の `use` (inline mod の中も) から「名前 → 出どころ (先頭 seg)」を作る。glob は拾えない (空 = ローカル扱い)。
 /// `use` の木 1 本を「名前 → (出どころ, 元の名前)」に展開する。
 pub(crate) fn use_tree_imports(t: &syn::UseTree, root: Option<&str>, out: &mut HashMap<String, (String, String)>) {
+    use_tree_imports_in(t, root, None, out)
+}
+
+/// `parent` = 直前の seg (`use a::b::{self as bb}` の self を b に戻すため)。
+fn use_tree_imports_in(t: &syn::UseTree, root: Option<&str>, parent: Option<&str>, out: &mut HashMap<String, (String, String)>) {
     match t {
         syn::UseTree::Path(p) => {
             let r = root.map(str::to_string).unwrap_or_else(|| p.ident.to_string());
-            use_tree_imports(&p.tree, Some(&r), out);
+            use_tree_imports_in(&p.tree, Some(&r), Some(&p.ident.to_string()), out);
         }
         syn::UseTree::Name(n) => {
             let name = n.ident.to_string();
@@ -2013,10 +2038,14 @@ pub(crate) fn use_tree_imports(t: &syn::UseTree, root: Option<&str>, out: &mut H
             }
         }
         syn::UseTree::Rename(r) => {
-            let orig = r.ident.to_string();
+            let mut orig = r.ident.to_string();
+            if orig == "self" {
+                let Some(p) = parent else { return };
+                orig = p.to_string();
+            }
             out.insert(r.rename.to_string(), (root.map(str::to_string).unwrap_or_else(|| orig.clone()), orig));
         }
-        syn::UseTree::Group(g) => g.items.iter().for_each(|i| use_tree_imports(i, root, out)),
+        syn::UseTree::Group(g) => g.items.iter().for_each(|i| use_tree_imports_in(i, root, parent, out)),
         syn::UseTree::Glob(_) => {}
     }
 }

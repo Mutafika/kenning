@@ -38,9 +38,10 @@ kenning edges                       # 全 cross-file call edge の集計 TSV (fr
 kenning refs    <name> [container]  # find-all-refs (要 --scip index、型/読み書きも)
 kenning impls   <trait|type>        # go-to-implementation (trait↔型)
 kenning across  <name>              # 全 repo 横断: 全 repo の定義/利用 + repo 跨ぎ精密参照
-kenning impact  <name> [container] [--confirmed-only]  # 変えると壊れる推移的 callers。既定は値渡し参照
-                                    #   (map(f)、名前が一意な時) も辿る。確定 edge だけなら --confirmed-only
-kenning tests   <name> [container]  # これに届くテスト = impact ∩ is_test (変更後に何を回すか)
+kenning impact  <name> [container] [path:S] [--confirmed-only]  # 変えると壊れる推移的 callers。既定は値渡し参照
+                                    #   (map(f)、名前が一意な時) と候補経由 (名前一致どまりの edge 1 本) も出す。
+                                    #   確定 edge だけなら --confirmed-only
+kenning tests   <name> [container] [path:S]  # これに届くテスト = impact ∩ is_test (変更後に何を回すか。[d]=確定 / [c1]=候補経由)
 kenning path    <from> <to>         # from→to の呼び出し経路
 kenning search  kind:method vis:pub container:Engine calls:unwrap path:engine.rs  # faceted AND
 kenning search  reachable:0         # **消せる候補はこれ**: live root (pub / #[test] / trait 実装 / main /
@@ -137,6 +138,12 @@ repo が RUSTFLAGS 前提の custom cfg を要る場合 (tokio の `--cfg tokio_
   `impls <Trait>` への導線が `#` 行に出る。未使用判定は `search … traitimpl:0` で外す。
 - `callers` は **確実 (callee_sym 逆引き、誤りなし) + 候補 (未確定=要 Read で確認) + 別 sym に確定** の3分割。
   「全 caller を掴んだか」はこの3つの合計で判断でき、grep に戻らなくていい。
+- `tests` / `impact` は **確定 `[dN]` (N = 呼び出しの段数) + 候補経由 `[c1]`** の 2 層。`[c1]` = 確定では届かず、
+  名前一致どまりの edge (受け手の型が分からない method 呼び / trait 経由の呼び出し = `impl Stream for X` の
+  `poll_next` を generic な包みが呼ぶ形) を 1 本通って届く物。静的に届き得るのは両方で全部なので、grep で
+  足さなくていい。回すテストは両方が安全側、絞るなら `[c1]` を読んで判断。同名定義が多すぎて候補を辿らなかった
+  名前は `#` 行に出る (`callers <その修飾名>` の⚠で確認)。`Drop::drop` は名前で呼べないので候補にしない。
+- `use a::f as g` の `g()` は `f` の呼び出しとして数える (`callers f` に出る)。`use a::{self as aa}` / `use a::T as U` も同じ。
 - 名前が無いと **近い名前を自動提案** (typo 救済)。
 
 ## 効いてくる正直な限界
