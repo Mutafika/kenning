@@ -103,8 +103,8 @@ kenning impls   <trait|type>        go-to-implementation (双方向)
 kenning impact  <name> [container] [--confirmed-only]
                                     推移的 callers = 変更の影響範囲 (逆 BFS)。既定は値渡し参照
                                     (map(f)) も辿る — 影響範囲は見落としの方が危険なので
-kenning tests   <name> [container]  この symbol に届くテスト = impact ∩ is_test
-kenning path    <from> <to>         A から B への呼び出し経路 1 本 (前方 BFS)
+kenning tests   <name> [container]  この symbol に届くテスト = impact ∩ is_test ([d] 確定 / [c1] 候補経由)
+kenning path    <from> <to>         A から B への呼び出し経路 1 本 (前方 BFS、同名の委譲は先まで続ける)
 kenning across  <name>              index 済み全 repo 横断の精密参照
 kenning search  kind:method vis:pub container:Engine path:engine.rs   faceted 等値 AND
 kenning search  reachable:0         live root (pub / #[test] / trait 実装 / main / item 直下マクロ) から
@@ -275,11 +275,11 @@ call-site 検出の独立相互検証。差は: 1 問あたり中央値 58–290
   7.3–14.6 ms なので速さは互角 — 差は返ってくる中身）。
 - `bake`: rust-analyzer のバッチ 1 回、その後 **常駐ゼロ**。実測は ripgrep 7 s / 1.1 GB、
   tokio 28 s / 2.0 GB、enchudb 46 s / 2.3 GB。**repo 内確定率**（分母から std / 依存 crate への
-  呼び出しを外した率。後述）の前→後: tokio 28.6% → 73.7%、ripgrep 60.7% → 92.7%
-  （ここまで features=all）、enchudb 32.0% → 89.5% — enchudb は features=all が上限時間を
+  呼び出しを外した率。後述）の前→後: tokio 33.1% → 75.1%、ripgrep 61.9% → 92.7%
+  （ここまで features=all）、enchudb 34.9% → 89.5% — enchudb は features=all が上限時間を
   超えて固まるため *default* features で焼く（上限が存在する理由そのもの）。
-  bake 無しでも、syn 層の「書いてある型」の推定と Rust のスコープ規則で（bench infer、v0.5.1）
-  **ripgrep 60.7%**（bake 92.7%）、**enchudb 32.0%**（89.5%）、**tokio 28.6%**（73.7%）まで届く —
+  bake 無しでも、syn 層の「書いてある型」の推定と Rust のスコープ規則で（bench infer、v0.6.0）
+  **ripgrep 61.9%**（bake 92.7%）、**enchudb 34.9%**（89.5%）、**tokio 33.1%**（75.1%）まで届く —
   どれも誤確定 0（kenning 自身も）。
   tokio が低いのは、ジェネリクス・マクロ生成・cfg の切り替えが多く、推測しない syn 層が黙るべき
   所がまさにそこだから。落とした分は位置付きの候補として残る。
