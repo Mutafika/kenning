@@ -2300,3 +2300,14 @@ pub fn entry(t: &Top) { t.park(); }
     assert!(tail.contains("Mid::park") && tail.contains("Leaf::park") && tail.contains("Other::park"), "同名の委譲の続きが無い:\n{out}");
     assert!(tail.contains("続き"), "続きの件数行が無い:\n{out}");
 }
+
+/// #15: vocab の hash 索引は予約全域に slot が散るので、予約 ≒ disk 消費。entity 数 × 16 で予約すると小さな
+/// repo でも 26 MB (充填 0.2%) になっていた。語数の見積もりで予約し、数 MB に収まることを固定する。
+#[test]
+fn vocab_index_is_sized_from_the_string_estimate_not_entity_count() {
+    let (_dir, db) = indexed();
+    let out = query(&["stats"], &db);
+    let line = out.lines().find(|l| l.starts_with("disk:")).unwrap_or_else(|| panic!("stats に disk 行が無い:\n{out}"));
+    let mb: f64 = line.split("vocab 索引 ").nth(1).and_then(|s| s.split(' ').next()).and_then(|s| s.parse().ok()).unwrap_or(f64::MAX);
+    assert!(mb < 4.0, "小さな fixture の vocab 索引が {mb} MB (entity 数 × 16 の予約に戻っていないか): {line}");
+}

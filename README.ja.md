@@ -250,9 +250,9 @@ DB 構築 **68 分 / 9.9 GB / 301 MB** vs 2.4 s / 174 MB / 67 MB；who-calls 1 �
 最も純粋な対決 — Glean の Rust 経路も rust-analyzer SCIP なので、**まったく同じ .scip
 ファイル**を両エンジンに食わせ、serving 層だけを比べた。取込 8.0 s / 702 MB vs
 0.52 s / 268 MB；find-refs 1 問 ~1.0 s vs 0.011 s（Rosetta で説明できるのはせいぜい
-2–3×）；回答は一致（57 vs 58、def-role のカウント差 — 4 本目の独立相互検証）。Glean は
-facts の disk（14 MB vs 87 MB — こちらは syn コールグラフと facet も載せている）で勝ち、
-live source に join しないので古い SCIP も優雅に serve できる。
+2–3×）；回答は一致（57 vs 58、def-role のカウント差 — 4 本目の独立相互検証）。facts の
+disk は今は互角（14 MB vs 11.7 MB、2026-10-02 実測。当初の 87 MB の大半はほぼ空の vocab 索引で #15 で解消）。
+Glean は live source に join しないので古い SCIP も優雅に serve できる。
 
 CodeQL / Glean の対決は当時の enchudb スナップショット（175 files）での計測で、リリースごとに
 回し直してはいない（68 分の DB 構築を毎回払う意味がない）。主張は桁であって小数第 3 位ではない。
@@ -298,7 +298,7 @@ call-site 検出の独立相互検証。差は: 1 問あたり中央値 58–290
 | 推測（解決の偽装をしない） | 確実集合に誤検出ゼロ | エージェントは*候補*バケットの目視が残る |
 | 汎用クエリ言語（Angle/QL） | 学習コストゼロ、µs の答え | 任意の関係クエリ（taint tracking）は CodeQL の領分のまま |
 | Rust 以外の言語（今は） | 深さ（cfg 回収、trait コンテナ） | TS/Python repo では無力；fact schema 自体は言語中立 |
-| disk 節約 | 全列自動 index + syn グラフを SCIP と並走 | 同じ corpus で 87 MB vs Glean の 14 MB |
+| disk 節約 | 全列自動 index + syn グラフを SCIP と並走 | 同じ corpus で 11.7 MB vs Glean の 14 MB (#15 の前は 87 MB) |
 
 **~15 コマンドで足りるのか？** 閉じた集合ではない — エージェントが実際に聞く質問の語彙
 （定義 / 利用者 / 呼ぶ先 / 影響範囲 / 実装 / 経路 / 構造）を dogfooding で育てたもの。実運用で

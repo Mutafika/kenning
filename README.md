@@ -265,8 +265,8 @@ the purest matchup — Glean's Rust path is also rust-analyzer SCIP, so we fed *
 .scip file** to both engines and compared only the serving layer. Ingest 8.0 s / 702 MB vs
 0.52 s / 268 MB; one find-refs query ~1.0 s vs 0.011 s (Rosetta explains at most 2–3× of that);
 answers agree (57 vs 58, a def-role counting nuance — fourth independent cross-validation).
-Glean wins on facts disk (14 MB vs 87 MB — ours also carries the syn call graph and facets)
-and serves stale SCIP gracefully, since it never joins against live source.
+Disk is now on par (14 MB vs 11.7 MB, measured 2026-10-02 — the 87 MB in the original run was mostly an
+almost-empty vocab hash index, fixed in #15) and Glean serves stale SCIP gracefully, since it never joins against live source.
 
 The CodeQL and Glean matchups were measured on an earlier enchudb snapshot (175 files) and are
 not re-run every release — a 68-minute database build is not a per-release cost anyone should pay
@@ -314,7 +314,7 @@ Every number above was bought by *not* doing something. The full ledger:
 | Guessing (no fabricated resolution) | zero false positives in the confirmed set | agents still eyeball the *candidates* bucket |
 | A general query language (Angle/QL) | zero learning curve, µs answers | arbitrary relational questions (taint tracking) stay CodeQL's territory |
 | Languages other than Rust (for now) | depth (cfg recovery, trait containers) | useless in a TS/Python repo; the fact schema itself is language-neutral |
-| Disk thrift | every column auto-indexed + syn graph alongside SCIP | 87 MB vs Glean's 14 MB for the same corpus |
+| Disk thrift | every column auto-indexed + syn graph alongside SCIP | 11.7 MB vs Glean's 14 MB for the same corpus (was 87 MB before #15) |
 
 **Are ~15 commands enough?** They are not a closed set — they are the vocabulary of questions
 agents actually ask (definition / users / callees / blast radius / implementations / path /

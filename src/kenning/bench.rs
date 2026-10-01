@@ -662,14 +662,18 @@ pub fn cmd_bench(args: &[String]) {
         .and_then(|t| t.all().find().unwrap().into_iter().next().map(|e| matches!(t.entity(e).get("baked_at"), Some(Value::Number(b)) if b > 0)))
         .unwrap_or(false);
     let rs = ResolveStats::of(&call_t);
+    // db の実 disk と vocab 索引の分 (#15 の回帰防止: entity 数比例の予約に戻ると索引が 2/3 を占める)。
+    let mb = |p: &Path| real_bytes(p) as f64 / 1_048_576.0;
     println!(
-        "corpus `{}` — {} files / {} call-sites (うち repo 内 {}) / repo 内確定率 {:.1}% / {}\n",
+        "corpus `{}` — {} files / {} call-sites (うち repo 内 {}) / repo 内確定率 {:.1}% / {} / db 実 {:.1} MB (vocab 索引 {:.1} MB)\n",
         root,
         files.len(),
         rs.total,
         rs.local(),
         rs.local_pct(),
-        if baked { "**baked (SCIP)**" } else { "syn-only (未 bake)" }
+        if baked { "**baked (SCIP)**" } else { "syn-only (未 bake)" },
+        mb(Path::new(&o.db)),
+        mb(&Path::new(&o.db).join(VOCAB_INDEX_SEG))
     );
 
     if sub == "quality" || sub == "all" {

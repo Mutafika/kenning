@@ -1611,6 +1611,16 @@ pub fn cmd_stats(args: &[String]) {
         .filter_map(|t| db.table_eid_usage(t).map(|u| format!("{t} {}%", u.allocated as u64 * 100 / u.capacity.max(1) as u64)))
         .collect();
     println!("capacity: {} (残 eid {})", usage.join(" "), db.remaining_eid_capacity());
+    // disk の内訳: vocab 索引 (hash) は予約全域に slot が散るので、予約 ≒ 実消費になる (#15)。
+    let vocab = db.engine().vocab_orphan_stats().vocab_total;
+    let vix = Path::new(&o.db).join(VOCAB_INDEX_SEG);
+    let vix_slots = std::fs::metadata(&vix).map(|m| m.len() / VOCAB_SLOT_BYTES).unwrap_or(0);
+    println!(
+        "disk: 実 {:.1} MB (うち vocab 索引 {:.1} MB) / vocab {vocab} 語 (索引 {vix_slots} slot = 充填 {:.1}%)",
+        real_bytes(Path::new(&o.db)) as f64 / 1_048_576.0,
+        real_bytes(&vix) as f64 / 1_048_576.0,
+        pct_of(vocab as usize, vix_slots as usize)
+    );
     // bake の有無は **精度そのもの**なのに、今までは capacity 行の `ref x%` から読むしかなかった。
     // (再 index で SCIP が落ちても気付けず、impact が静かに縮む事故が起きる)
     let n_ref = db.get_table("ref").map(|t| t.all().count().unwrap_or(0)).unwrap_or(0);

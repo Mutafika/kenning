@@ -29,6 +29,16 @@ use super::*;
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// #15: extref などの entity 枠があふれた時に vocab まで 4 倍にしない (hash 索引は予約 ≒ disk)。逆も同じ。
+    #[test]
+    fn retry_widens_only_the_overflowed_capacity() {
+        let (mut cap, mut voc) = (1u32, 1u32);
+        widen_after_failure("table 'extref' eid range exhausted (121121 eids reserved)", &mut cap, &mut voc);
+        assert_eq!((cap, voc), (4, 1), "entity 枠のあふれで vocab まで広げた");
+        widen_after_failure("index: enchudb が 3 件の write を拒否 (vocabulary full=3) → 容量不足", &mut cap, &mut voc);
+        assert_eq!((cap, voc), (4, 4), "vocab のあふれで entity 枠まで広げた");
+    }
+
     /// 提案は「近い」の根拠が要る: 短すぎる定義名 (`_` / `Op`) は何にでも含まれるので 0 点。
     #[test]
     fn suggest_score_ignores_tiny_definition_names() {

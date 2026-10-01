@@ -66,12 +66,15 @@ pub(crate) fn index_locked(dir: &str, path: &str, scip_path: Option<&str>, reuse
     sweep_leftovers(path); // lock を握っている = 他に作成中の process は居ない = 残骸と断定できる
     let tmp = tmp_db_path(path);
     let mut cap_mult = 1u32;
+    // vocab (文字列の hash 索引) は他の枠と別に広げる。entity 枠があふれた時に vocab まで 4 倍にすると、
+    // 予約全域に slot が散る hash 索引はそのまま disk を食う (#15: bamiri で 872 MB)。
+    let mut vocab_mult = 1u32;
     loop {
         // 予約枯渇 (enchudb の unwrap 失敗) を捕まえるため panic を握りつぶして試行。
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_index_inner(dir, path, &tmp, scip_path, cap_mult)
+            run_index_inner(dir, path, &tmp, scip_path, cap_mult, vocab_mult)
         }));
         std::panic::set_hook(prev);
         // panic payload を人間可読に (握りつぶすと真因が消えるので必ず表示する)。
@@ -88,9 +91,10 @@ pub(crate) fn index_locked(dir: &str, path: &str, scip_path: Option<&str>, reuse
                 }
                 return placed;
             }
-            Err(e) if cap_mult < 64 => {
-                cap_mult *= 4;
-                eprintln!("# index 失敗 ({}) → capacity {cap_mult}x で再試行", msg_of(e));
+            Err(e) if cap_mult < 64 && vocab_mult < 64 => {
+                let msg = msg_of(e);
+                let what = widen_after_failure(&msg, &mut cap_mult, &mut vocab_mult);
+                eprintln!("# index 失敗 ({msg}) → {what} で再試行");
             }
             Err(e) => {
                 eprintln!("# index 失敗: capacity 64x でも解消せず ({dir}): {}", msg_of(e));
@@ -98,6 +102,18 @@ pub(crate) fn index_locked(dir: &str, path: &str, scip_path: Option<&str>, reuse
                 return false;
             }
         }
+    }
+}
+
+/// index 失敗の後、**あふれた枠だけ** 4 倍にする (戻り値 = 何を広げたかの表示)。vocab の満杯は fault の名前で
+/// 分かる (`assert_no_faults` の内訳)。それ以外 (entity 枠の枯渇 = enchudb の panic 文) は entity 枠を広げる。
+pub(crate) fn widen_after_failure(msg: &str, cap_mult: &mut u32, vocab_mult: &mut u32) -> String {
+    if msg.contains(FaultKind::VocabSpace.as_str()) {
+        *vocab_mult *= 4;
+        format!("vocab {vocab_mult}x")
+    } else {
+        *cap_mult *= 4;
+        format!("capacity {cap_mult}x")
     }
 }
 
@@ -218,7 +234,7 @@ pub(crate) fn remove_v9_sidecars(path: &str) {
 pub(crate) const V9_SIDECAR_EXTS: [&str; 7] = ["oplog", "lock", "schema", "tables", "eidmap", "vocabmap", "crc"];
 
 /// `tmp` に焼いて最後に `path` へ差し替える。戻り値 = 配置できたか。
-pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Option<&str>, cap_mult: u32) -> bool {
+pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Option<&str>, cap_mult: u32, vocab_mult: u32) -> bool {
     wipe_db(tmp); // 前 loop (capacity 不足で panic) の作りかけ
 
     if !quiet() {
@@ -255,7 +271,14 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
     let extref_cap = if scip_path.is_some() { (n_files_est * 100).max(8_192) * cap_mult } else { 1_024 };
     let field_cap = sym_cap; // field 数は定義数と同程度
     let max_entities = (file_cap + dir_cap + sym_cap + call_cap + ref_cap + impl_cap + extref_cap + field_cap) * 11 / 10; // +10% 余白
-    let mut db = Database::create_growable_with_capacity(tmp, max_entities).unwrap();
+    // vocab の語数 (文字列の種類) は entity 数と比例しない。enchudb 既定の max_entities × 16 は実需の数百倍で、
+    // hash 索引は予約全域に slot が散るので予約 ≒ disk 消費になる (#15、充填 0.2〜0.6%)。実測の語数は
+    // call-site の 0.4〜0.7 倍 (4 repo) — call 枠 (実数の ~2.6 倍で見積もり済み) + 定義・file・外部 symbol の名前で
+    // 足りる。余りは増分 update で増える語 (vocab は回収しない) の分。満杯は fault → ここの vocab_mult か、
+    // update なら heal の full 再 index に落ちる。
+    let vocab_max = (call_cap + sym_cap * 4 + file_cap + dir_cap + extref_cap).saturating_mul(vocab_mult);
+    let opts = GrowableOptions { max_entities, vocab_max_entries: Some(vocab_max), ..Default::default() };
+    let mut db = Database::create_growable_with(tmp, opts).unwrap();
     db.table("file")
         .tag("path")
         .tag("crate_")
