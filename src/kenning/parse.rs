@@ -279,6 +279,9 @@ pub(crate) struct CallCollector {
     imports: std::rc::Rc<HashMap<String, (String, String)>>,
     /// 関数の中の `use` (`use std::os::unix::fs::symlink;`)。file の `use` より優先。
     fn_imports: HashMap<String, (String, String)>,
+    /// この file の `static` / `const` の名前 → 宣言に書いてある型 (`static SEM: Semaphore` の `SEM.f()`)。
+    /// 同じ file に同名が複数なら None (どれか決めない)。
+    statics: std::rc::Rc<HashMap<String, Option<Recv>>>,
 }
 
 /// 修飾なしの `f()` の f がこの body の束縛 (クロージャ / 引数) だった印。qual_root 列に入れて永続化する
@@ -379,6 +382,16 @@ impl CallCollector {
     fn lookup(&self, name: &str) -> Option<Recv> {
         self.scopes.iter().rev().find_map(|s| s.get(name)).cloned().flatten()
     }
+    /// 式に現れた単独の名前の型。この body の束縛が先、次に file の `static` / `const` (外から `use` した同名は別物)。
+    fn lookup_value(&self, name: &str) -> Option<Recv> {
+        if self.is_bound(name) {
+            return self.lookup(name);
+        }
+        if self.import(name).is_some() {
+            return None;
+        }
+        self.statics.get(name).cloned().flatten()
+    }
     fn bind(&mut self, name: String, r: Option<Recv>) {
         if self.scopes.is_empty() {
             self.scopes.push(HashMap::new());
@@ -472,7 +485,7 @@ impl CallCollector {
             // `self.field` は Pin<&mut Self> 越しでも Self の field に届く (自動参照外し)。当たり得ないのは
             // `self.m()` の直接の method 呼びだけ (下の MethodCall で止める)。
             syn::Expr::Path(p) if p.path.is_ident("self") => Some(Recv { ty: "Self".into(), root: self.self_root.clone(), ..Default::default() }),
-            syn::Expr::Path(p) => p.path.get_ident().and_then(|i| self.lookup(&i.to_string())),
+            syn::Expr::Path(p) => p.path.get_ident().and_then(|i| self.lookup_value(&i.to_string())),
             _ => None,
         }
     }
@@ -630,9 +643,21 @@ impl<'ast> Visit<'ast> for CallCollector {
         // 確定しないよう、先にローカルの束縛として登録する (tokio の tests の中の `fn iter()` を tokio_stream::iter
         // に確定していた)。
         for st in &node.stmts {
-            if let syn::Stmt::Item(syn::Item::Fn(f)) = st {
-                self.locals.insert(f.sig.ident.to_string());
-                self.bind(f.sig.ident.to_string(), None);
+            match st {
+                syn::Stmt::Item(syn::Item::Fn(f)) => {
+                    self.locals.insert(f.sig.ident.to_string());
+                    self.bind(f.sig.ident.to_string(), None);
+                }
+                // 関数の中の `static SEM: Semaphore = ..;` / `const N: T = ..;` — 宣言に型が書いてある
+                syn::Stmt::Item(syn::Item::Static(it)) => {
+                    let r = self.type_recv(&it.ty);
+                    self.bind(it.ident.to_string(), r);
+                }
+                syn::Stmt::Item(syn::Item::Const(it)) => {
+                    let r = self.type_recv(&it.ty);
+                    self.bind(it.ident.to_string(), r);
+                }
+                _ => {}
             }
         }
         visit::visit_block(self, node);
@@ -699,6 +724,7 @@ impl<'ast> Visit<'ast> for CallCollector {
                 bounds: self.bounds.clone(),
                 imports: self.imports.clone(),
                 fn_imports: self.fn_imports.clone(),
+                statics: self.statics.clone(),
                 self_root: self.self_root.clone(),
                 self_wrapped: self.self_wrapped,
                 in_user_macro: self.in_user_macro || !STD_EXPR_MACROS.contains(&name.as_str()),
@@ -730,6 +756,7 @@ pub(crate) struct SymDef {
     file: EntityId,     // 定義のある file (別 crate / 別ターゲットの判定)
     gated: bool,        // `cfg_not_*!` の中の定義 (確定先にしない)
     cond: bool,         // cfg 付きの定義 (別の file からは確定しない)
+    vis: u32,           // 可視性 (V_PUB 以外の型は別の crate から名前で書けない)
 }
 
 /// Cargo の crate 名は `-`、Rust path は `_`。突き合わせ前に正規化する。
@@ -791,6 +818,7 @@ pub(crate) struct Ctx {
     impl_generics: Vec<String>, // 囲む impl の型引数 (受け手の型推定で具体型と区別する)
     impl_bounds: HashMap<String, TyRef>, // 囲む impl の型引数の単一 trait 境界
     imports: std::rc::Rc<HashMap<String, (String, String)>>, // この file の `use` (名前 → (出どころ, 元の名前))
+    statics: std::rc::Rc<HashMap<String, Option<Recv>>>,     // この file の `static` / `const` の型 (CallCollector に渡す)
 }
 
 /// 1 ファイルから取り出した facts (eid 未割当の中間表現)。parse した thread で行/列・sig・doc まで
@@ -890,7 +918,7 @@ pub(crate) fn record_symbol(
 ) {
     let mut calls = Vec::new();
     if let Some(b) = body {
-        let mut cc = CallCollector { imports: ctx.imports.clone(), self_root: ctx.impl_self_root.clone(), ..Default::default() };
+        let mut cc = CallCollector { imports: ctx.imports.clone(), statics: ctx.statics.clone(), self_root: ctx.impl_self_root.clone(), ..Default::default() };
         cc.generics.extend(ctx.impl_generics.iter().cloned());
         cc.bounds.extend(ctx.impl_bounds.iter().map(|(k, v)| (k.clone(), v.clone())));
         // 引数名は signature 側にあるので、body だけ歩くと束縛が漏れる。
@@ -996,7 +1024,7 @@ pub(crate) fn insert_file_facts(file_t: &Table, sym_t: &Table, acc: &mut Acc, ro
             .commit()
             .unwrap();
         // 名前解決の突き合わせ先として登録 (syn 用)。
-        acc.defs.entry(s.name).or_default().push(SymDef { eid: sym_eid, kind: s.kind, container: s.container.clone(), module: s.module, crate_: crate_name.clone(), ret: s.ret.clone(), impl_trait: s.impl_trait.clone(), impl_blanket: s.impl_blanket, file: file_eid, gated: s.gated, cond: s.cond });
+        acc.defs.entry(s.name).or_default().push(SymDef { eid: sym_eid, kind: s.kind, container: s.container.clone(), module: s.module, crate_: crate_name.clone(), ret: s.ret.clone(), impl_trait: s.impl_trait.clone(), impl_blanket: s.impl_blanket, file: file_eid, gated: s.gated, cond: s.cond, vis: s.vis });
         // SCIP symbol → 自 index の eid (call の正確解決に使う)。
         // **衝突したら 0 (曖昧) にする**: RA の symbol 文字列は test / example / bench の各ターゲットで
         // 同じになることがあり (enchudb には同名 `cleanup` が 108 個)、上書きすると
@@ -1391,7 +1419,7 @@ pub(crate) fn walk_item(it: &syn::Item, ctx: &mut Ctx, out: &mut FileFacts) {
                 return;
             }
             if let Ok(args) = m.mac.parse_body_with(Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated) {
-                let mut cc = CallCollector { imports: ctx.imports.clone(), ..Default::default() };
+                let mut cc = CallCollector { imports: ctx.imports.clone(), statics: ctx.statics.clone(), ..Default::default() };
                 for e in &args {
                     visit::visit_expr(&mut cc, e);
                 }
@@ -1448,6 +1476,10 @@ pub(crate) fn walk_item(it: &syn::Item, ctx: &mut Ctx, out: &mut FileFacts) {
 pub(crate) struct Resolver<'a> {
     pub(crate) defs: &'a HashMap<String, Vec<SymDef>>,
     local_roots: HashSet<String>,
+    /// どこからでも内側の出どころ (workspace の crate 名と `crate` / `self` / `super` / `Self`)。
+    crate_roots: HashSet<String>,
+    /// module 名 → その module を持つ crate (module 名は同じ crate の中からだけ内側)。
+    mod_crates: HashMap<String, HashSet<String>>,
     fields: FieldTypes,
     /// file eid → (crate 名, path)。修飾なしの呼び出しが別 crate / 別ターゲットを指していないかを見る。
     files: HashMap<EntityId, (String, String)>,
@@ -1507,29 +1539,36 @@ impl<'a> Resolver<'a> {
         };
         let gated_files: HashSet<EntityId> = files.iter().filter(|(_, (_, p))| region_of(p, &gated_targets).is_some()).map(|(e, _)| *e).collect();
         let cond_region: HashMap<EntityId, usize> = files.iter().filter_map(|(e, (_, p))| region_of(p, &cond_targets).map(|r| (*e, r))).collect();
-        let rs_paths: Vec<String> = files.values().map(|(_, p)| p.clone()).collect();
-        let mut local_roots: HashSet<String> = ["crate", "self", "super", "Self"].iter().map(|s| s.to_string()).collect();
+        let mut crate_roots: HashSet<String> = ["crate", "self", "super", "Self"].iter().map(|s| s.to_string()).collect();
+        // module 名 → それを持つ crate。module 名が内側なのは同じ crate の中からだけ (tokio の loom/std/parking_lot.rs
+        // があっても、tokio-util の `use parking_lot::Mutex` は外の crate)。
+        let mut mod_crates: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut add_mod = |m: &str, c: &str| {
+            if !m.is_empty() {
+                mod_crates.entry(m.to_string()).or_default().insert(c.to_string());
+            }
+        };
         for d in defs.values().flatten() {
-            local_roots.insert(crate_key(&d.crate_));
-            local_roots.extend(d.module.split("::").filter(|m| !m.is_empty()).map(str::to_string));
+            crate_roots.insert(crate_key(&d.crate_));
+            d.module.split("::").for_each(|m| add_mod(m, &crate_key(&d.crate_)));
         }
         for e in file_t.where_eq("lang", LANG_RUST).find().unwrap_or_default() {
-            local_roots.extend(txt(file_t.entity(e).get("mod_names")).split(' ').filter(|m| !m.is_empty()).map(str::to_string));
+            let c = files.get(&e).map(|f| f.0.clone()).unwrap_or_default();
+            txt(file_t.entity(e).get("mod_names")).split(' ').for_each(|m| add_mod(m, &c));
         }
-        for p in &rs_paths {
+        for (c, p) in files.values() {
             let p = Path::new(p);
             match p.file_stem().and_then(|s| s.to_str()) {
                 Some("mod") => {
                     if let Some(d) = p.parent().and_then(|d| d.file_name()).and_then(|d| d.to_str()) {
-                        local_roots.insert(d.to_string());
+                        add_mod(d, c);
                     }
                 }
-                Some(s) => {
-                    local_roots.insert(s.to_string());
-                }
+                Some(s) => add_mod(s, c),
                 None => {}
             }
         }
+        let mut local_roots: HashSet<String> = crate_roots.iter().cloned().chain(mod_crates.keys().cloned()).collect();
         // std / core / alloc は同名の module があっても常に外 (`use std::time::Instant` の std は標準ライブラリ。
         // tokio の loom/std/ module を内側と数えて Instant::now を自前に確定した実例)。
         for ext in ["std", "core", "alloc"] {
@@ -1547,7 +1586,7 @@ impl<'a> Resolver<'a> {
             }
         }
         let variants = fields.keys().filter_map(|(_, f)| f.split_once('.').map(|(v, _)| v.to_string())).collect();
-        Resolver { defs, local_roots, fields, files, traits, for_all_traits, types, gated_files, cond_region, cfg_ext_names, variants }
+        Resolver { defs, local_roots, crate_roots, mod_crates, fields, files, traits, for_all_traits, types, gated_files, cond_region, cfg_ext_names, variants }
     }
     /// 呼び出し元 (file) から定義 `d` を確定先にしてよいか。cfg 付きの定義 / 条件付き module の中の定義は、
     /// 同じ file / 同じ条件付き module の中からの呼び出しだけ (外からは cfg 付きの re-export 越しに別の実体に
@@ -1598,6 +1637,23 @@ impl<'a> Resolver<'a> {
     fn is_local_ty(&self, root: &str, name: &str) -> bool {
         self.is_local(root) && !(root.is_empty() && PRELUDE_TYPES.contains(&name))
     }
+    /// 呼び出し元の file に書いてある出どころ (`use` の先頭 / 修飾) が内側か。module 名は呼び出し元と同じ crate の
+    /// module の時だけ内側 (別の crate の同名 module は書けない)。呼び出し元の crate が分からなければ従来どおり。
+    fn is_local_from(&self, root: &str, cs: &CallSite) -> bool {
+        if !self.is_local(root) {
+            return false;
+        }
+        if root.is_empty() || self.crate_roots.contains(&crate_key(root)) {
+            return true;
+        }
+        match self.files.get(&cs.file) {
+            Some((c, _)) => self.mod_crates.get(root).is_some_and(|owners| owners.contains(c)),
+            None => true,
+        }
+    }
+    fn is_local_ty_from(&self, root: &str, name: &str, cs: &CallSite) -> bool {
+        self.is_local_from(root, cs) && !(root.is_empty() && PRELUDE_TYPES.contains(&name))
+    }
     /// 確定先を rust-analyzer (= bake 済み kenning) の流儀に揃える (bench infer で RA と突き合わせた挙動)。
     /// trait 実装の method を
     /// - method 呼び `x.f()` で、具体的な型への impl なら → その impl の method のまま
@@ -1628,6 +1684,23 @@ impl<'a> Resolver<'a> {
             [x] => Some(x.eid),
             _ => None,
         })
+    }
+    /// 型 `t` の method `d` は、別の crate の呼び出し元からは型ごと見えないか。`d` と同じ file にある型 `t` の
+    /// 定義が pub でなければ見えない (tokio の `Semaphore` 5 つのうち tokio-util から書けるのは `sync::Semaphore`
+    /// だけ)。同じ crate / 定義が見つからない時は見えるものとして扱う (外すのは確実に書けない物だけ)。
+    fn type_hidden_from(&self, cs: &CallSite, d: &SymDef, t: &str) -> bool {
+        let (Some((caller_crate, _)), Some((def_crate, _))) = (self.files.get(&cs.file), self.files.get(&d.file)) else {
+            return false;
+        };
+        if caller_crate == def_crate {
+            return false;
+        }
+        let tys: Vec<&SymDef> = self
+            .defs
+            .get(t)
+            .map(|v| v.iter().filter(|x| matches!(x.kind, K_STRUCT | K_ENUM | K_TRAIT) && x.file == d.file).collect())
+            .unwrap_or_default();
+        !tys.is_empty() && tys.iter().all(|x| x.vis != V_PUB)
     }
     /// 修飾なしの `f()` から定義 `d` に届くか: 別の crate の fn は `use` していなければ呼べない。
     /// tests/ benches/ examples/ の直下の file は互いに別の crate (benches の `iter()` を tokio-stream の
@@ -1775,7 +1848,7 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
     if let Some(q) = qualifier {
         // 修飾の出どころが repo の外 (`use std::io::Error` の `Error::new`) なら、同名の自前の型の
         // new に確定してはいけない (ripgrep で 26 件の誤確定を RA との突き合わせで確認)。
-        if !rz.is_local(&cs.qual_root) {
+        if !rz.is_local_from(&cs.qual_root, cs) {
             return (None, R_EXTERNAL);
         }
         // `Self::` は現在の impl 型に読み替える。
@@ -1833,7 +1906,7 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
             let by_self: Vec<&SymDef> =
                 cands.iter().copied().filter(|d| d.container == cs.caller_container).collect();
             // 外の型への impl の中の `self.f()` は std の inherent method が先に当たる (`impl Kill for StdChild`)
-            if !rz.is_local_ty(&cs.recv.root, &cs.caller_container) {
+            if !rz.is_local_ty_from(&cs.recv.root, &cs.caller_container, cs) {
                 return (None, R_METHOD);
             }
             if let [d] = by_self.as_slice()
@@ -1856,7 +1929,7 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
             {
                 return (None, R_METHOD);
             }
-            let by_ty: Vec<&SymDef> = cands.iter().copied().filter(|d| d.container == t).collect();
+            let by_ty: Vec<&SymDef> = cands.iter().copied().filter(|d| d.container == t && !rz.type_hidden_from(cs, d, &t)).collect();
             if let [d] = by_ty.as_slice()
                 && !(wrapped && (!d.impl_trait.name.is_empty() || rz.traits.contains(&t) || SMART_PTR_METHODS.contains(&cs.name.as_str())))
                 && !shadowed(&|x| x.container == t)
@@ -1873,7 +1946,7 @@ pub(crate) fn resolve_call(cs: &CallSite, rz: &Resolver) -> (Option<EntityId>, u
     }
     // 修飾なしの関数呼び。名前が束縛 (クロージャ / 引数) や外から `use` した関数なら repo の fn ではない
     // (`use std::os::unix::fs::symlink; symlink(..)` を同名の自前 fn に確定した実例)。
-    if !rz.is_local(&cs.qual_root) {
+    if !rz.is_local_from(&cs.qual_root, cs) {
         return (None, R_EXTERNAL);
     }
     // 修飾なしの `f()` は method を呼べない (呼ぶには `T::f` / `x.f()` が要る) — method は候補から外す。
@@ -1911,7 +1984,7 @@ fn recv_type_of(cs: &CallSite, rz: &Resolver) -> Option<(String, bool)> {
         last_ret = Some(ret);
         t
     } else {
-        if r.ty.is_empty() || !rz.is_local_ty(&r.root, &r.ty) {
+        if r.ty.is_empty() || !rz.is_local_ty_from(&r.root, &r.ty, cs) {
             return None;
         }
         let t = if r.ty == "Self" { cs.caller_container.clone() } else { r.ty.clone() };
@@ -2058,6 +2131,7 @@ pub(crate) fn build_defs_from_table(sym_t: &Table) -> HashMap<String, Vec<SymDef
             file: ref_of(er.get("file")),
             gated: num(er.get("gated")) == 1,
             cond: num(er.get("cond")) == 1,
+            vis: num(er.get("vis")),
         });
     }
     defs
@@ -2129,6 +2203,37 @@ fn use_tree_imports_in(t: &syn::UseTree, root: Option<&str>, parent: Option<&str
     }
 }
 
+/// file の `static` / `const` (inline mod / item を包むマクロの中も) の名前 → 宣言の型。同名が複数なら None。
+pub(crate) fn file_statics(items: &[syn::Item], imp: ImportLookup) -> HashMap<String, Option<Recv>> {
+    // 同名が 2 つ目に出たら None (別 module / cfg 違い — どれか決めない)
+    fn put(out: &mut HashMap<String, Option<Recv>>, k: String, v: Option<Recv>) {
+        out.entry(k).and_modify(|e| *e = None).or_insert(v);
+    }
+    let mut out = HashMap::new();
+    let ty_of = |ty: &syn::Type| ty_ref(ty, imp, &HashSet::new()).map(|t| Recv { ty: t.name, root: t.root, ..Default::default() });
+    for it in items {
+        let inner = match it {
+            syn::Item::Static(st) => {
+                put(&mut out, st.ident.to_string(), ty_of(&st.ty));
+                continue;
+            }
+            syn::Item::Const(c) => {
+                put(&mut out, c.ident.to_string(), ty_of(&c.ty));
+                continue;
+            }
+            syn::Item::Mod(m) => m.content.as_ref().map(|(_, inner)| file_statics(inner, imp)),
+            syn::Item::Macro(m) if !m.mac.path.is_ident("macro_rules") => {
+                m.mac.parse_body_with(parse_items::<syn::Item>).ok().map(|items| file_statics(&items, imp))
+            }
+            _ => None,
+        };
+        for (k, v) in inner.into_iter().flatten() {
+            put(&mut out, k, v);
+        }
+    }
+    out
+}
+
 pub(crate) fn file_imports(items: &[syn::Item]) -> HashMap<String, (String, String)> {
     let mut out = HashMap::new();
     for it in items {
@@ -2157,7 +2262,8 @@ pub(crate) fn extract_file(src: &str) -> Option<FileFacts> {
     // file 冒頭の inner attribute (`#![cfg(test)]`) は file 全体に効く。per-file parse では親の
     // `#[cfg(test)] mod x;` が見えないので、これを見ないと test 専用 file の helper が
     // 「test でない symbol」として出てしまう (`tests <name>` と `search test:1` が取りこぼす)。
-    let mut ctx = Ctx { module: Vec::new(), in_test: file.attrs.iter().any(is_cfg_test), container: String::new(), in_trait_impl: false, impl_trait: TyRef::default(), impl_blanket: false, impl_self_root: String::new(), neg_gate: false, cond: false, impl_generics: Vec::new(), impl_bounds: HashMap::new(), imports: std::rc::Rc::new(file_imports(&file.items)) };
+    let mut ctx = Ctx { module: Vec::new(), in_test: file.attrs.iter().any(is_cfg_test), container: String::new(), in_trait_impl: false, impl_trait: TyRef::default(), impl_blanket: false, impl_self_root: String::new(), neg_gate: false, cond: false, impl_generics: Vec::new(), impl_bounds: HashMap::new(), imports: std::rc::Rc::new(file_imports(&file.items)), statics: Default::default() };
+    ctx.statics = std::rc::Rc::new(file_statics(&file.items, &|n: &str| ctx.imports.get(n).cloned()));
     walk_items(&file.items, &mut ctx, &mut out);
     let live = std::mem::take(&mut out.live_mods);
     out.gated_mods.retain(|m| !live.contains(m)); // 両方の枝で宣言 = 出し分けであって代用品ではない

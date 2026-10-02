@@ -2311,3 +2311,76 @@ fn vocab_index_is_sized_from_the_string_estimate_not_entity_count() {
     let mb: f64 = line.split("vocab 索引 ").nth(1).and_then(|s| s.split(' ').next()).and_then(|s| s.parse().ok()).unwrap_or(f64::MAX);
     assert!(mb < 4.0, "小さな fixture の vocab 索引が {mb} MB (entity 数 × 16 の予約に戻っていないか): {line}");
 }
+
+/// `static` / `const` の宣言に書いてある型は受け手の手掛かり (`static SEM: Semaphore` の `SEM.add()`)。
+/// file 直下も関数の中も。束縛 (`let SEM = ..`) は外の static を隠し、同名の static が 2 つあれば決めない。
+#[test]
+fn statics_and_consts_give_their_declared_type() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"pub struct Sem;
+impl Sem { pub const fn new() -> Self { Sem } pub fn add(&self) {} }
+pub struct Other;
+impl Other { pub fn add(&self) {} }
+static TOP: Sem = Sem::new();
+pub fn top() { TOP.add(); }
+pub fn inner() {
+    static IN: crate::other::Sem = crate::other::Sem::new();
+    let f = async move { IN.add(); };
+    drop(f);
+}
+pub fn shadow(TOP: Other) { TOP.add(); }
+mod a { pub static DUP: super::Sem = super::Sem::new(); }
+mod b { pub static DUP: super::Other = super::Other; }
+pub fn dup() { DUP.add(); }
+"#,
+    );
+    let db = d.join("k.db");
+    index(&d, &db);
+    let sem = query(&["callers", "add", "Sem"], &db);
+    let confirmed = sem.split("候補").next().unwrap_or("");
+    assert!(confirmed.contains("in top\t") && confirmed.contains("in inner\t"), "static の型で確定するはず:\n{sem}");
+    assert!(!confirmed.contains("in shadow\t"), "引数が static を隠しているのに static の型で確定:\n{sem}");
+    assert!(!confirmed.contains("in dup\t"), "同名の static が 2 つあるのに確定:\n{sem}");
+}
+
+/// crate の境目: (1) module 名が内側なのは同じ crate の中からだけ — crate `a` に `mod parking_lot` があっても、
+/// crate `b` の `use parking_lot::Mutex` は外の crate (tokio の loom/std/parking_lot.rs で tokio-util の
+/// `static M: Mutex` を tokio の Mutex に誤確定した形)。(2) 別の crate からは pub でない型を書けないので、同名の
+/// 型が複数でも pub の 1 つに絞れる (tokio の `Semaphore` 5 つ)。
+#[test]
+fn crate_boundaries_limit_module_roots_and_type_visibility() {
+    let d = tmp();
+    std::fs::write(d.join("Cargo.toml"), "[workspace]\nmembers = [\"a\", \"b\"]\n").unwrap();
+    for (k, files) in [
+        (
+            "a",
+            vec![
+                ("lib.rs", "pub mod parking_lot;\npub mod s;\nmod t;\n"),
+                ("parking_lot.rs", "pub struct Mutex<T>(pub T);\nimpl<T> Mutex<T> { pub fn lock(&self) {} }\n"),
+                ("s.rs", "pub struct Sem;\nimpl Sem { pub const fn new() -> Self { Sem } pub fn add(&self) {} }\n"),
+                ("t.rs", "pub(crate) struct Sem;\nimpl Sem { pub(crate) fn add(&self) {} }\n"),
+            ],
+        ),
+        (
+            "b",
+            vec![(
+                "lib.rs",
+                "use parking_lot::Mutex;\nstatic M: Mutex<()> = parking_lot::const_mutex(());\npub fn ext() { M.lock(); }\nstatic S: a::s::Sem = a::s::Sem::new();\npub fn vis() { S.add(); }\n",
+            )],
+        ),
+    ] {
+        std::fs::create_dir_all(d.join(k).join("src")).unwrap();
+        std::fs::write(d.join(k).join("Cargo.toml"), format!("[package]\nname = \"{k}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n")).unwrap();
+        for (f, src) in files {
+            std::fs::write(d.join(k).join("src").join(f), src).unwrap();
+        }
+    }
+    let db = d.join("k.db");
+    index(&d, &db);
+    let lock = query(&["callers", "lock", "Mutex"], &db);
+    assert!(!lock.split("候補").next().unwrap_or("").contains("in ext\t"), "別 crate の module 名 parking_lot を内側と数えて誤確定:\n{lock}");
+    let add = query(&["callers", "add", "Sem", "path:a/src/s.rs"], &db);
+    assert!(add.split("候補").next().unwrap_or("").contains("in vis\t"), "別 crate から書けるのは pub の Sem だけ — 確定するはず:\n{add}");
+}
