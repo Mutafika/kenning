@@ -275,11 +275,11 @@ call-site 検出の独立相互検証。差は: 1 問あたり中央値 58–290
   7.3–14.6 ms なので速さは互角 — 差は返ってくる中身）。
 - `bake`: rust-analyzer のバッチ 1 回、その後 **常駐ゼロ**。実測は ripgrep 7 s / 1.1 GB、
   tokio 28 s / 2.0 GB、enchudb 46 s / 2.3 GB。**repo 内確定率**（分母から std / 依存 crate への
-  呼び出しを外した率。後述）の前→後: tokio 33.1% → 75.1%、ripgrep 61.9% → 92.7%
+  呼び出しを外した率。後述）の前→後: tokio 33.3% → 70.8%、ripgrep 62.0% → 92.7%
   （ここまで features=all）、enchudb 34.9% → 89.5% — enchudb は features=all が上限時間を
   超えて固まるため *default* features で焼く（上限が存在する理由そのもの）。
-  bake 無しでも、syn 層の「書いてある型」の推定と Rust のスコープ規則で（bench infer、v0.6.0）
-  **ripgrep 61.9%**（bake 92.7%）、**enchudb 34.9%**（89.5%）、**tokio 33.1%**（75.1%）まで届く —
+  bake 無しでも、syn 層の「書いてある型」の推定と Rust のスコープ規則で（bench infer、v0.6.2）
+  **ripgrep 62.0%**（bake 92.7%）、**enchudb 34.9%**（89.5%）、**tokio 33.3%**（70.8%）まで届く —
   どれも誤確定 0（kenning 自身も）。
   tokio が低いのは、ジェネリクス・マクロ生成・cfg の切り替えが多く、推測しない syn 層が黙るべき
   所がまさにそこだから。落とした分は位置付きの候補として残る。
