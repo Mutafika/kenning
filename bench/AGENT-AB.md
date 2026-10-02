@@ -164,6 +164,23 @@ tuple struct と取り違え得るので確定しない)。syn 層の typed 確�
   本文を読んで決めるしかない。kenning の穴ではない。
 - Opus の grep 系は 6 回目と同じ (16〜17 回、癖)。
 
+### 8 回目 — v0.6.1 (#15 で db を 4〜13 分の 1 に縮めた後、D、Haiku / Opus)
+
+db の縮小 (vocab 索引の予約を語数の見積もりに) で答えが変わらないことの確認。tokio corpus は当日 bake し直した
+`.scip` (確定率 75.1 → 70.8%、rust-analyzer の出力差。kenning の版とは無関係) で回したので、tokio 課題の差は
+その分も含む。途中で machine の disk が満杯になり Haiku の 3 run が壊れたので、空けてからその 3 本だけ回し直した。
+
+| | 7 回目 (v29) | 8 回目 (v0.6.1) |
+|---|---|---|
+| Opus 正答 | 全課題 100% | 全課題 100% |
+| Opus 費用 (6 課題の中央値の和) / grep 系 | $0.86 / 17.0 回 | $0.83 / 15.3 回 |
+| Opus block-on-park | 3 run とも `io::Driver::turn` まで | 同じ (16〜19 段) |
+| Haiku テスト特定 | 100% (limit 修正後) | 100% (precision 37%) |
+| Haiku 他 4 課題 | 正答 96〜100% / 2 turn | 同じ (add-permits だけ 1 run が 5 turn) |
+| Haiku block-on-park | $0.30 / 46 turn | $0.25 / 49 turn、3 run とも io driver (`turn` / `mio::Poll::poll`) まで |
+
+縮めた db で正答・費用とも 3 run の揺れの内。
+
 ## 読み方 (正直な所)
 
 - **正答は差が無い。** grep だけの Opus も 1,140 件の同名 `spawn` から 25 件を全部当てる。kenning の価値は
