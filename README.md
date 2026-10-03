@@ -112,6 +112,11 @@ kenning search  reachable:0         definitions unreachable from live roots (pub
                                     impls / main / item-level macro args) = deletion candidates.
                                     Finds dead chains and mutually-recursive dead clusters in one pass
 kenning search  attr:<substr>       attribute substring (deprecated / allow(dead_code) / serde / cfg)
+kenning search  unsafe:block self:ref   unsafe:(1|fn|block|0) = unsafe fn / safe fn with an unsafe block (the soundness
+                                    boundary); self:(ref|mut|owned|none) = receiver kind
+kenning search  unsafe:1 reachable-from:Engine::pull_raw   reachability as a facet: reachable-from:X / reaches:X
+                                    AND-ed with any other facet
+kenning uncovered unsafe:1          fn/methods no test reaches statically (candidate edges counted) — unverified unsafe
 kenning search  kind:fn callers:0 namecalls:0 test:0   the one-hop version (in-degree 0). definitions nothing calls (deletion
                                     candidates). callers = confirmed edges, namecalls = name matches.
                                     Add traitimpl:0 for methods — trait impls are called through the trait.

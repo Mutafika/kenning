@@ -93,6 +93,7 @@ fn main() {
         Some("refs") => kenning::cmd_refs(&args[2..]),
         Some("impact") => kenning::cmd_impact(&args[2..]),
         Some("tests") => kenning::cmd_tests(&args[2..]),
+        Some("uncovered") => kenning::cmd_uncovered(&args[2..]),
         Some("impls") => kenning::cmd_impls(&args[2..]),
         Some("across") => kenning::cmd_across(&args[2..]),
         Some("path") => kenning::cmd_path(&args[2..]),
@@ -138,6 +139,7 @@ const USAGE: &str = concat!(
      impact <name> [container] [--confirmed-only]  推移的 callers = 変えると壊れる範囲 (逆 BFS)\n  \
      \u{0020}                              既定は値渡し参照 (map(f)) も辿る — 見落としの方が危険なので\n  \
      tests <name> [container]         これに届くテスト = impact ∩ is_test (回す物の特定)\n  \
+     uncovered [facet...]             どのテストからも届かない fn/method (例: uncovered unsafe:1)\n  \
      impls <trait|type>               go-to-implementation (trait↔型)\n  \
      across <name>                    全 repo 横断: 全 repo db で定義/利用 + repo 跨ぎ精密参照\n  \
      path <from> <to>                 from→to の呼び出し経路 1 本 (前方 BFS)\n  \

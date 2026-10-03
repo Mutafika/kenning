@@ -855,6 +855,8 @@ pub(crate) struct RawSym {
     pub(crate) vis: u32,
     pub(crate) is_async: bool,
     pub(crate) is_test: bool,
+    /// fn / method の (unsafety, 受け手) = (UNSAFE_NAMES, RECV_NAMES) の番号。他の kind は None。
+    pub(crate) fn_facets: Option<(u32, u32)>,
     pub(crate) trait_impl: bool, // trait 実装の method (呼び出し側に名前が出ないので「未使用」に見える)
     pub(crate) module: String,
     pub(crate) container: String,
@@ -897,6 +899,49 @@ pub(crate) fn sig_text(sig: &syn::Signature) -> String {
         s = s.replace(from, to);
     }
     s
+}
+
+/// `unsafe fn` = 1、safe fn で本体に `unsafe { }` がある = 2 (呼び手に unsafe を求めず中で不変条件を守ると
+/// 宣言している健全性の境界)、どちらでもない = 0。本体の中のクロージャ / 入れ子の fn の unsafe block も数える。
+fn unsafety_of(sig: &syn::Signature, body: Option<&syn::Block>) -> u32 {
+    struct Find(bool);
+    impl<'ast> Visit<'ast> for Find {
+        fn visit_expr_unsafe(&mut self, _: &'ast syn::ExprUnsafe) {
+            self.0 = true;
+        }
+    }
+    if sig.unsafety.is_some() {
+        return 1;
+    }
+    let mut f = Find(false);
+    if let Some(b) = body {
+        f.visit_block(b);
+    }
+    if f.0 { 2 } else { 0 }
+}
+
+/// 受け手の種別 (RECV_NAMES の番号)。`self: Pin<&mut Self>` のように型を書いた受け手は、型の中の最初の参照で決める
+/// (参照が無ければ所有 = `Box<Self>` / `Arc<Self>` も 3)。
+fn recv_of(sig: &syn::Signature) -> u32 {
+    let Some(syn::FnArg::Receiver(r)) = sig.inputs.first() else { return 0 };
+    fn first_ref(t: &syn::Type) -> Option<bool> {
+        match t {
+            syn::Type::Reference(rf) => Some(rf.mutability.is_some()),
+            syn::Type::Path(p) => p.path.segments.iter().flat_map(|s| match &s.arguments {
+                syn::PathArguments::AngleBracketed(a) => a.args.iter().collect::<Vec<_>>(),
+                _ => Vec::new(),
+            }).find_map(|a| match a {
+                syn::GenericArgument::Type(t) => first_ref(t),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+    match first_ref(&r.ty) {
+        Some(true) => 2,
+        Some(false) => 1,
+        None => 3,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -942,6 +987,7 @@ pub(crate) fn record_symbol(
         vis,
         is_async,
         is_test,
+        fn_facets: sig.map(|s| (unsafety_of(s, body), recv_of(s))),
         trait_impl: ctx.in_trait_impl,
         module: ctx.module.join("::"),
         container: ctx.container.clone(),
@@ -994,8 +1040,11 @@ pub(crate) fn insert_file_facts(file_t: &Table, sym_t: &Table, acc: &mut Acc, ro
             .and_then(|sc| sc.symbol_at(&rel_path, s.line, s.col))
             .map(str::to_string)
             .unwrap_or_default();
-        let sym_eid = sym_t
-            .insert()
+        let mut ins = sym_t.insert();
+        if let Some((u, r)) = s.fn_facets {
+            ins = ins.set("unsafety", u).set("recv", r); // fn / method だけ (他の kind は列ごと無し = facet に当たらない)
+        }
+        let sym_eid = ins
             .set("name", s.name.as_str())
             .set("kind", s.kind)
             .set("vis", s.vis)

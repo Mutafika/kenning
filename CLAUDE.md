@@ -15,6 +15,7 @@ kenning impls   <trait|type>         # implementations
 kenning text    <term>... [-e] [path:<dir>]  # full-text search (.rs/.md/.toml) with enclosing fn / heading
 kenning outline <path|dir>           # structure of a file / crate without reading it
 kenning search  reachable:0          # unreachable (dead) definitions
+kenning uncovered unsafe:1           # fn/methods no test reaches (facets: unsafe: self: reaches: reachable-from:)
 kenning changes --since HEAD         # semantic diff of uncommitted work (broken calls / sig changes / dead)
 ```
 

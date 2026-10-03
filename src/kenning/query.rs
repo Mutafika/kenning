@@ -703,6 +703,9 @@ pub fn cmd_search(args: &[String]) {
         eprintln!("         reachable:(0|1)  live root (pub/test/trait 実装/main/item マクロ) からの到達可能性");
         eprintln!("         callers:<n> namecalls:<n>  (被呼び出し数。`callers:0 namecalls:0` = 未使用候補)");
         eprintln!("         calls:<name>  (本体で <name> を呼ぶ sym に絞る = grep 不可の edge×facet AND)");
+        eprintln!("         unsafe:(1|fn|block|0)  unsafe fn / 本体に unsafe block の safe fn (健全性の境界)");
+        eprintln!("         self:(ref|mut|owned|none)  受け手 &self / &mut self / self / 無し");
+        eprintln!("         reaches:<X> reachable-from:<X>  X に届く / X から届く sym (impact / callees の推移閉包と AND)");
         return;
     }
     run_search_opt(&o.db, &o.pos, o.limit, false, lexical);
@@ -713,19 +716,23 @@ pub(crate) fn run_search(db_path: &str, facets: &[String], limit: usize, with_si
 }
 
 /// `lexical` = 未使用候補を字句照合で裏取りするか (`--no-lexical` で切る)。
-pub(crate) fn run_search_opt(db_path: &str, facets: &[String], limit: usize, with_sig: bool, lexical: bool) {
-    let Some(db) = open_ro(db_path) else { return };
-    let file_t = db.get_table("file").unwrap();
-    let sym_t = db.get_table("sym").unwrap();
-    let call_t = db.get_table("call").unwrap();
-    let paths = file_paths(&file_t);
+/// `search` の絞り込み (facet の AND)。`uncovered` も同じ facet で候補を絞るので共用。
+pub(crate) struct SearchHits {
+    pub(crate) hits: Vec<EntityId>,
+    pub(crate) applied: Vec<String>,
+    /// 被呼び出し 0 / 到達不能を聞いた (= 「呼ばれていない」の但し書きを出す)。
+    pub(crate) zero_query: bool,
+}
 
+pub(crate) fn search_hits(sym_t: &Table, call_t: &Table, paths: &HashMap<EntityId, String>, facets: &[String], lexical: bool) -> SearchHits {
     let mut q = sym_t.all();
     let mut applied: Vec<String> = Vec::new();
     let mut calls_filters: Vec<String> = Vec::new(); // calls:X = 本体で X を呼ぶ sym に絞る (edge facet)
     // 被呼び出し数の facet。`callers:0 namecalls:0` = 誰からも呼ばれていない = 未使用候補を 1 手で。
     let (mut want_callers, mut want_namecalls): (Option<usize>, Option<usize>) = (None, None);
     let mut want_reachable: Option<bool> = None;
+    let mut unsafe_any = false;
+    let mut reach_filters: Vec<(bool, String)> = Vec::new(); // (前向き?, 起点名) — reaches: / reachable-from: (#7) // unsafe:1 = unsafety が fn か block (等値 facet 2 つの OR なので後で濾す)
     let mut path_filters: Vec<String> = Vec::new(); // path:X = 定義 file の部分一致 (複数は OR)
     let mut attr_filters: Vec<String> = Vec::new(); // attr:X = 属性文字列の部分一致 (複数は AND)
     for f in facets {
@@ -757,6 +764,19 @@ pub(crate) fn run_search_opt(db_path: &str, facets: &[String], limit: usize, wit
             // trait 実装の method は trait 経由で呼ばれるので `callers:0` が構造的に真になる。
             // `traitimpl:0` で外すと「本当に誰も使っていない候補」だけが残る。
             "traitimpl" => { q = q.where_eq("trait_impl", bool01(v)); applied.push(format!("traitimpl={v}")); }
+            // unsafe:1 = unsafe fn か本体に unsafe block / unsafe:fn / unsafe:block (健全性の境界) / unsafe:0 (#6)
+            "unsafe" => match v {
+                "1" => { unsafe_any = true; applied.push("unsafe=1".into()); }
+                _ => match UNSAFE_NAMES.iter().position(|n| *n == v) {
+                    Some(c) => { q = q.where_eq("unsafety", c as u32); applied.push(format!("unsafe={v}")); }
+                    None => eprintln!("# 無視: 未知 unsafe \"{v}\" (1/fn/block/0)"),
+                },
+            },
+            // self:ref (&self) / self:mut (&mut self) / self:owned (self) / self:none (関連関数・自由関数) (#5)
+            "self" => match RECV_NAMES.iter().position(|n| *n == v) {
+                Some(c) => { q = q.where_eq("recv", c as u32); applied.push(format!("self={v}")); }
+                None => eprintln!("# 無視: 未知 self \"{v}\" (ref/mut/owned/none)"),
+            },
             // 属性の部分一致 (`attr:deprecated` / `attr:allow(dead_code)` / `attr:serde`)。
             // 特定属性を特別扱いしないので、廃止予定 API の利用調査にも dead 判定の裏取りにも効く。
             "attr" => { attr_filters.push(v.to_lowercase()); applied.push(format!("attr~{v}")); }
@@ -767,6 +787,10 @@ pub(crate) fn run_search_opt(db_path: &str, facets: &[String], limit: usize, wit
             "container" => { q = q.where_eq("container", v); applied.push(format!("container={v}")); }
             "module" => { q = q.where_eq("module", v); applied.push(format!("module={v}")); }
             "calls" => { calls_filters.push(v.to_string()); applied.push(format!("calls={v}")); }
+            // 到達性を facet に (#7): graph 系の集合と他の facet を AND できる。edge は impact と同じ確定 + 値渡し参照。
+            // reaches:X = X に (推移的に) 届く sym (impact X の集合) / reachable-from:X = X から届く sym (callees の推移閉包)
+            "reaches" => { reach_filters.push((false, v.to_string())); applied.push(format!("reaches={v}")); }
+            "reachable-from" | "from" => { reach_filters.push((true, v.to_string())); applied.push(format!("reachable-from={v}")); }
             // path: は text / read と同じ「file path の部分一致」。ここだけ無いと
             // 「graph.rs の pub fn」が 1 手で出せず grep + search の 2 手になっていた。
             "path" | "file" => { path_filters.push(v.to_string()); applied.push(format!("path={v}")); }
@@ -780,10 +804,13 @@ pub(crate) fn run_search_opt(db_path: &str, facets: &[String], limit: usize, wit
                 }
                 Err(_) => eprintln!("# 無視: {k}:\"{v}\" は数値で (例: {k}:0)"),
             },
-            _ => eprintln!("# 無視: 未知 facet key \"{k}\" (name/kind/vis/async/test/crate/container/module/calls/path)"),
+            _ => eprintln!("# 無視: 未知 facet key \"{k}\" (name/kind/vis/async/test/unsafe/self/crate/container/module/calls/path/reachable/reaches/reachable-from/callers/namecalls/attr/traitimpl)"),
         }
     }
     let mut hits = q.find().unwrap();
+    if unsafe_any {
+        hits.retain(|&e| matches!(num(sym_t.entity(e).get("unsafety")), 1 | 2));
+    }
     for f in &attr_filters {
         hits.retain(|&e| txt(sym_t.entity(e).get("attrs")).to_lowercase().contains(f.as_str()));
     }
@@ -795,7 +822,7 @@ pub(crate) fn run_search_opt(db_path: &str, facets: &[String], limit: usize, wit
     }
     let mut dead_set: HashSet<EntityId> = HashSet::new();
     if let Some(want) = want_reachable {
-        dead_set = dead_by_elimination(&call_t, &sym_t);
+        dead_set = dead_by_elimination(call_t, sym_t);
         hits.retain(|e| dead_set.contains(e) != want);
     }
     // 被呼び出し数で絞る。列は自動 index 済みなので 1 sym あたり等値 count の 2 発で済む
@@ -823,7 +850,7 @@ pub(crate) fn run_search_opt(db_path: &str, facets: &[String], limit: usize, wit
     let unused_query = want_reachable == Some(false) || (want_callers == Some(0) && want_namecalls == Some(0));
     if lexical && unused_query && !hits.is_empty() {
         let before = hits.len();
-        let used = names_used_lexically(&paths, &sym_t, &hits, &dead_set);
+        let used = names_used_lexically(paths, sym_t, &hits, &dead_set);
         hits.retain(|e| !used.contains(&txt(sym_t.entity(*e).get("name"))));
         let dropped = before - hits.len();
         if dropped > 0 {
@@ -842,8 +869,31 @@ pub(crate) fn run_search_opt(db_path: &str, facets: &[String], limit: usize, wit
             .collect();
         hits.retain(|e| callers.contains(e));
     }
+    for (forward, name) in &reach_filters {
+        let defs = defs_of(sym_t, name, None);
+        if defs.is_empty() {
+            eprintln!("# ⚠ {} の起点 \"{name}\" の定義が index に無い → 0 件", if *forward { "reachable-from" } else { "reaches" });
+        }
+        let set: HashSet<EntityId> = if *forward {
+            callee_closure(call_t, &defs)
+        } else {
+            caller_bfs(call_t, sym_t, &defs, true).0.into_iter().flatten().collect()
+        };
+        hits.retain(|e| set.contains(e));
+    }
+    let zero_query = want_callers == Some(0) || want_namecalls == Some(0) || want_reachable == Some(false);
+    SearchHits { hits, applied, zero_query }
+}
+
+pub(crate) fn run_search_opt(db_path: &str, facets: &[String], limit: usize, with_sig: bool, lexical: bool) {
+    let Some(db) = open_ro(db_path) else { return };
+    let file_t = db.get_table("file").unwrap();
+    let sym_t = db.get_table("sym").unwrap();
+    let call_t = db.get_table("call").unwrap();
+    let paths = file_paths(&file_t);
+    let SearchHits { hits, applied, zero_query } = search_hits(&sym_t, &call_t, &paths, facets, lexical);
     println!("# {} symbols  [{}]", hits.len(), applied.join(" "));
-    if want_callers == Some(0) || want_namecalls == Some(0) || want_reachable == Some(false) {
+    if zero_query {
         println!("# 呼ばれていない = この index の中での話。pub は外部 crate から、trait impl の method は動的に呼ばれ得る (test:0 で #[test] を除ける)");
         println!("# const / struct / enum は呼び出し edge を持たないので常に 0 → `kind:fn` / `kind:method` と併用する");
     }

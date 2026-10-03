@@ -2384,3 +2384,65 @@ fn crate_boundaries_limit_module_roots_and_type_visibility() {
     let add = query(&["callers", "add", "Sem", "path:a/src/s.rs"], &db);
     assert!(add.split("候補").next().unwrap_or("").contains("in vis\t"), "別 crate から書けるのは pub の Sem だけ — 確定するはず:\n{add}");
 }
+
+/// #5 / #6 / #7 / #8: `unsafe:` / `self:` facet、到達性 facet (`reaches:` / `reachable-from:`)、`uncovered`。
+#[test]
+fn unsafe_self_reachability_facets_and_uncovered() {
+    let d = tmp();
+    write_fixture(
+        &d,
+        r#"use std::pin::Pin;
+pub struct R;
+impl R {
+    pub fn by_ref(&self) { unsafe { core::hint::unreachable_unchecked() } }
+    pub fn by_mut(&mut self) {}
+    pub fn by_val(self) {}
+    pub fn by_pin(self: Pin<&mut Self>) {}
+    pub fn assoc() -> Self { R }
+}
+pub unsafe fn raw() {}
+pub fn safe_wrapper() { unsafe { raw() } }
+pub fn tested_root() { safe_wrapper(); }
+pub fn untested_unsafe() { unsafe { raw() } }
+pub trait Run { fn run(&self); }
+pub struct S;
+impl Run for S { fn run(&self) { lonely(); } }
+pub fn lonely() {}
+pub fn via_dyn(r: &dyn Run) { r.run(); }
+#[test]
+fn t() { tested_root(); via_dyn(&S); }
+"#,
+    );
+    let db = d.join("k.db");
+    index(&d, &db);
+    let names = |args: &[&str]| -> Vec<String> {
+        let out = query(args, &db);
+        out.lines().filter(|l| l.starts_with('/')).filter_map(|l| l.split('\t').nth(1)).map(|s| s.split("  ").next().unwrap_or("").to_string()).collect()
+    };
+    let has = |v: &[String], n: &str| v.iter().any(|s| s.ends_with(&format!(" {n}")));
+    // #6 unsafe:
+    let fns = names(&["search", "unsafe:fn"]);
+    assert!(has(&fns, "raw") && !has(&fns, "safe_wrapper"), "unsafe:fn: {fns:?}");
+    let blocks = names(&["search", "unsafe:block"]);
+    assert!(has(&blocks, "safe_wrapper") && has(&blocks, "R::by_ref") && !has(&blocks, "raw"), "unsafe:block: {blocks:?}");
+    assert_eq!(names(&["search", "unsafe:1"]).len(), fns.len() + blocks.len(), "unsafe:1 = fn + block");
+    // #5 self:
+    assert!(has(&names(&["search", "self:ref"]), "R::by_ref"));
+    let m = names(&["search", "self:mut"]);
+    assert!(has(&m, "R::by_mut") && has(&m, "R::by_pin"), "Pin<&mut Self> は mut: {m:?}");
+    assert!(has(&names(&["search", "self:owned"]), "R::by_val"));
+    assert!(has(&names(&["search", "kind:method", "self:none"]), "R::assoc"));
+    // #7 到達性 facet
+    let from = names(&["search", "reachable-from:tested_root"]);
+    assert!(has(&from, "safe_wrapper") && has(&from, "raw") && !has(&from, "tested_root"), "reachable-from: {from:?}");
+    let to = names(&["search", "kind:fn", "reaches:raw"]);
+    assert!(has(&to, "safe_wrapper") && has(&to, "tested_root") && has(&to, "untested_unsafe"), "reaches: {to:?}");
+    // #8 uncovered: テストから届かない unsafe = untested_unsafe だけ (raw / safe_wrapper はテストから届く)
+    let out = query(&["uncovered", "unsafe:1"], &db);
+    let strong = out.split("# 候補 edge").next().unwrap_or("");
+    assert!(strong.contains("fn untested_unsafe") && !strong.contains("fn safe_wrapper") && !strong.contains("fn raw "), "uncovered unsafe:1:\n{out}");
+    // dyn 経由 (宣言に確定 → 実装) でしか届かない lonely は「候補経由でのみ」側
+    let all = query(&["uncovered"], &db);
+    let (strong, rest) = all.split_once("# 候補 edge").unwrap_or((&all, ""));
+    assert!(!strong.contains("fn lonely") && rest.contains("fn lonely"), "trait 経由でのみ届く物は候補側:\n{all}");
+}

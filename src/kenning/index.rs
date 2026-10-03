@@ -299,6 +299,8 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         .number("is_async")
         .number("is_test")
         .number("trait_impl")
+        .number("unsafety") // UNSAFE_NAMES (fn / method だけ)
+        .number("recv") // RECV_NAMES (fn / method だけ)
         .ref_to("file", "file")
         .tag("module")
         .tag("crate_")

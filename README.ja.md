@@ -110,6 +110,10 @@ kenning search  kind:method vis:pub container:Engine path:engine.rs   faceted �
 kenning search  reachable:0         live root (pub / #[test] / trait 実装 / main / item 直下マクロ) から
                                     到達しない定義 = 消せる候補。鎖・相互再帰の dead な塊も 1 パスで出る
 kenning search  attr:<substr>       属性の部分一致 (deprecated / allow(dead_code) / serde / cfg(...))
+kenning search  unsafe:block self:ref   unsafe:(1|fn|block|0) = unsafe fn / unsafe block を持つ safe fn (健全性の境界)、
+                                    self:(ref|mut|owned|none) = 受け手の種別
+kenning search  unsafe:1 reachable-from:Engine::pull_raw   到達性を facet に: reachable-from:X / reaches:X を他の facet と AND
+kenning uncovered unsafe:1          どのテストからも静的に届かない fn/method (候補 edge も数えて) = 検証の光が当たっていない unsafe
 kenning search  kind:fn callers:0 namecalls:0 test:0   1 段だけの版 (入次数 0)。
                                     callers=確実 / namecalls=名前一致 の被呼び出し数。
                                     method には traitimpl:0 も付ける (trait 実装は trait 経由で呼ばれる)。

@@ -53,6 +53,12 @@ kenning search  reachable:0         # **消せる候補はこれ**: live root (p
                                     #   使用に数えない。cfg で分岐した同名定義も候補から外す (索引は cfg-blind
                                     #   なので非活性側に流入が付かないため)
 kenning search  attr:deprecated     # 属性の部分一致 (attr:allow(dead_code) / attr:serde / attr:cfg(...))
+kenning search  unsafe:block self:ref  # unsafe:(1|fn|block|0) = unsafe fn / 本体に unsafe block の safe fn (健全性の境界)、
+                                    #   self:(ref|mut|owned|none) = 受け手 (&self / &mut self / self / 無し)
+kenning search  unsafe:1 reachable-from:Engine::pull_raw  # 到達性の facet: reachable-from:X (X から届く) /
+                                    #   reaches:X (X に届く = impact の集合)。確定 + 値渡し参照の edge
+kenning uncovered [facet...]        # どのテストからも静的に届かない fn/method (#8)。候補 edge も数えて届かない物 =
+                                    #   強い主張。候補経由でのみ届く物と trait 実装 (判定外) は別に数える。本命は unsafe:1
 kenning search  kind:fn callers:0 namecalls:0 test:0  # 1 段だけの版 (入次数 0)。定義以外に
                                     #   名前が字句として出る物は自動で除外 (DSL マクロ等。`--no-lexical` で切れる)。(callers=確実 /
                                     #   namecalls=名前一致。確実だけ 0 なら「未解決の呼び出しかも」)。method は

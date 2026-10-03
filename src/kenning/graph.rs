@@ -632,6 +632,25 @@ pub(crate) fn print_wide(sym_t: &Table, wide: &[(EntityId, usize)]) {
     println!("# 候補 caller が {CAND_FANOUT_MAX} 超で辿っていない: {}{more} — 同名定義が多い名前。要るなら `callers <その修飾名>` の⚠", list.join(", "));
 }
 
+/// `defs` から確定 edge で (推移的に) 届く sym (起点は含まない)。`search reachable-from:X` の集合。
+pub(crate) fn callee_closure(call_t: &Table, defs: &[EntityId]) -> HashSet<EntityId> {
+    let mut seen: HashSet<EntityId> = HashSet::new();
+    let mut stack: Vec<EntityId> = defs.to_vec();
+    while let Some(s) = stack.pop() {
+        for c in direct_callees(call_t, s) {
+            if seen.insert(c) {
+                stack.push(c);
+            }
+        }
+    }
+    for d in defs {
+        if !direct_callees(call_t, *d).contains(d) {
+            seen.remove(d); // 再帰していない起点は自分を含めない
+        }
+    }
+    seen
+}
+
 /// s が確定 edge で呼ぶ直接 callee の sym eid 群 (前方)。
 pub(crate) fn direct_callees(call_t: &Table, s: EntityId) -> Vec<EntityId> {
     call_t
@@ -813,6 +832,117 @@ pub(crate) fn run_tests(db_path: &str, name: &str, narrow: &Narrow, limit: usize
         ns.sort();
         println!("# 実行: cargo test -- {}", ns.join(" "));
     }
+}
+
+/// `uncovered [facet...]` — どのテストからも静的に届かない fn / method (#8、`tests` の裏返し)。
+/// 行カバレッジと違って実行は要らない。届くかは**候補 edge も数えて**判定する (名前一致どまりの呼び出し /
+/// trait の宣言 → 実装 / 外部 trait の method → 自前の実装) ので、ここに出る物は「構造上届き得ない」= 強い主張。
+/// 本命は `uncovered unsafe:1` (検証の光が当たっていない unsafe)。
+pub fn cmd_uncovered(args: &[String]) {
+    let o = parse_opts(args);
+    let Some(db) = open_ro(&o.db) else { return };
+    let file_t = db.get_table("file").unwrap();
+    let sym_t = db.get_table("sym").unwrap();
+    let call_t = db.get_table("call").unwrap();
+    let paths = file_paths(&file_t);
+    let SearchHits { hits, applied, .. } = search_hits(&sym_t, &call_t, &paths, &o.pos, false);
+    let (confirmed, any) = test_reach(&call_t, &sym_t);
+    let (mut strong, mut cand_only, mut trait_impls) = (Vec::new(), Vec::new(), 0usize);
+    for e in hits {
+        let er = sym_t.entity(e);
+        if !matches!(num(er.get("kind")), K_FN | K_METHOD) || num(er.get("is_test")) == 1 || confirmed.contains(&e) {
+            continue;
+        }
+        if any.contains(&e) {
+            cand_only.push(e);
+        } else if num(er.get("trait_impl")) == 1 {
+            trait_impls += 1; // Drop::drop / Display::fmt は名前で呼ばれない — 届いたかを決められない
+        } else {
+            strong.push(e);
+        }
+    }
+    let filt = if applied.is_empty() { String::new() } else { format!("  [{}]", applied.join(" ")) };
+    println!("# uncovered: {} sym — どのテストからも静的に届かない (候補 edge も数えて){filt}", strong.len());
+    print_sym_layer(&sym_t, &paths, &strong, o.limit, "");
+    if !cand_only.is_empty() {
+        println!("# 候補 edge 経由でのみ届く: {} sym (確定 edge だけでは届かない — `tests <name>` の [c1] で経路を確認)", cand_only.len());
+        print_sym_layer(&sym_t, &paths, &cand_only, o.limit, "  ");
+    }
+    if trait_impls > 0 {
+        println!("# 判定外: trait 実装の method {trait_impls} sym (暗黙 / 動的に呼ばれ得るので届いたかを決められない。見るなら `search traitimpl:1 ...`)");
+    }
+    println!("# テスト = #[test] / #[tokio::test] 等。pub API は外の crate のテストから呼ばれ得る (この repo の中での話)");
+}
+
+/// 全テストからの前方到達: (確定 edge だけで届く sym, 候補 edge も数えて届く sym)。
+/// 候補 edge は `cand_callers` の向きを逆にした物 — callee_sym の無い呼び出しは同名の fn / method 全部へ
+/// (`[external]` は trait 実装だけへ。`Drop::drop` は名前で呼べないので除く)、trait の宣言に確定した呼び出しは
+/// その trait の実装へ。
+pub(crate) fn test_reach(call_t: &Table, sym_t: &Table) -> (HashSet<EntityId>, HashSet<EntityId>) {
+    let mut by_name: HashMap<String, Vec<EntityId>> = HashMap::new();
+    let mut impls_of: HashMap<(String, String), Vec<EntityId>> = HashMap::new(); // (trait, method) → 実装
+    let mut is_trait_impl: HashSet<EntityId> = HashSet::new();
+    let mut tests: Vec<EntityId> = Vec::new();
+    for e in sym_t.all().find().unwrap_or_default() {
+        let er = sym_t.entity(e);
+        if num(er.get("is_test")) == 1 {
+            tests.push(e);
+        }
+        if !matches!(num(er.get("kind")), K_FN | K_METHOD) {
+            continue;
+        }
+        let name = txt(er.get("name"));
+        let tr = txt(er.get("impl_trait"));
+        if !tr.is_empty() {
+            if tr == "Drop" {
+                continue;
+            }
+            is_trait_impl.insert(e);
+            impls_of.entry((tr, name.clone())).or_default().push(e);
+        }
+        by_name.entry(name).or_default().push(e);
+    }
+    let mut sure: HashMap<EntityId, Vec<EntityId>> = HashMap::new();
+    let mut maybe: HashMap<EntityId, Vec<EntityId>> = HashMap::new();
+    for c in call_t.all().find().unwrap_or_default() {
+        let ce = call_t.entity(c);
+        let caller = ref_of(ce.get("caller"));
+        if caller == 0 {
+            continue;
+        }
+        let name = txt(ce.get("callee"));
+        match ce.get("callee_sym") {
+            Some(Value::Ref(t)) => {
+                sure.entry(caller).or_default().push(t);
+                let te = sym_t.entity(t);
+                if txt(te.get("impl_trait")).is_empty()
+                    && let Some(v) = impls_of.get(&(txt(te.get("container")), name))
+                {
+                    maybe.entry(caller).or_default().extend(v); // trait の宣言に確定 → 動的 dispatch の行き先
+                }
+            }
+            _ => {
+                let ext = num(ce.get("res")) == R_EXTERNAL;
+                if let Some(v) = by_name.get(&name) {
+                    maybe.entry(caller).or_default().extend(v.iter().filter(|d| !ext || is_trait_impl.contains(d)));
+                }
+            }
+        }
+    }
+    let walk = |with_maybe: bool| {
+        let mut seen: HashSet<EntityId> = tests.iter().copied().collect();
+        let mut stack = tests.clone();
+        while let Some(s) = stack.pop() {
+            let next = sure.get(&s).into_iter().flatten().chain(maybe.get(&s).into_iter().flatten().filter(|_| with_maybe));
+            for &n in next {
+                if seen.insert(n) {
+                    stack.push(n);
+                }
+            }
+        }
+        seen
+    };
+    (walk(false), walk(true))
 }
 
 /// `path <from> <to>` — from が to を(推移的に)呼ぶ最短経路を 1 本 (前方 BFS)。
