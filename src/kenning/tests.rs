@@ -29,6 +29,63 @@ use super::*;
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// bake 後に**定義側の file** だけが変わった状態で .scip を使い回して full index (index の版上げの自動焼き直し)
+    /// しても、変わっていない file からの呼び出しを「SCIP は知っているが index に無い = repo の外」にしない。
+    /// 定義の位置は使えないので syn の規準で解く (`defs_of` の caller 3 件が [external] になっていた)。
+    #[test]
+    fn calls_to_definitions_in_files_changed_after_bake_are_not_external() {
+        use protobuf::Message;
+        let d = tmp_tree("stale-scip");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("Cargo.toml"), "[package]\nname = \"fx\"\nversion = \"0.0.0\"\n").unwrap();
+        let lib = "mod g;\nmod c;\n";
+        let g_baked = "pub fn target() {}\n";
+        let c = "pub fn caller() { crate::g::target(); }\n";
+        std::fs::write(d.join("src/lib.rs"), lib).unwrap();
+        std::fs::write(d.join("src/g.rs"), format!("// edited after bake\n{g_baked}")).unwrap(); // 行がずれた
+        std::fs::write(d.join("src/c.rs"), c).unwrap();
+        let root = std::fs::canonicalize(&d).unwrap();
+        let sym = "rust-analyzer cargo fx 0.0.0 g/target().";
+        let occ = |line: i32, col: i32, len: i32, roles: i32| {
+            let mut o = scip::types::Occurrence::new();
+            o.range = vec![line, col, col + len];
+            o.symbol = sym.to_string();
+            o.symbol_roles = roles;
+            o
+        };
+        let doc = |rel: &str, occs: Vec<scip::types::Occurrence>| {
+            let mut doc = scip::types::Document::new();
+            doc.relative_path = rel.to_string();
+            doc.occurrences = occs;
+            doc
+        };
+        let mut idx = scip::types::Index::new();
+        let mut meta = scip::types::Metadata::new();
+        meta.project_root = format!("file://{}", root.display());
+        idx.metadata = protobuf::MessageField::some(meta);
+        let col = c.find("target").unwrap() as i32;
+        idx.documents = vec![doc("src/g.rs", vec![occ(0, 7, 6, 1)]), doc("src/c.rs", vec![occ(0, col, 6, 0)])];
+        let scip_path = root.join("x.scip").to_string_lossy().to_string();
+        std::fs::write(&scip_path, idx.write_to_bytes().unwrap()).unwrap();
+        // bake 時の内容: g.rs は編集前、c.rs / lib.rs は今と同じ
+        let src = [("src/lib.rs", lib), ("src/g.rs", g_baked), ("src/c.rs", c)]
+            .iter()
+            .map(|(p, body)| format!("{}\t{}\n", root.join(p).display(), hash_u32(body)))
+            .collect::<String>();
+        std::fs::write(scip_src_path(&scip_path), src).unwrap();
+        let db = root.join("k.db").to_string_lossy().to_string();
+        run_index(&root.to_string_lossy(), &db, Some(&scip_path));
+        let db = Database::open_readonly(&db).unwrap();
+        let call_t = db.get_table("call").unwrap();
+        let res: Vec<u32> = call_t.where_eq("callee", "target").find().unwrap().into_iter().map(|e| num(call_t.entity(e).get("res"))).collect();
+        assert_eq!(res.len(), 1);
+        assert_ne!(res[0], R_EXTERNAL, "定義側だけ変わった file への呼び出しを repo の外にした");
+        assert!(matches!(res[0], R_UNIQUE | R_QUALIFIED), "syn の規準で確定するはず (res={})", RES_NAMES[res[0] as usize]);
+        drop(call_t);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// #15: extref などの entity 枠があふれた時に vocab まで 4 倍にしない (hash 索引は予約 ≒ disk)。逆も同じ。
     #[test]
     fn retry_widens_only_the_overflowed_capacity() {

@@ -23,6 +23,10 @@ pub(crate) struct Scip {
     pub(crate) stale_docs: u32,
     /// bake 時の内容の記録 (`<scip>.src`) が無かった = どの doc も位置を保証できない (旧版の bake)。
     pub(crate) unverified: bool,
+    /// 捨てた doc (bake 後に変わった file) で**定義**された symbol。位置は使えないが「repo の中の定義」なのは
+    /// 確か — これを知らないと、変わっていない file からの呼び出しが「SCIP は知っているが index に無い = 外」
+    /// に落ちる (定義側の file を編集した後の full 再 index で `defs_of` の caller 3 件が [external] になった)。
+    pub(crate) stale_defs: HashSet<String>,
 }
 
 /// bake 時点の各 .rs の内容 fingerprint の置き場 (`<scip>.src`、行 = `絶対 path<TAB>hash`)。
@@ -80,6 +84,7 @@ impl Scip {
         let mut doc_paths = HashSet::new();
         let recorded = read_scip_src(path);
         let mut stale_docs = 0u32;
+        let mut stale_defs = HashSet::new();
         for doc in &idx.documents {
             let rel = if prefix.is_empty() { doc.relative_path.clone() } else { format!("{prefix}/{}", doc.relative_path) };
             // doc の元ソースを 1 度だけ読み、行→char 列変換に使う。bake 時の内容と違えば doc ごと捨てる
@@ -89,6 +94,9 @@ impl Scip {
             let fresh = matches!((&recorded, &src), (Some(m), Some(s)) if m.get(&canon(&abs)) == Some(&hash_u32(s)));
             if !fresh {
                 stale_docs += 1;
+                stale_defs.extend(
+                    doc.occurrences.iter().filter(|o| o.symbol_roles & 1 != 0 && !o.symbol.starts_with("local ")).map(|o| o.symbol.clone()),
+                );
                 continue;
             }
             doc_paths.insert(rel.clone());
@@ -120,7 +128,7 @@ impl Scip {
                 if recorded.is_none() { "内容の記録が無い旧版の bake" } else { " bake 後に変わった" }
             );
         }
-        Scip { occ, pos2idx, doc_paths, stale_docs, unverified: recorded.is_none() }
+        Scip { occ, pos2idx, doc_paths, stale_docs, unverified: recorded.is_none(), stale_defs }
     }
     /// syn の (rel_path, line 1-indexed, col 0-indexed) を SCIP 鍵に変換して symbol を引く。
     pub(crate) fn symbol_at(&self, rel_path: &str, line1: u32, col0: u32) -> Option<&str> {

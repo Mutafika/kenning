@@ -489,6 +489,8 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
                         scip_ws += 1;
                         (Some(eid), R_UNIQUE) // workspace の定義に確定
                     }
+                    // 定義が bake 後に変わった file にある = repo の中。位置は使えないので syn の規準で解く
+                    None if scip.stale_defs.contains(sym) => resolve_call(cs, &rz),
                     None => {
                         scip_external += 1;
                         (None, R_EXTERNAL) // std/dep/macro (SCIP は知ってるが自 index に無い)
@@ -608,7 +610,8 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
                 None => {
                     // 外部シンボル: std/toolchain と local は捨て、dep crate への参照だけ残す
                     // (cross-repo `across` の材料。std を入れると数十万行のノイズになる)。
-                    if o.symbol.contains("https://github.com/rust-lang/rust/library") || o.symbol.starts_with("local ") {
+                    // bake 後に変わった file で定義された symbol は repo の中 (外部 crate の参照ではない)。
+                    if o.symbol.contains("https://github.com/rust-lang/rust/library") || o.symbol.starts_with("local ") || scip.stale_defs.contains(&o.symbol) {
                         continue;
                     }
                     extref_t
