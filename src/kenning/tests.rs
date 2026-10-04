@@ -245,13 +245,20 @@ use super::*;
             let (r, d) = (root_s.clone(), db.clone());
             std::thread::spawn(move || index_locked(&r, &d, None, !explicit))
         };
-        let settle = || std::thread::sleep(std::time::Duration::from_millis(150));
+        // n 本目の待ち手が lock 待ちに入るまで待つ (時間の見込みでなく合図で)。
+        let settle = |n: usize| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while index::LOCK_WAITERS.lock().unwrap().iter().filter(|p| **p == db).count() < n {
+                assert!(std::time::Instant::now() < deadline, "待ち手が lock 待ちに入らない");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
 
         // 勝った側が現行版を残した → 待った側は焼き直さない
         let held = IndexLock::acquire(&db).unwrap();
         assert!(!held.1, "誰も握っていないのに待ち扱い");
         let t = spawn(false);
-        settle();
+        settle(1);
         assert!(Path::new(&db).is_dir(), "lock 待ち中に db が触られている");
         drop(held);
         assert!(!t.join().unwrap(), "待った側が現行版を再利用せず焼き直している");
@@ -259,7 +266,7 @@ use super::*;
         // 勝った側が失敗して db が無い → 待った側が自分で焼く
         let held = IndexLock::acquire(&db).unwrap();
         let t = spawn(false);
-        settle();
+        settle(2);
         wipe_db(&db);
         drop(held);
         assert!(t.join().unwrap(), "db が無いのに焼いていない");
@@ -268,7 +275,7 @@ use super::*;
         // 明示 run_index (bake / `kenning index`) は待っても必ず焼く
         let held = IndexLock::acquire(&db).unwrap();
         let t = spawn(true);
-        settle();
+        settle(3);
         drop(held);
         assert!(t.join().unwrap(), "明示 index が再利用で済まされている");
         let _ = std::fs::remove_dir_all(&root);

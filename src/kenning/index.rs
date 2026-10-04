@@ -129,6 +129,11 @@ pub(crate) struct IndexLock {
     _held: std::fs::File, // 生きている間 flock を保持する (読まない)
 }
 
+/// テスト用の合図: lock 待ちに入った db path (待ちに入る直前に積む)。sleep で「待ちに入ったはず」と
+/// 見込むと、重い machine でスレッドが lock に届く前に手放して flaky になる。
+#[cfg(test)]
+pub(crate) static LOCK_WAITERS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 impl IndexLock {
     /// 取れるまで待つ。`.1` = 他 process が同じ db を焼いていて完了を待ったか。
     pub(crate) fn acquire(db_path: &str) -> std::io::Result<(IndexLock, bool)> {
@@ -142,6 +147,8 @@ impl IndexLock {
             Ok(()) => Ok((IndexLock { _held: f }, false)),
             Err(std::fs::TryLockError::WouldBlock) => {
                 eprintln!("# 別 process が同じ index を作成中 → 完了を待つ ({db_path})");
+                #[cfg(test)]
+                LOCK_WAITERS.lock().unwrap().push(db_path.to_string());
                 f.lock()?;
                 Ok((IndexLock { _held: f }, true))
             }
