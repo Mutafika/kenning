@@ -287,8 +287,8 @@ call-site detection is complete. The differences: median 58–290 ms per questio
 call-shape patterns the user must enumerate) vs 5–12 ms (indexed), and no name resolution —
 it cannot say *which* definition a call belongs to, and has no impact/path/faceted/cross-repo.
 
-- Index build (syn layer, cold, measured 2026-09-08): enchudb 258 files / 4,110 symbols / 44,382 call-sites in
-  **0.29 s**; tokio 722 files / 7,156 symbols / 38,216 call-sites in **0.33 s**.
+- Index build (syn layer, no SCIP, measured 2026-10-05, median of 3): enchudb 322 files / 5,573 symbols / 65,719
+  call-sites in **0.45 s**; tokio 722 files / 7,723 symbols / 38,428 call-sites in **0.42 s**.
 - Incremental update after a one-file edit: **5–21 ms** (median: 4.8 on kenning's 31 files and
   enchudb's 297, 12.6 on ripgrep's 207, 20.8 on tokio's 770). The per-query freshness check (a
   dir-gated stat-walk) costs 0.8–4.4 ms; a whole `callers` query, process start included, is

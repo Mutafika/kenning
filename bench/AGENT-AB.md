@@ -164,7 +164,7 @@ tuple struct と取り違え得るので確定しない)。syn 層の typed 確�
   本文を読んで決めるしかない。kenning の穴ではない。
 - Opus の grep 系は 6 回目と同じ (16〜17 回、癖)。
 
-### 8 回目 — v0.6.1 (#15 で db を 4〜13 分の 1 に縮めた後、D、Haiku / Opus)
+### 8 回目 — v0.6.1 (#15 で vocab 索引を縮めた後、D、Haiku / Opus)
 
 db の縮小 (vocab 索引の予約を語数の見積もりに) で答えが変わらないことの確認。tokio corpus は当日 bake し直した
 `.scip` (確定率 75.1 → 70.8%、rust-analyzer の出力差。kenning の版とは無関係) で回したので、tokio 課題の差は

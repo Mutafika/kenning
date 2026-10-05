@@ -270,8 +270,8 @@ call-site 検出の独立相互検証。差は: 1 問あたり中央値 58–290
 ユーザーが列挙する 3 つの call 形パターン）vs 5–12 ms（index 済み）、そして名前解決が
 ない — call が*どの*定義に属すか言えず、impact/path/faceted/cross-repo も無い。
 
-- index 構築（syn 層、cold、2026-09-08 実測）: enchudb 258 files / 4,110 symbols / 44,382 call-sites を **0.29 s**、
-  tokio 722 files / 7,156 symbols / 38,216 call-sites を **0.33 s**。
+- index 構築（syn 層・SCIP なし、2026-10-05 実測、3 回の中央値）: enchudb 322 files / 5,573 symbols / 65,719 call-sites を
+  **0.45 s**、tokio 722 files / 7,723 symbols / 38,428 call-sites を **0.42 s**。
 - 1 file 編集後の増分 update: **5–21 ms**（kenning 31 files と enchudb 297 files で 4.8、
   ripgrep 207 files で 12.6、tokio 770 files で 20.8 ms、median）。クエリごとの鮮度チェック
   （dir ゲート付き stat-walk）は 0.8–4.4 ms、`callers` 1 本の全体（プロセス起動込み）は 5–10 ms
