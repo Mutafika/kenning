@@ -48,13 +48,23 @@ index は自己維持する: 古いファイルは毎クエリで検出され（
 ## インストール
 
 ```bash
-cargo install --git https://github.com/Mutafika/kenning
+cargo install --git https://github.com/Mutafika/kenning --locked
 ```
 
 これでインストールは全部 — ストレージエンジン
-[enchudb](https://github.com/Mutafika/enchudb) は pin された git 依存として一緒に入る。
+[enchudb](https://github.com/Mutafika/enchudb) は pin された git 依存として一緒に入る
+（`--locked` で依存を全部テスト済みの版に固定する）。
 精密モード（`bake`）を使うなら rust-analyzer も用意する
 （`rustup component add rust-analyzer`）。
+
+動作環境: Rust 1.89 以上。macOS (arm64) と Linux (Ubuntu, arm64) で確認済み、CI も両方で回している。
+Windows は未確認。
+
+### AI agent から使う
+
+この repo の短い [CLAUDE.md](CLAUDE.md)（~2 KB）を、作業する Rust repo の agent 向け指示
+（`CLAUDE.md`、`AGENTS.md` など）に貼るだけ。agent は repo で `kenning <command>` を打ち、index は
+勝手に作られて更新される。短いまま使う — 実 agent の A/B では 1.5 KB の案内が 15 KB の全文に勝った（下記）。
 
 グローバル git 設定で GitHub の HTTPS URL を SSH に書き換えている場合
 （`url."git@github.com:".insteadOf https://github.com/`、わりと一般的）、cargo 内蔵の
@@ -62,7 +72,7 @@ libgit2 が書き換え後の URL を認証できず、enchudb の fetch が *"n
 succeeded"* で落ちる。fetch を git CLI に委譲すれば書き換えも ssh key もそのまま通る:
 
 ```bash
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/Mutafika/kenning
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/Mutafika/kenning --locked
 ```
 
 kenning と enchudb を並べて開発する場合は、両方を横に checkout して

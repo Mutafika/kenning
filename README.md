@@ -48,12 +48,22 @@ and re-indexed incrementally (5–21 ms for a one-file edit), so answers are nev
 ## Install
 
 ```bash
-cargo install --git https://github.com/Mutafika/kenning
+cargo install --git https://github.com/Mutafika/kenning --locked
 ```
 
 That's the whole install — the [enchudb](https://github.com/Mutafika/enchudb) engine is
-pulled in as a pinned git dependency. For precise mode (`bake`), also have rust-analyzer
-available (`rustup component add rust-analyzer`).
+pulled in as a pinned git dependency (`--locked` keeps every dependency at the tested version).
+For precise mode (`bake`), also have rust-analyzer available (`rustup component add rust-analyzer`).
+
+Requirements: Rust 1.89+. Tested on macOS (arm64) and Linux (Ubuntu, arm64), with CI on both;
+Windows is untested.
+
+### Use it from an AI agent
+
+Paste the short [CLAUDE.md](CLAUDE.md) of this repo (~2 KB) into your agent's instructions
+(`CLAUDE.md`, `AGENTS.md`, …) for the Rust repos you work on. That is all the setup: the
+agent runs `kenning <command>` in the repo, and the index builds and refreshes itself. Keep
+it short — in our agent A/B a 1.5 KB guide beat the full 15 KB one (see below).
 
 If your global git config rewrites GitHub HTTPS URLs to SSH — `url."git@github.com:".insteadOf
 https://github.com/`, a common setup — cargo's bundled libgit2 cannot authenticate the
@@ -61,7 +71,7 @@ rewritten URL and the enchudb fetch fails with *"no authentication methods succe
 Hand the fetch to the git CLI, which honours the rewrite and your ssh key:
 
 ```bash
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/Mutafika/kenning
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/Mutafika/kenning --locked
 ```
 
 Hacking on kenning and enchudb together? Check out both side by side and point the
