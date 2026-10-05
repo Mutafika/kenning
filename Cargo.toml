@@ -80,3 +80,7 @@ protobuf = "3"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+# bake の peak RSS を /usr/bin/time の無い環境 (素の Linux) でも測る (getrusage)。enchudb 経由で既に依存木にある。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

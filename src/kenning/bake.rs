@@ -58,14 +58,24 @@ impl Drop for BakeLock {
     }
 }
 
-/// 空きメモリ (MB)。macOS: memory_pressure の free% × hw.memsize。測れなければ None (ゲートは警告のみ)。
+/// 空きメモリ (MB)。Linux: /proc/meminfo の MemAvailable、macOS: memory_pressure の free% × hw.memsize。
+/// 測れなければ None (ゲートは警告のみ)。
 pub(crate) fn avail_mem_mb() -> Option<u64> {
+    if let Ok(m) = std::fs::read_to_string("/proc/meminfo") {
+        return meminfo_avail_mb(&m);
+    }
     let pct = std::process::Command::new("memory_pressure").arg("-Q").output().ok()?;
     let s = String::from_utf8_lossy(&pct.stdout);
     let pct: u64 = s.lines().find(|l| l.contains("free percentage"))?.trim_end_matches('%').rsplit(' ').next()?.parse().ok()?;
     let total = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok()?;
     let total: u64 = String::from_utf8_lossy(&total.stdout).trim().parse().ok()?;
     Some(total / 1_048_576 * pct / 100)
+}
+
+/// `/proc/meminfo` の `MemAvailable:  12345678 kB` → MB。
+pub(crate) fn meminfo_avail_mb(meminfo: &str) -> Option<u64> {
+    let kb: u64 = meminfo.lines().find_map(|l| l.strip_prefix("MemAvailable:"))?.trim().trim_end_matches("kB").trim().parse().ok()?;
+    Some(kb / 1024)
 }
 
 /// rust-analyzer binary を探す: env KENNING_RA > PATH > rustup toolchain 直。
@@ -98,6 +108,24 @@ pub(crate) fn parse_peak_mb(stats: &str) -> Option<u64> {
         .and_then(|l| l.trim().split(' ').next())
         .and_then(|n| n.parse::<u64>().ok())
         .map(|b| b / 1_048_576)
+}
+
+/// 待ち終えた子 process の peak RSS (MB)。`/usr/bin/time` が無い環境 (素の Linux) 用。bake の子で一番
+/// 大きいのは rust-analyzer なので、それの peak になる。ru_maxrss の単位は Linux が KB、macOS が byte。
+#[cfg(unix)]
+fn children_peak_mb() -> Option<u64> {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: ru は呼び出しの間だけ有効な領域で、getrusage はそこへ書くだけ。
+    if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru) } != 0 {
+        return None;
+    }
+    let raw = ru.ru_maxrss as u64;
+    let mb = if cfg!(target_os = "macos") { raw / 1_048_576 } else { raw / 1024 };
+    (mb > 0).then_some(mb)
+}
+#[cfg(not(unix))]
+fn children_peak_mb() -> Option<u64> {
+    None
 }
 
 /// rust-analyzer の stderr から診断に効く行だけ拾う。
@@ -302,7 +330,7 @@ pub fn run_bake(dir: &str) {
         };
         let errs = std::fs::read_to_string(&err_path).unwrap_or_default();
         let _ = std::fs::remove_file(&err_path);
-        peak_mb = std::fs::read_to_string(&stats_path).ok().and_then(|s| parse_peak_mb(&s)).unwrap_or(0);
+        peak_mb = std::fs::read_to_string(&stats_path).ok().and_then(|s| parse_peak_mb(&s)).or_else(children_peak_mb).unwrap_or(0);
         let Some(status) = status else {
             eprintln!(
                 "# ⚠ rust-analyzer が {timeout}s で終わらない (features={}) → 止めた。optional dep の build script が重いか、proc-macro server の応答待ちで固まった疑い",

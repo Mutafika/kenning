@@ -242,6 +242,14 @@ use super::*;
     /// 直列化が無いと並列 heal が互いの作りかけ directory を消し合う (v10 で顕在化、3 本中 1 本しか
     /// 答えず 1 本は panic、を再現済み)。「他 process が焼いている最中」は IndexLock を手で握って
     /// 再現する (flock は open file description 単位なので、同一 process 内の別 open でも衝突する)。
+    /// Linux の bake 前メモリゲート: MemAvailable (kB) を MB で読む (MemFree ではない = page cache を空きに数える)。
+    #[test]
+    fn meminfo_avail_reads_mem_available_not_mem_free() {
+        let m = "MemTotal:       16000000 kB\nMemFree:          1024000 kB\nMemAvailable:   12288000 kB\nBuffers: 1 kB\n";
+        assert_eq!(meminfo_avail_mb(m), Some(12000));
+        assert_eq!(meminfo_avail_mb("MemTotal: 1 kB\n"), None);
+    }
+
     #[test]
     fn ensure_index_waits_for_concurrent_indexer_and_reuses_its_result() {
         let (root, db) = indexed_fixture("waitreuse");

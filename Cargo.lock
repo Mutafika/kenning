@@ -349,6 +349,7 @@ dependencies = [
  "enchudb",
  "enchudb-oplog",
  "ignore",
+ "libc",
  "proc-macro2",
  "protobuf",
  "quote",
