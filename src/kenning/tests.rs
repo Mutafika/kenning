@@ -4,8 +4,9 @@
 
 use super::*;
 
-    /// enchudb 0.23+ の「満杯は拒否 + 計数」を黙って通さない: vocab を極小にして拒否を起こし、
-    /// assert_no_faults が panic (= 呼び側の capacity リトライ / heal に落ちる) することを固定。
+    /// 満杯の拒否を黙って通さない: vocab を極小にして拒否を起こし、
+    /// (1) enchudb 0.30+ は `commit()` が Err を返す — index の `.unwrap()` の panic 文から vocab だけを広げる
+    /// (2) fault の計数も残り、assert_no_faults が panic する (= 呼び側の capacity リトライ / heal に落ちる)。
     #[test]
     fn assert_no_faults_panics_when_enchudb_rejected_writes() {
         let d = tmp_tree("faults");
@@ -14,9 +15,13 @@ use super::*;
         let mut db = Database::create_growable_with(&path, opts).unwrap();
         db.table("t").tag("v").build().unwrap();
         let t = db.get_table("t").unwrap();
-        for i in 0..64 {
-            t.insert().set("v", format!("value-{i}").as_str()).commit().unwrap(); // Err にならず黙って拒否される
-        }
+        let rejected: Vec<String> =
+            (0..64).filter_map(|i| t.insert().set("v", format!("value-{i}").as_str()).commit().err()).map(|e| format!("{e:?}")).collect();
+        assert!(!rejected.is_empty(), "vocab_max_entries=8 に 64 種を入れて commit が拒否を返さない");
+        let panic_msg = format!("called `Result::unwrap()` on an `Err` value: {}", rejected[0]);
+        let (mut cap, mut voc) = (1, 1);
+        widen_after_failure(&panic_msg, &mut cap, &mut voc);
+        assert_eq!((cap, voc), (1, 4), "commit の拒否 ({panic_msg}) で vocab でなく entity 枠を広げた");
         assert!(db.engine().fault_total() > 0, "vocab_max_entries=8 に 64 種を入れて fault が出ない");
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));

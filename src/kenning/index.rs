@@ -106,9 +106,12 @@ pub(crate) fn index_locked(dir: &str, path: &str, scip_path: Option<&str>, reuse
 }
 
 /// index 失敗の後、**あふれた枠だけ** 4 倍にする (戻り値 = 何を広げたかの表示)。vocab の満杯は fault の名前で
-/// 分かる (`assert_no_faults` の内訳)。それ以外 (entity 枠の枯渇 = enchudb の panic 文) は entity 枠を広げる。
+/// 分かる (`assert_no_faults` の内訳の表示名、または enchudb 0.30+ で `commit()` が返す
+/// `WriteRejected(Fault(VocabSpace))` の unwrap panic = Debug 名)。それ以外 (entity 枠の枯渇 = enchudb の
+/// panic 文) は entity 枠を広げる。
 pub(crate) fn widen_after_failure(msg: &str, cap_mult: &mut u32, vocab_mult: &mut u32) -> String {
-    if msg.contains(FaultKind::VocabSpace.as_str()) {
+    let vocab = FaultKind::VocabSpace;
+    if msg.contains(vocab.as_str()) || msg.contains(&format!("{vocab:?}")) {
         *vocab_mult *= 4;
         format!("vocab {vocab_mult}x")
     } else {

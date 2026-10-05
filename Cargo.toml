@@ -61,8 +61,8 @@ repository = "https://github.com/Mutafika/kenning"
 # 実測 (同一機で交互 A/B、load avg 58 なので wall は不問): full index の peak RSS 不変 (tokio 133 /
 # enchudb corpus 135 / ripgrep 60MB)、callers / impact / search reachable:0 / text の出力は旧版と完全一致。
 # 0.26.12 (Android の flock) / 0.26.13 (test のみ) / 0.26.14 (sync 配布の brick 修正) は kenning と無関係。
-enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.27.0" }
-enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.27.0" }
+enchudb = { git = "https://github.com/Mutafika/enchudb", tag = "v0.30.0" }
+enchudb-oplog = { git = "https://github.com/Mutafika/enchudb", tag = "v0.30.0" }
 # indexer = syn で Rust ソースをパースして symbol/call fact を抽出。
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
