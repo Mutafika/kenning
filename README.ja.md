@@ -23,7 +23,7 @@ kenning callers finish_with_oplog     # これだけ — index は初回クエ�
 AI コーディングエージェントは `grep` ＋ファイル通読でコードを探索する。動くが、token を
 焼く: 「X を変えたら何が壊れる?」は grep とファイル読みの再帰的な連鎖になる — 1 問で
 数百回の tool 呼び出し（enchudb で 1,322 回、下記で実測）。kenning の `impact` は事前に
-焼いたグラフから 1 レスポンスで答える: ベンチ corpus 全体で **29–100× 少ないバイト**、
+焼いたグラフから 1 レスポンスで答える: ベンチ corpus 全体で **32–74× 少ないバイト**、
 そして問いが深いほど差が広がる。
 
 古典的な精密解は language server だが、rust-analyzer は 1 問ずつ答えるために複数 GB の
@@ -211,21 +211,21 @@ kenning あり / なしで各 3 回解かせ、kenning と独立に作った正�
 
 | スイート | tokio (770 files) | ripgrep (207 files) | enchudb (354 files) | 測るもの |
 |---|---|---|---|---|
-| **agent** — 「誰が X を呼ぶ?」の答えまでのバイト数 | **3.2×** 少・13 呼→1 | **1.4×** 少・3 呼→1 | **14.0×** 少・56 呼→1 | 固定 20 問、grep 経路は*楽観*モデル（下限）vs 実際の `callers` 出力 |
-| **beyond** — 「X を変えたら何が壊れる?」(`impact`) | **100×**・1,226 呼→1 | **33×**・12 呼→1 | **76×**・1,322 呼→1 | 推移的 caller BFS: grep 経路 = エージェントが実際にやる手動 grep+read 再帰 |
+| **agent** — 「誰が X を呼ぶ?」の答えまでのバイト数 | **3.6×** 少・13 呼→1 | **1.4×** 少・3 呼→1 | **14.3×** 少・60 呼→1 | 固定 20 問、grep 経路は*楽観*モデル（下限）vs 実際の `callers` 出力 |
+| **beyond** — 「X を変えたら何が壊れる?」(`impact`) | **72×**・1,226 呼→1 | **33×**・12 呼→1 | **74×**・1,372 呼→1 | 推移的 caller BFS: grep 経路 = エージェントが実際にやる手動 grep+read 再帰 |
 | **quality** — ランダム 100 symbol の grep ノイズ | 中央値 33% | 中央値 33% | 中央値 29% | `\bname\(` ヒットのうち def/コメント/文字列/別 symbol の割合 = 無駄に読む行 |
 | **micro** — warm クエリ遅延 | 166 ns – 4.0 µs | 166 ns – 1.6 µs | 125 ns – 3.7 µs | faceted カウント・def 検索・精密逆引き callers |
 
-同じスイートは他の非サーチクエリも測る: `impls`（go-to-implementation）10.6–23.5×、
+同じスイートは他の非サーチクエリも測る: `impls`（go-to-implementation）10.6–23.4×、
 `outline`（読まずに構造把握）ソースなら 5–80×（enchudb の 918 KB の `engine.rs` が 80×、tokio の 143 KB CHANGELOG が 30×。ripgrep の
 `raw.csv` のようなデータファイルは 1,000× 超だが、それは CSV の話であって本品の手柄ではない）、
-`def`（hover: 位置 + シグネチャ + doc 行）6.1–10.6×。faceted クエリは grep 等価物が存在しない — µs で走り、
+`def`（hover: 位置 + シグネチャ + doc 行）6.1–11.6×。faceted クエリは grep 等価物が存在しない — µs で走り、
 比ではなく能力として報告する。パターンに注目: **問いが深いほど差が開く** — ripgrep では
 素の who-calls は 1.4× だが推移的 impact は 33×、grep 経路は BFS の hop ごとに掛け算になるから。
 
 このばらつきが正直な物語: 優位は symbol がどれだけ広く呼ばれるかに比例する。ripgrep —
 小さく、よく分割されていることで有名 — が床（1.4×、中央値の symbol は 3 箇所から呼ばれる）；
-enchudb のホットな symbol（56 箇所）は 14.0×。最悪例は grep が最も溺れる所:
+enchudb のホットな symbol（60 箇所）は 14.3×。最悪例は grep が最も溺れる所:
 enchudb の `tmp` = grep 560 ヒットが、test file ごとに置かれた同名の helper 数十個に散らばる —
 kenning はうち 498 件を、実際に届く helper に確定する。
 
@@ -255,7 +255,7 @@ DB 構築 **68 分 / 9.9 GB / 301 MB** vs 2.4 s / 174 MB / 67 MB；who-calls 1 �
 ファイル**を両エンジンに食わせ、serving 層だけを比べた。取込 8.0 s / 702 MB vs
 0.52 s / 268 MB；find-refs 1 問 ~1.0 s vs 0.011 s（Rosetta で説明できるのはせいぜい
 2–3×）；回答は一致（57 vs 58、def-role のカウント差 — 4 本目の独立相互検証）。facts の
-disk は今は互角（14 MB vs 11.7 MB、2026-10-02 実測。当初の 87 MB の大半はほぼ空の vocab 索引で #15 で解消）。
+disk は今は互角（Glean 14 MB vs 14.2 MB、2026-10-05 に今の (より大きい) enchudb で実測。当初の 87 MB はほぼ空の vocab 索引 (#15) と、APFS が実体化する列の前置きの 0 (enchudb#400、enchudb 0.30 で解消)。2026-10-02 に出した 11.7 MB は測り違い）。
 Glean は live source に join しないので古い SCIP も優雅に serve できる。
 
 CodeQL / Glean の対決は当時の enchudb スナップショット（175 files）での計測で、リリースごとに
@@ -274,9 +274,9 @@ call-site 検出の独立相互検証。差は: 1 問あたり中央値 58–290
   tokio 722 files / 7,156 symbols / 38,216 call-sites を **0.33 s**。
 - 1 file 編集後の増分 update: **5–21 ms**（kenning 31 files と enchudb 297 files で 4.8、
   ripgrep 207 files で 12.6、tokio 770 files で 20.8 ms、median）。クエリごとの鮮度チェック
-  （dir ゲート付き stat-walk）は 0.8–4.4 ms、`callers` 1 本の全体（プロセス起動込み）は 5–12 ms
-  （ベンチ中央値: kenning 5.0、ripgrep 7.2、tokio 11.4、enchudb 12.2 ms。同じ問いを `rg` で引くと
-  7.3–14.6 ms なので速さは互角 — 差は返ってくる中身）。
+  （dir ゲート付き stat-walk）は 0.8–4.4 ms、`callers` 1 本の全体（プロセス起動込み）は 5–10 ms
+  （ベンチ中央値 2026-10-05: kenning 5.3、ripgrep 6.2、tokio 7.8、enchudb 9.6 ms。同じ問いを `rg` で引くと
+  8.3–15.2 ms なので速さは互角 — 差は返ってくる中身）。
 - `bake`: rust-analyzer のバッチ 1 回、その後 **常駐ゼロ**。実測は ripgrep 7 s / 1.1 GB、
   tokio 28 s / 2.0 GB、enchudb 46 s / 2.3 GB。**repo 内確定率**（分母から std / 依存 crate への
   呼び出しを外した率。後述）の前→後: tokio 33.3% → 70.8%、ripgrep 62.0% → 92.7%
@@ -302,7 +302,7 @@ call-site 検出の独立相互検証。差は: 1 問あたり中央値 58–290
 | 推測（解決の偽装をしない） | 確実集合に誤検出ゼロ | エージェントは*候補*バケットの目視が残る |
 | 汎用クエリ言語（Angle/QL） | 学習コストゼロ、µs の答え | 任意の関係クエリ（taint tracking）は CodeQL の領分のまま |
 | Rust 以外の言語（今は） | 深さ（cfg 回収、trait コンテナ） | TS/Python repo では無力；fact schema 自体は言語中立 |
-| disk 節約 | 全列自動 index + syn グラフを SCIP と並走 | 同じ corpus で 11.7 MB vs Glean の 14 MB (#15 の前は 87 MB) |
+| disk 節約 | 全列自動 index + syn グラフを SCIP と並走 | 14.2 MB vs Glean の 14 MB (#15 / enchudb#400 の前は 87 MB) |
 
 **~15 コマンドで足りるのか？** 閉じた集合ではない — エージェントが実際に聞く質問の語彙
 （定義 / 利用者 / 呼ぶ先 / 影響範囲 / 実装 / 経路 / 構造）を dogfooding で育てたもの。実運用で

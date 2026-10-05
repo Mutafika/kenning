@@ -23,7 +23,7 @@ kenning callers finish_with_oplog     # that's it — the index builds itself on
 AI coding agents explore code with `grep` + reading whole files. That works, but it burns
 tokens: *"what breaks if I change X?"* becomes a recursive chain of greps and reads —
 hundreds of tool calls for a single question (1,322 on enchudb, measured below). kenning's
-`impact` answers it from a pre-baked graph in one reply: **29–100× fewer bytes** across the
+`impact` answers it from a pre-baked graph in one reply: **32–74× fewer bytes** across the
 benchmark corpora, and the deeper the question the wider the gap.
 
 The classic precise answer is a language server — but rust-analyzer runs resident at
@@ -222,15 +222,15 @@ A 1.5 KB tool guide beat the full 15 KB CLAUDE.md, which costs input tokens on e
 
 | Suite | tokio (770 files) | ripgrep (207 files) | enchudb (354 files) | What it measures |
 |---|---|---|---|---|
-| **agent** — bytes to answer "who calls X?" | **3.2×** less, 13 calls → 1 | **1.4×** less, 3 calls → 1 | **14.0×** less, 56 calls → 1 | 20 fixed questions, grep-route modeled *optimistically* (lower bound) vs actual `callers` output |
-| **beyond** — "what breaks if I change X?" (`impact`) | **100×**, 1,226 calls → 1 | **33×**, 12 calls → 1 | **76×**, 1,322 calls → 1 | transitive-caller BFS: grep route = the manual grep+read recursion an agent actually performs |
+| **agent** — bytes to answer "who calls X?" | **3.6×** less, 13 calls → 1 | **1.4×** less, 3 calls → 1 | **14.3×** less, 60 calls → 1 | 20 fixed questions, grep-route modeled *optimistically* (lower bound) vs actual `callers` output |
+| **beyond** — "what breaks if I change X?" (`impact`) | **72×**, 1,226 calls → 1 | **33×**, 12 calls → 1 | **74×**, 1,372 calls → 1 | transitive-caller BFS: grep route = the manual grep+read recursion an agent actually performs |
 | **quality** — grep noise on 100 random symbols | median 33 % | median 33 % | median 29 % | share of `\bname\(` hits that are defs/comments/strings/other symbols — rows an agent reads for nothing |
 | **micro** — warm query latency | 166 ns – 4.0 µs | 166 ns – 1.6 µs | 125 ns – 3.7 µs | faceted counts, def lookup, precise reverse-edge callers |
 
 The same suite also measures the other non-search queries: `impls` (go-to-implementation)
-10.6–23.5×, `outline` (structure without reading the file) 5–80× on source files (enchudb's 918 KB
+10.6–23.4×, `outline` (structure without reading the file) 5–80× on source files (enchudb's 918 KB
 `engine.rs` compresses 80×, tokio's 143 KB CHANGELOG 30×; ripgrep's `raw.csv` test data hits
-1,000×+, which says more about CSV than about kenning), `def` (hover: location + signature + doc line) 6.1–10.6×. Faceted queries
+1,000×+, which says more about CSV than about kenning), `def` (hover: location + signature + doc line) 6.1–11.6×. Faceted queries
 have no grep equivalent at all — they run in µs and are reported as a capability, not a ratio.
 Note the pattern:
 **the deeper the question, the bigger the win** — on ripgrep, plain who-calls is only 1.4×
@@ -238,7 +238,7 @@ but transitive impact is 33×, because the grep route multiplies per BFS hop.
 
 The spread is the honest story: the advantage scales with how widely symbols are called.
 ripgrep — small and famously well-factored — is the floor (1.4×, median symbol called from
-3 sites); enchudb's hot symbols (56 sites) show 14.0×. Worst cases are where grep drowns
+3 sites); enchudb's hot symbols (60 sites) show 14.3×. Worst cases are where grep drowns
 hardest: `tmp` in enchudb = 560 grep hits spread over dozens of same-named per-file test helpers —
 kenning pins 498 of them to the helper each call actually reaches.
 
@@ -270,8 +270,9 @@ the purest matchup — Glean's Rust path is also rust-analyzer SCIP, so we fed *
 .scip file** to both engines and compared only the serving layer. Ingest 8.0 s / 702 MB vs
 0.52 s / 268 MB; one find-refs query ~1.0 s vs 0.011 s (Rosetta explains at most 2–3× of that);
 answers agree (57 vs 58, a def-role counting nuance — fourth independent cross-validation).
-Disk is now on par (14 MB vs 11.7 MB, measured 2026-10-02 — the 87 MB in the original run was mostly an
-almost-empty vocab hash index, fixed in #15) and Glean serves stale SCIP gracefully, since it never joins against live source.
+Disk is now on par (Glean 14 MB vs 14.2 MB, measured 2026-10-05 on the current, larger enchudb tree — the 87 MB in the
+original run was an almost-empty vocab hash index (#15) plus column padding that APFS materializes (enchudb#400, fixed in
+enchudb 0.30). The 11.7 MB we published on 2026-10-02 was a mis-measurement) and Glean serves stale SCIP gracefully, since it never joins against live source.
 
 The CodeQL and Glean matchups were measured on an earlier enchudb snapshot (175 files) and are
 not re-run every release — a 68-minute database build is not a per-release cost anyone should pay
@@ -291,8 +292,8 @@ it cannot say *which* definition a call belongs to, and has no impact/path/facet
 - Incremental update after a one-file edit: **5–21 ms** (median: 4.8 on kenning's 31 files and
   enchudb's 297, 12.6 on ripgrep's 207, 20.8 on tokio's 770). The per-query freshness check (a
   dir-gated stat-walk) costs 0.8–4.4 ms; a whole `callers` query, process start included, is
-  5–12 ms (bench medians: kenning 5.0, ripgrep 7.2, tokio 11.4, enchudb 12.2 ms — `rg` answering
-  the same questions takes 7.3–14.6 ms, so the speed is a tie and the difference is what comes back).
+  5–10 ms (bench medians 2026-10-05: kenning 5.3, ripgrep 6.2, tokio 7.8, enchudb 9.6 ms — `rg` answering
+  the same questions takes 8.3–15.2 ms, so the speed is a tie and the difference is what comes back).
 - `bake`: one rust-analyzer batch run, then **zero** resident memory. Measured: ripgrep 7 s /
   1.1 GB, tokio 28 s / 2.0 GB, enchudb 46 s / 2.3 GB. **In-repo confirmation rate** (calls into
   std / dependency crates are excluded from the denominator — see below) before → after:
@@ -319,7 +320,7 @@ Every number above was bought by *not* doing something. The full ledger:
 | Guessing (no fabricated resolution) | zero false positives in the confirmed set | agents still eyeball the *candidates* bucket |
 | A general query language (Angle/QL) | zero learning curve, µs answers | arbitrary relational questions (taint tracking) stay CodeQL's territory |
 | Languages other than Rust (for now) | depth (cfg recovery, trait containers) | useless in a TS/Python repo; the fact schema itself is language-neutral |
-| Disk thrift | every column auto-indexed + syn graph alongside SCIP | 11.7 MB vs Glean's 14 MB for the same corpus (was 87 MB before #15) |
+| Disk thrift | every column auto-indexed + syn graph alongside SCIP | 14.2 MB vs Glean's 14 MB (was 87 MB before #15 / enchudb#400) |
 
 **Are ~15 commands enough?** They are not a closed set — they are the vocabulary of questions
 agents actually ask (definition / users / callees / blast radius / implementations / path /
