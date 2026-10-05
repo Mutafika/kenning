@@ -203,7 +203,7 @@ pub fn cmd_refs(args: &[String]) {
             .iter()
             .map(|&d| (ref_t.where_eq("symbol_sym", Value::Ref(d)).count().unwrap(), d))
             .collect();
-        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        rows.sort_by_key(|a| std::cmp::Reverse(a.0));
         println!("# \"{name}\" は {} 型が定義。定義ごとの参照数:", defs.len());
         for (n, d) in rows.iter().take(o.limit) {
             let er = sym_t.entity(*d);

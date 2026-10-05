@@ -942,7 +942,7 @@ pub(crate) fn run_callers(db_path: &str, name: &str, narrow: &Narrow, limit: usi
             .iter()
             .map(|&d| (call_t.where_eq("callee_sym", Value::Ref(d)).count().unwrap(), d))
             .collect();
-        rows.sort_by(|a, b| b.0.cmp(&a.0)); // caller 数 降順
+        rows.sort_by_key(|a| std::cmp::Reverse(a.0)); // caller 数 降順
         let precise_sum: usize = rows.iter().map(|(n, _)| n).sum();
         println!("# \"{name}\" は {} 型が定義 (同名)。定義ごとの精密 caller 数:", defs.len());
         for (n, d) in rows.iter().take(limit) {
@@ -1718,7 +1718,7 @@ pub fn cmd_stats(args: &[String]) {
         .into_iter()
         .map(|c| (sym_t.where_eq("crate_", c.as_str()).count().unwrap(), c))
         .collect();
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_by_key(|a| std::cmp::Reverse(a.0));
     println!("crates ({}):", rows.len());
     for (n, c) in rows.iter().take(20) {
         println!("  {n:>5}  {c}");

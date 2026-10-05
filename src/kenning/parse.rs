@@ -2077,7 +2077,8 @@ fn recv_type_of(cs: &CallSite, rz: &Resolver) -> Option<(String, bool)> {
                 return None;
             }
             t = ty.name.clone();
-        } else if let Some(m) = s.strip_prefix("m:") {
+        } else {
+            let m = s.strip_prefix("m:")?; // 未知の step → 推定しない
             if wrapped && matches!(m, "as_mut" | "as_ref") {
                 continue; // `Pin<Box<T>>::as_mut()` / `Box::as_ref()` — 中身への参照 (まだ包まれている扱い)
             }
@@ -2088,8 +2089,6 @@ fn recv_type_of(cs: &CallSite, rz: &Resolver) -> Option<(String, bool)> {
             t = ret.name.clone();
             last_ret = Some(ret);
             wrapped = false;
-        } else {
-            return None;
         }
     }
     // 連鎖の最後が戻り値の Result / Option / Vec 等 (`?` を当てていない) なら std の型

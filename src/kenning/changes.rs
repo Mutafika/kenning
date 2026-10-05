@@ -498,7 +498,7 @@ fn prune_by_mtime(dir: &Path, keep: usize) {
         .filter(|e| e.path().extension().is_some_and(|x| x == SNAP_EXT))
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
-    v.sort_by(|a, b| b.0.cmp(&a.0));
+    v.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (_, p) in v.into_iter().skip(keep) {
         let _ = std::fs::remove_file(p);
     }
