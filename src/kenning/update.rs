@@ -36,10 +36,7 @@ pub fn run_update(dir: &str, path: &str) {
 /// `scan`: 走査方式 (UpdateScan)。明示 update は `Walk { trust_mtime: false }` = 全件 hash 照合。
 /// `why`: 自動 update の理由 (quiet 時の 1 行要約に載せる。明示 update は "update")。
 pub(crate) fn update_with_heal(db: Database, dir: &str, path: &str, scan: UpdateScan, why: &str) {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| update_inner(db, dir, scan, why)));
-    std::panic::set_hook(prev);
+    let r = catch_quiet(|| update_inner(db, dir, scan, why));
     match r {
         Err(_) => heal_full_reindex(dir, path, "増分 update 失敗 (旧 schema の index?)"),
         Ok(Some(stale)) => maybe_auto_bake(path, dir, stale),

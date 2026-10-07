@@ -71,12 +71,7 @@ pub(crate) fn index_locked(dir: &str, path: &str, scip_path: Option<&str>, reuse
     let mut vocab_mult = 1u32;
     loop {
         // 予約枯渇 (enchudb の unwrap 失敗) を捕まえるため panic を握りつぶして試行。
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_index_inner(dir, path, &tmp, scip_path, cap_mult, vocab_mult)
-        }));
-        std::panic::set_hook(prev);
+        let r = catch_quiet(|| run_index_inner(dir, path, &tmp, scip_path, cap_mult, vocab_mult));
         // panic payload を人間可読に (握りつぶすと真因が消えるので必ず表示する)。
         let msg_of = |e: Box<dyn std::any::Any + Send>| -> String {
             e.downcast_ref::<String>()

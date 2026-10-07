@@ -23,10 +23,7 @@ use super::*;
         widen_after_failure(&panic_msg, &mut cap, &mut voc);
         assert_eq!((cap, voc), (1, 4), "commit の拒否 ({panic_msg}) で vocab でなく entity 枠を広げた");
         assert!(db.engine().fault_total() > 0, "vocab_max_entries=8 に 64 種を入れて fault が出ない");
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assert_no_faults(&db, "index")));
-        std::panic::set_hook(prev);
+        let r = catch_quiet(|| assert_no_faults(&db, "index"));
         let msg = r.unwrap_err().downcast_ref::<String>().cloned().unwrap_or_default();
         assert!(msg.contains("vocabulary full"), "拒否の内訳が出ない: {msg}");
         drop(t);
@@ -258,10 +255,13 @@ use super::*;
             let (r, d) = (root_s.clone(), db.clone());
             std::thread::spawn(move || index_locked(&r, &d, None, !explicit))
         };
-        // n 本目の待ち手が lock 待ちに入るまで待つ (時間の見込みでなく合図で)。
-        let settle = |n: usize| {
+        // spawn した待ち手が lock 待ちに入るまで待つ (時間の見込みでなく合図で)。
+        // 数は spawn 直前からの増分で見る: この test 自身の acquire も、並行する別 test の fork が
+        // lock fd を exec まで一瞬抱えたせいで待ちになることがあり、絶対数だと 1 本ずれる。
+        let waiters = || index::LOCK_WAITERS.lock().unwrap().iter().filter(|p| **p == db).count();
+        let settle = |base: usize| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            while index::LOCK_WAITERS.lock().unwrap().iter().filter(|p| **p == db).count() < n {
+            while waiters() <= base {
                 assert!(std::time::Instant::now() < deadline, "待ち手が lock 待ちに入らない");
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
@@ -269,17 +269,18 @@ use super::*;
 
         // 勝った側が現行版を残した → 待った側は焼き直さない
         let held = IndexLock::acquire(&db).unwrap();
-        assert!(!held.1, "誰も握っていないのに待ち扱い");
+        let base = waiters();
         let t = spawn(false);
-        settle(1);
+        settle(base);
         assert!(Path::new(&db).is_dir(), "lock 待ち中に db が触られている");
         drop(held);
         assert!(!t.join().unwrap(), "待った側が現行版を再利用せず焼き直している");
 
         // 勝った側が失敗して db が無い → 待った側が自分で焼く
         let held = IndexLock::acquire(&db).unwrap();
+        let base = waiters();
         let t = spawn(false);
-        settle(2);
+        settle(base);
         wipe_db(&db);
         drop(held);
         assert!(t.join().unwrap(), "db が無いのに焼いていない");
@@ -287,8 +288,9 @@ use super::*;
 
         // 明示 run_index (bake / `kenning index`) は待っても必ず焼く
         let held = IndexLock::acquire(&db).unwrap();
+        let base = waiters();
         let t = spawn(true);
-        settle(3);
+        settle(base);
         drop(held);
         assert!(t.join().unwrap(), "明示 index が再利用で済まされている");
         let _ = std::fs::remove_dir_all(&root);

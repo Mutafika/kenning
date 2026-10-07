@@ -94,6 +94,28 @@ pub(crate) fn quiet() -> bool {
     AUTO_QUIET.load(Ordering::Relaxed)
 }
 
+thread_local! {
+    static PANIC_QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// `f` の panic を捕まえ、その panic の表示だけ黙らせる (失敗は呼び手が要約して出す)。
+/// process 全体の hook を差し替えると、同時に走る別 thread (test) の panic 表示まで消える —
+/// 実際に lock 待ちテストの失敗理由が空になった。黙らせるのは呼んだ thread だけ。
+pub(crate) fn catch_quiet<R>(f: impl FnOnce() -> R) -> std::thread::Result<R> {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !PANIC_QUIET.with(|q| q.get()) {
+                prev(info);
+            }
+        }));
+    });
+    let was = PANIC_QUIET.with(|q| q.replace(true));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    PANIC_QUIET.with(|q| q.set(was));
+    r
+}
+
 // ── 名前解決の信頼度 (call.res facet) ──
 // 推測はしない。曖昧・外部は resolved にせず callee_sym を空にする。
 pub(crate) const R_UNRESOLVED: u32 = 0; // 同名の定義が index に無い (外部 crate / std / macro)
