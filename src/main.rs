@@ -124,7 +124,7 @@ const USAGE: &str = concat!(
      bake   [dir]                     rust-analyzer scip を焚いて精密 facts を焼き込む\n  \
      \u{0020}                              (空きメモリゲート + 直列 lock、常駐なし)\n\n\
      探索 (共通 flag: --db <path> / --limit <n>。<name> は Type::method 形でも可):\n  \
-     def <name>                       名前の定義位置 (exact, path:line)\n  \
+     def <name> [container|path:S]    名前の定義位置 (exact, path:line)\n  \
      read <name> [container] [crate:X] [path:S] [--all]  定義本体 (def + Read の 1 手化)。同名は絞るか --all\n  \
      read <path>:<line>               その行を囲む item の本体 (非 Rust は見出し配下)\n  \
      read <path>:<from>-<to>          行範囲 (sed -n 'A,Bp' の代わり)。跨ぐ定義 / 見出しを列挙\n  \
@@ -133,7 +133,7 @@ const USAGE: &str = concat!(
      text <term>... [-e] [--and] [--files] [path:S]  全文検索 + どの関数内かの注釈 (grep superset)\n  \
      \u{0020}                              複数語 OR / --and で全語 AND、-e 正規表現、--files で file 別件数\n  \
      callers <name> [container] [crate:X] [path:S]  精密 who-calls (確実 ∪ 未確定候補を位置付きで)\n  \
-     callees <name> [container]       X が呼ぶ先 (outgoing、callers の鏡)\n  \
+     callees <name> [container|path:S] X が呼ぶ先 (outgoing、callers の鏡)\n  \
      edges                            全 cross-file call edge の集計 TSV (from TAB to TAB count)\n  \
      refs <name> [container]          正確 find-all-refs (要 --scip index、読み書き型も)\n  \
      impact <name> [container] [--confirmed-only]  推移的 callers = 変えると壊れる範囲 (逆 BFS)\n  \

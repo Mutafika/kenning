@@ -87,7 +87,7 @@ enchudb-oplog = { path = "../enchudb/crates/enchudb-oplog" }
 ## コマンド
 
 ```
-kenning def     <name>              定義 + シグネチャ + doc 1 行目 (hover 相当)
+kenning def     <name> [path:S]     定義 + シグネチャ + doc 1 行目 (hover 相当)
                                     (<name> は Type::method 形でも可 — 出力の修飾名をそのまま渡せる)
 kenning read    <name> [container] [crate:X] [path:S] [--all]
                                     定義本体をそのまま出力 (def + ファイル読みを 1 手に)。
@@ -106,7 +106,7 @@ kenning text    <term>... [-e] [--and] [--files] [path:S]
                                     triage)、path: で dir 絞り
 kenning callers <name> [container] [crate:X] [path:S]  who-calls: 確実 ∪ 未確定候補を位置付きで
                                     (同名の自由関数は crate: / path: で絞る)
-kenning callees <name> [container]  呼ぶ先 (outgoing)
+kenning callees <name> [container] [path:S]  呼ぶ先 (outgoing)
 kenning edges                       全 cross-file call edge を集計 (from\tto\tcount TSV)
 kenning refs    <name> [container]  find-all-references (要 bake; 型参照・読み書きも)
 kenning impls   <trait|type>        go-to-implementation (双方向)

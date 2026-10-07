@@ -22,7 +22,7 @@ kenning callers <name>          # 変更があれば自動増分 update (進捗�
 ```
 
 ```bash
-kenning def     <name>              # 定義位置 + シグネチャ + doc 1 行目 (hover 相当)
+kenning def     <name> [path:S]     # 定義位置 + シグネチャ + doc 1 行目 (hover 相当)
 kenning read    <name> [container] [crate:X] [path:S] [--all]  # 定義本体 (def + Read の 1 手化。まずこれ)。同名は絞るか --all
 kenning read    <path>:<line>       # その行を囲む item の本体 (grep -n → sed の代わり)。非 Rust は見出し配下
 kenning read    <path>:<from>-<to>  # 行範囲 (sed -n 'A,Bp' の代わり)。範囲が跨ぐ定義 / 見出しを頭に列挙
@@ -33,7 +33,7 @@ kenning text    <term>... [-e] [--and] [--files] [path:S]  # 全文検索 + 文�
                                     #   -e で正規表現 ((?-i) で大小区別)、`--files` で file 別件数だけ (`rg -c` = 広い語の
                                     #   triage)、path: で dir 絞り。末尾に `# N 件 / M files`
 kenning callers <name> [container] [crate:X] [path:S]  # who-calls: 確実 ∪ 未確定候補を位置付き (同名の自由関数は path: で絞る)
-kenning callees <name> [container]  # X が呼ぶ先 (outgoing)
+kenning callees <name> [container] [path:S]  # X が呼ぶ先 (outgoing)
 kenning edges                       # 全 cross-file call edge の集計 TSV (from TAB to TAB count)。依存グラフの素材
 kenning refs    <name> [container]  # find-all-refs (要 --scip index、型/読み書きも)
 kenning impls   <trait|type>        # go-to-implementation (trait↔型)

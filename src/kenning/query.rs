@@ -275,10 +275,18 @@ pub(crate) fn maybe_auto_update(db_path: &str, auto_root: Option<&Path>) {
 pub fn cmd_def(args: &[String]) {
     let o = parse_opts(args);
     let Some(name) = o.pos.first() else {
-        eprintln!("usage: kenning def <name> [--db P] [--limit N]");
+        eprintln!("usage: kenning def <name> [container] [crate:X] [path:S] [--db P] [--limit N]");
         return;
     };
-    run_search(&o.db, &[format!("name:{name}")], o.limit, true); // def = hover 相当で sig も
+    // 絞り込みは search の facet に渡す (read / callers と同じ書き方、黙って捨てない)。素の語は container。
+    let mut facets = vec![format!("name:{name}")];
+    for a in &o.pos[1..] {
+        facets.push(match a.split_once(':') {
+            Some(("crate" | "path" | "container", _)) => a.clone(),
+            _ => format!("container:{a}"),
+        });
+    }
+    run_search(&o.db, &facets, o.limit, true); // def = hover 相当で sig も
 }
 
 /// `read` — 定義本体をそのまま出す (`def` → Read の 2 手を 1 手に)。3 つの形:
@@ -1136,28 +1144,32 @@ pub(crate) fn run_edges(db_path: &str) {
     eprintln!("# {} file-pair edges ({total} resolved cross-file calls)", rows.len());
 }
 
-/// `callees <name> [container]` — X が呼ぶ先 (outgoing calls、`callers` の鏡)。
+/// `callees <name> [container] [crate:X] [path:S]` — X が呼ぶ先 (outgoing calls、`callers` の鏡)。
 /// rust-analyzer の callHierarchy/outgoingCalls 相当。「この fn は何に依存するか」。
 pub fn cmd_callees(args: &[String]) {
     let o = parse_opts(args);
     let Some(name) = o.pos.first() else {
-        eprintln!("usage: kenning callees <name> [container] [--db P] [--limit N]");
+        eprintln!("usage: kenning callees <name> [container] [crate:X] [path:S] [--db P] [--limit N]");
         return;
     };
-    run_callees(&o.db, name, o.pos.get(1).map(String::as_str), o.limit);
+    run_callees(&o.db, name, &Narrow::parse(&o.pos[1..]), o.limit);
 }
 
-pub(crate) fn run_callees(db_path: &str, name: &str, container: Option<&str>, limit: usize) {
+pub(crate) fn run_callees(db_path: &str, name: &str, narrow: &Narrow, limit: usize) {
     let Some(db) = open_ro(db_path) else { return };
     let file_t = db.get_table("file").unwrap();
     let sym_t = db.get_table("sym").unwrap();
     let call_t = db.get_table("call").unwrap();
     let paths = file_paths(&file_t);
-    let defs = defs_of(&sym_t, name, container);
+    let defs = narrow.defs(&sym_t, &paths, name);
     if defs.is_empty() {
-        println!("# \"{name}\" の定義が index に無い。");
+        println!("# \"{name}\" の定義が index に無い{}。", narrow.describe());
         suggest_similar(&sym_t, &paths, name);
         return;
+    }
+    if defs.len() > 1 {
+        // 同名を混ぜて読まれないよう、定義ごとに分けて出すことを先に言う。
+        println!("# \"{name}\"{} は同名 {} 定義 — 定義ごとに分けて出す (1 つに絞るなら container / crate:X / path:S)", narrow.describe(), defs.len());
     }
     for &d in &defs {
         println!("{}", fmt_sym(&sym_t, &paths, d));

@@ -86,7 +86,7 @@ enchudb-oplog = { path = "../enchudb/crates/enchudb-oplog" }
 ## Commands
 
 ```
-kenning def     <name>              definition + signature + first doc line (hover)
+kenning def     <name> [path:S]     definition + signature + first doc line (hover)
                                     (<name> also takes the qualified `Type::method` form, so a name
                                     kenning prints can be pasted straight back as an argument)
 kenning read    <name> [container] [crate:X] [path:S] [--all]
@@ -106,7 +106,7 @@ kenning text    <term>... [-e] [--and] [--files] [path:S]
                                     hit counts (`rg -c`, for triaging a wide term), path: = dir filter
 kenning callers <name> [container] [crate:X] [path:S]  who-calls: confirmed ∪ unresolved candidates,
                                     with positions (crate: / path: narrow same-named free fns)
-kenning callees <name> [container]  outgoing calls
+kenning callees <name> [container] [path:S]  outgoing calls
 kenning edges                       all cross-file call edges, aggregated (from\tto\tcount TSV)
 kenning refs    <name> [container]  find-all-references (needs bake; includes type refs, read/write)
 kenning impls   <trait|type>        go-to-implementation, both directions

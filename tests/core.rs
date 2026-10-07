@@ -755,6 +755,30 @@ fn qualified_name_from_output_is_accepted_as_input() {
     assert!(out.contains("fn dup"), "明示 container と一致:\n{out}");
 }
 
+/// `callees` / `def` も read / callers と同じ絞り込み (`path:` / `crate:` / container) を受ける。
+/// 以前 `callees X path:S` は `path:S` を container と取り違えて「定義が無い」、`def X path:S` は黙って無視していた。
+/// 同名が残る時は「同名 N 定義を分けて出す」と先に言う (混ぜて 1 つの関数の呼び先と読まれないように)。
+#[test]
+fn callees_and_def_honor_narrowing() {
+    let dir = tmp();
+    write_fixture(&dir, "pub fn dup() {\n    helper();\n}\nfn helper() {}\n");
+    let db = dir.join("k.db");
+    index(&dir, &db);
+
+    let out = query(&["callees", "dup"], &db);
+    assert!(out.contains("同名 3 定義"), "同名を分けて出すと言う:\n{out}");
+    let out = query(&["callees", "dup", "path:other.rs"], &db);
+    assert!(out.contains("helper") && !out.contains("lib.rs") && !out.contains("同名"), "path 絞り:\n{out}");
+    let out = query(&["callees", "dup", "crate:nope"], &db);
+    assert!(out.contains("定義が index に無い (crate=nope)"), "絞った結果が 0 なら絞り込みごと言う:\n{out}");
+
+    let out = query(&["def", "dup", "path:other.rs"], &db);
+    assert!(out.contains("1 symbols") && out.contains("other.rs") && !out.contains("lib.rs"), "def の path 絞り:\n{out}");
+    let out = query(&["def", "dup", "C"], &db);
+    assert!(out.contains("1 symbols") && out.contains("C::dup"), "def の container 絞り:\n{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// macro 引数の中の呼び出し (`println!("{}", target())`) も call graph に入ること。
 /// ここが抜けていると「確実 + 候補 + 別 sym の合計 = 全 caller」という kenning の中心的な約束が破れ、
 /// 実際に使われている関数が `callers 0` に見える (この repo の append_src / role_name がそうだった)。
