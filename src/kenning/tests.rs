@@ -112,6 +112,19 @@ use super::*;
         assert_eq!(suggest_score(&tokens, lname, "sparse"), 2, "十分長い定義名の逆包含は生きる");
     }
 
+    /// 一致は語の頭から (#17)。`run` で p**run**e、`index` で re**index** を候補にしない。camelCase も語に割る。
+    #[test]
+    fn suggestions_match_at_word_starts_only() {
+        assert_eq!(name_words("IndexLock::acquire_now"), vec!["index", "lock", "acquire", "now"]);
+        let t = suggest_tokens("run");
+        assert_eq!(suggest_score(&t, "run", "cache_prunable"), 0, "語の途中の run");
+        assert!(suggest_score(&t, "run", "run_read") > 0);
+        assert!(suggest_score(&t, "run", "RunRead") > 0, "camelCase の語頭");
+        assert_eq!(suggest_score_norm("index", "reindex_all"), 0, "語の途中の index");
+        assert_eq!(suggest_score_norm("index", "index_locked"), 2);
+        assert_eq!(suggest_score_norm("locked", "IndexLocked"), 2, "camelCase の語頭からの包含");
+    }
+
     /// heal 用の最小 repo (Cargo.toml + src/a.rs) を作って index。(root, db) を返す。
     fn indexed_fixture(name: &str) -> (PathBuf, String) {
         let d = tmp_tree(name);

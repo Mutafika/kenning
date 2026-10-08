@@ -1005,17 +1005,23 @@ pub(crate) fn run_callers(db_path: &str, name: &str, narrow: &Narrow, limit: usi
     // ── 候補 (completeness backstop): 名前一致だが callee_sym 未 set (型推論待ち/cfg 非活性/
     //    外部同名)。確実集合の「見逃し」がここに全部いる = grep superset の未確認部分。これを
     //    出すことで Claude は「本当に全 caller を掴んだか」を grep に戻らず目視できる。
-    let mut cand: Vec<(String, u32, String, u32)> = name_matches
+    // self を取らない定義 (自由関数 / 関連関数) にしか当たらないなら、`x.f()` 形の呼び出しは届かない (#16)。
+    // 落とした分は件数で言う (「全 call site はどれかの欄にある」を崩さない)。
+    let unreachable = |c: EntityId| is_method_syntax(&call_t, c) && defs.iter().all(|&d| takes_no_self(&sym_t, d));
+    let unresolved_calls: Vec<EntityId> =
+        name_matches.iter().copied().filter(|&c| !matches!(call_t.entity(c).get("callee_sym"), Some(Value::Ref(_)))).collect();
+    let no_self_skipped = unresolved_calls.iter().filter(|&&c| unreachable(c)).count();
+    let mut cand: Vec<(String, u32, String, u32)> = unresolved_calls
         .iter()
         .copied()
-        .filter(|&c| !matches!(call_t.entity(c).get("callee_sym"), Some(Value::Ref(_))))
+        .filter(|&c| !unreachable(c))
         .map(|c| {
             let (p, ln, cq) = caller_label(c);
             (p, ln, cq, num(call_t.entity(c).get("res")))
         })
         .collect();
     cand.sort();
-    let other = name_total.saturating_sub(precise_sum).saturating_sub(cand.len());
+    let other = name_total.saturating_sub(precise_sum).saturating_sub(cand.len()).saturating_sub(no_self_skipped);
     if !cand.is_empty() {
         println!(
             "  ⚠ {} unresolved candidates (name matches but unconfirmed — check these; anything missing from confirmed is here):",
@@ -1028,6 +1034,9 @@ pub(crate) fn run_callers(db_path: &str, name: &str, narrow: &Narrow, limit: usi
         if cand.len() > limit {
             println!("    {}", omitted(cand.len(), limit));
         }
+    }
+    if no_self_skipped > 0 {
+        println!("  ↳ {no_self_skipped} `x.{bare}()` calls left out — `{bare}` takes no self, so method syntax can't reach it");
     }
     // 別の同名 sym に確定した分も、行き先の定義ごとの件数を出す。件数だけだと「本当に全部か」を
     // grep で数え直すことになる (実 agent の A/B で kenning ありでも grep に戻った一番の理由)。
@@ -1052,8 +1061,9 @@ pub(crate) fn run_callers(db_path: &str, name: &str, narrow: &Narrow, limit: usi
             println!("    … (+{} definitions omitted)", to.len() - limit);
         }
     }
+    let (skipped, buckets) = if no_self_skipped > 0 { (format!(" + {no_self_skipped} method-syntax (can't reach it)"), 4) } else { (String::new(), 3) };
     println!(
-        "# {name_total} call sites named `{bare}` = {precise_sum} confirmed + {} unresolved candidates + {other} resolved to another same-named symbol — every call site of `{bare}` is in one of these 3 (no need to re-count with grep)",
+        "# {name_total} call sites named `{bare}` = {precise_sum} confirmed + {} unresolved candidates + {other} resolved to another same-named symbol{skipped} — every call site of `{bare}` is in one of these {buckets} (no need to re-count with grep)",
         cand.len()
     );
     // 0 件で終わる trait 実装 method は「使われていない」ではなく **trait 経由で呼ばれる** だけ。

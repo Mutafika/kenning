@@ -153,6 +153,9 @@ own gate) / while another bake runs.
   method of that name, it is not confirmed (so std/dep `.next()` / `.len()` aren't wrongly confirmed to your own
   definition). Confirmed are the ones whose receiver type is written in the source (`self` / argument and `let` types /
   return values of `T::new()` and free functions / through `Box::pin(x)`) and whatever SCIP answered. Baking shrinks this.
+  A definition that takes no `self` (a free fn, or an associated fn like `S::make`) can't be called as `x.f()`, so those
+  calls are left out of its candidates (and of `impact` / `tests` candidate paths) and reported as a 4th bucket:
+  "N `x.f()` calls left out … method syntax can't reach it".
 - `[external]` on a candidate = SCIP or name matching decided the callee is outside the repo (std / a dependency crate).
   Even if the repo has a same-named definition, that call is something else.
 - `[value-ref]` on a candidate = a reference passing the function as a value (`map(f)` / `&f` / `Some(f)` / `S { f: g }` /

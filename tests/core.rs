@@ -796,6 +796,49 @@ fn free_fn_is_selectable_next_to_a_same_named_method() {
     assert!(out.contains("·::dup") && out.contains("`-` = free fn"), "一覧が自由関数の印と選び方を出す:\n{out}");
 }
 
+/// `x.f()` / `self.f()` の形の呼び出しは self を取らない定義 (自由関数 / `S::make` 形の関連関数) に届かない (#16)。
+/// 候補から外し、件数は 4 つ目の欄で言う。tests の候補経路でも同じ。self を取る method への候補は残す。
+#[test]
+fn method_syntax_calls_are_not_candidates_for_fns_without_self() {
+    let dir = tmp();
+    write_fixture(
+        &dir,
+        "pub fn flat() {}\n\
+         pub struct S;\n\
+         impl S {\n    pub fn make() -> S { S }\n    pub fn go(&self) {}\n}\n\
+         pub fn user(v: Vec<Vec<u8>>, s: std::sync::Arc<S>) {\n    let _ = v.into_iter().flat();\n    let _ = s.make();\n    s.go();\n}\n\
+         #[test]\nfn only_method_syntax() {\n    user(Vec::new(), std::sync::Arc::new(S));\n    let w: Vec<u8> = Vec::new();\n    w.iter().flat();\n}\n",
+    );
+    let db = dir.join("k.db");
+    index(&dir, &db);
+
+    let out = query(&["callers", "flat"], &db);
+    assert!(!out.contains("⚠") && out.contains("0 unresolved candidates"), "自由関数に x.flat() が候補で残る:\n{out}");
+    assert!(out.contains("`x.flat()` calls left out") && out.contains("one of these 4"), "落とした件数を言う:\n{out}");
+    let out = query(&["callers", "make"], &db);
+    assert!(out.contains("`x.make()` calls left out"), "self を取らない関連関数にも効く:\n{out}");
+    let out = query(&["callers", "go"], &db);
+    assert!(!out.contains("left out") && out.contains("one of these 3"), "self を取る method は従来どおり:\n{out}");
+    let out = query(&["tests", "flat"], &db);
+    assert!(!out.contains("only_method_syntax"), "x.flat() しか呼ばない test が候補経路で自由関数に届いた:\n{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 名前が無い時の Similar names (#17): 語の途中の一致 (p**run**e) は出さず、test 関数は後ろ、同点なら短い名前が先。
+#[test]
+fn similar_names_prefer_word_starts_non_tests_and_short_names() {
+    let dir = tmp();
+    write_fixture(&dir, "pub fn prune_all() {}\npub fn run_longer_name() {}\npub fn run_one() {}\n#[test]\nfn run_the_whole_case() {}\n");
+    let db = dir.join("k.db");
+    index(&dir, &db);
+    let out = query(&["def", "run"], &db);
+    assert!(!out.contains("prune_all"), "語の途中の一致が出た:\n{out}");
+    let pos = |n: &str| out.find(n).unwrap_or_else(|| panic!("{n} が無い:\n{out}"));
+    assert!(pos("run_one") < pos("run_longer_name"), "同点なら短い名前が先:\n{out}");
+    assert!(pos("run_longer_name") < pos("run_the_whole_case"), "同点なら test 関数は後ろ:\n{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// macro 引数の中の呼び出し (`println!("{}", target())`) も call graph に入ること。
 /// ここが抜けていると「確実 + 候補 + 別 sym の合計 = 全 caller」という kenning の中心的な約束が破れ、
 /// 実際に使われている関数が `callers 0` に見える (この repo の append_src / role_name がそうだった)。

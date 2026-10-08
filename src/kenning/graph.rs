@@ -260,12 +260,42 @@ pub(crate) fn suggest_tokens(lname: &str) -> Vec<&str> {
     lname.split(|c: char| c == '_' || !c.is_alphanumeric()).filter(|t| t.len() >= SUGGEST_MIN_TOKEN).collect()
 }
 
-/// 定義名 `ldn` (小文字) が問い合わせ `lname` にどれだけ近いか。一致 token 数 + substring 全体一致 1 点。
-/// 逆包含 (`lname` が `ldn` を含む) は `ldn` が十分長い時だけ — 短い定義名は何にでも含まれる
+/// 名前を語に割る (`_` / 記号 / camelCase の境目、小文字化)。`cache_ls_and_prune` → cache / ls / and / prune。
+pub(crate) fn name_words(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for c in s.chars() {
+        if !c.is_alphanumeric() {
+            if !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
+            prev_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && prev_lower && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        prev_lower = c.is_lowercase() || c.is_ascii_digit();
+        cur.extend(c.to_lowercase());
+    }
+    if !cur.is_empty() { out.push(cur); }
+    out
+}
+
+/// `hay` の語の並びの中に、`needle` が**語の頭から**現れるか (`_` 区切りで比べる)。
+/// 語の途中の一致 (`run` → p**run**e) は数えない (#17: 長い test 名が候補の上位を占めていた)。
+fn at_word_start(hay: &[String], needle: &str) -> bool {
+    !needle.is_empty() && format!("_{}", hay.join("_")).contains(&format!("_{needle}"))
+}
+
+/// 定義名 `dn` が問い合わせ `lname` (小文字) にどれだけ近いか。語の頭で一致する token 数 + 全体が語の頭から
+/// 現れれば 1 点。逆包含 (`lname` が `dn` を含む) は `dn` が十分長い時だけ — 短い定義名は何にでも含まれる
 /// (`copy_sparse` の候補に `_` や `Op` が出ていた)。
-pub(crate) fn suggest_score(tokens: &[&str], lname: &str, ldn: &str) -> u32 {
-    let mut score = tokens.iter().filter(|t| ldn.contains(**t)).count() as u32;
-    if ldn.contains(lname) || (ldn.len() >= SUGGEST_MIN_TOKEN && lname.contains(ldn)) {
+pub(crate) fn suggest_score(tokens: &[&str], lname: &str, dn: &str) -> u32 {
+    let words = name_words(dn);
+    let mut score = tokens.iter().filter(|t| words.iter().any(|w| w.starts_with(**t))).count() as u32;
+    let qwords = name_words(lname);
+    let whole = qwords.join("_");
+    if at_word_start(&words, &whole) || (words.join("").len() >= SUGGEST_MIN_TOKEN && at_word_start(&qwords, &words.join("_"))) {
         score += 1;
     }
     score
@@ -306,7 +336,9 @@ pub(crate) fn edit_within(a: &str, b: &str, max: usize) -> bool {
 /// 次に typo、最後に包含。**綴りがほぼ一致する名前は、部分一致の山より必ず上に出す** —
 /// 同点だと `run_index_iner` の 1 位が (名前順で) `index` になり、正解が埋もれた。
 /// typo 許容は短い名前ほど狭い (`cmd_refs` のような別 symbol を候補に混ぜないため)。
-pub(crate) fn suggest_score_norm(qkey: &str, dkey: &str) -> u32 {
+pub(crate) fn suggest_score_norm(q: &str, d: &str) -> u32 {
+    let (qkey, dkey) = (norm_key(q), norm_key(d));
+    let (qkey, dkey) = (qkey.as_str(), dkey.as_str());
     if qkey.is_empty() || dkey.is_empty() {
         return 0;
     }
@@ -317,9 +349,12 @@ pub(crate) fn suggest_score_norm(qkey: &str, dkey: &str) -> u32 {
     if edit_within(qkey, dkey, max) {
         return 5; // cmd_reed → cmd_read
     }
-    let (long, short) = if qkey.len() >= dkey.len() { (qkey, dkey) } else { (dkey, qkey) };
-    if short.len() >= SUGGEST_MIN_TOKEN && long.contains(short) {
-        return 2; // 部分名 (readtextfile ⊃ readtext)
+    // 部分名 (readtextfile ⊃ readtext)。包含は長い側の語の頭から始まる時だけ (prune ⊅ run、#17)。
+    let (long, short) = if qkey.len() >= dkey.len() { (q, dkey) } else { (d, qkey) };
+    let starts: Vec<usize> = name_words(long).iter().scan(0, |at, w| { let s = *at; *at += w.len(); Some(s) }).collect();
+    let lkey = norm_key(long);
+    if short.len() >= SUGGEST_MIN_TOKEN && lkey.match_indices(short).any(|(i, _)| starts.contains(&i)) {
+        return 2;
     }
     0
 }
@@ -327,13 +362,11 @@ pub(crate) fn suggest_score_norm(qkey: &str, dkey: &str) -> u32 {
 pub(crate) fn suggest_similar(sym_t: &Table, paths: &HashMap<EntityId, String>, name: &str) {
     let lname = name.to_lowercase();
     let tokens = suggest_tokens(&lname);
-    let qkey = norm_key(name);
     let mut best: HashMap<String, (u32, EntityId)> = HashMap::new(); // name → (score, 代表 eid)
     for e in sym_t.all().find().unwrap() {
         let dn = txt(sym_t.entity(e).get("name"));
-        let ldn = dn.to_lowercase();
         // token 層 (部分名) + 正規化層 (書き方違い / typo) の合算。片方が 0 でも他方で救う。
-        let score = suggest_score(&tokens, &lname, &ldn) + suggest_score_norm(&qkey, &norm_key(&dn));
+        let score = suggest_score(&tokens, &lname, &dn) + suggest_score_norm(name, &dn);
         if score > 0 {
             let slot = best.entry(dn).or_insert((0, e));
             if score > slot.0 { *slot = (score, e); }
@@ -344,7 +377,9 @@ pub(crate) fn suggest_similar(sym_t: &Table, paths: &HashMap<EntityId, String>, 
         return;
     }
     let mut ranked: Vec<(u32, String, EntityId)> = best.into_iter().map(|(n, (s, e))| (s, n, e)).collect();
-    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1))); // score 降順 → 名前昇順
+    // score 降順 → 非 test を先 (名前を引く時はたいてい本体を探している) → 短い名前を先 → 名前昇順 (#17)
+    let is_test = |e: EntityId| num(sym_t.entity(e).get("is_test")) == 1;
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(is_test(a.2).cmp(&is_test(b.2))).then(a.1.len().cmp(&b.1.len())).then(a.1.cmp(&b.1)));
     println!("# no \"{name}\". Similar names:");
     for (_, n, e) in ranked.iter().take(8) {
         let er = sym_t.entity(*e);
@@ -364,6 +399,17 @@ pub(crate) fn split_qualified(s: &str) -> (&str, Option<&str>) {
         Some((c, n)) if !c.is_empty() && !n.is_empty() => (n, Some(c.rsplit("::").next().unwrap_or(c))),
         _ => (s, None),
     }
+}
+
+/// self を取らない fn / method (自由関数 / `Type::new` 形の関連関数)。`x.f()` / `self.f()` の形では呼べない (#16)。
+/// recv 列が無い (旧 index / fn 以外) なら false = 分からないので候補から外さない。
+pub(crate) fn takes_no_self(sym_t: &Table, d: EntityId) -> bool {
+    let r = sym_t.entity(d).get("recv");
+    r.is_some() && num(r) == 0
+}
+/// 呼び出しが method 構文 (`x.f()` / `self.f()`) か。
+pub(crate) fn is_method_syntax(call_t: &Table, c: EntityId) -> bool {
+    num(call_t.entity(c).get("is_method")) >= M_RECV
 }
 
 /// 自由関数 (container 無し) の表記。出力 (`callers` の同名一覧の `·::f`) と入力で同じ印を使う。
@@ -406,6 +452,7 @@ pub(crate) fn dead_by_elimination(call_t: &Table, sym_t: &Table) -> HashSet<Enti
     for &e in &all_syms {
         by_name.entry(txt(sym_t.entity(e).get("name"))).or_default().push(e);
     }
+    let no_self: HashSet<EntityId> = all_syms.iter().copied().filter(|&e| takes_no_self(sym_t, e)).collect();
     // call 表を 1 パスして「誰から誰へ」を作る (node ごとに query すると repo 規模で効く)。
     // caller 無し (item 直下のマクロ) は永久 root 扱い = そこからの流入は常に live。
     let mut inbound: HashMap<EntityId, Vec<Option<EntityId>>> = HashMap::new(); // 流入先 → 流入元 (None = item 直下)
@@ -419,8 +466,11 @@ pub(crate) fn dead_by_elimination(call_t: &Table, sym_t: &Table) -> HashSet<Enti
         match er.get("callee_sym") {
             Some(Value::Ref(t)) => inbound.entry(t).or_default().push(from),
             _ => {
+                let method = is_method_syntax(call_t, c);
                 for &t in by_name.get(&txt(er.get("callee"))).map(|v| v.as_slice()).unwrap_or(&[]) {
-                    inbound.entry(t).or_default().push(from);
+                    if !(method && no_self.contains(&t)) {
+                        inbound.entry(t).or_default().push(from);
+                    }
                 }
             }
         }
@@ -567,6 +617,7 @@ pub(crate) fn cand_callers(call_t: &Table, sym_t: &Table, s: EntityId) -> Vec<En
     if tr == "Drop" {
         return Vec::new(); // `x.drop()` は書けない (E0040)。`drop(x)` は std::mem::drop
     }
+    let no_self = takes_no_self(sym_t, s);
     let mut out: Vec<EntityId> = call_t
         .where_eq("callee", name.as_str())
         .find()
@@ -574,7 +625,13 @@ pub(crate) fn cand_callers(call_t: &Table, sym_t: &Table, s: EntityId) -> Vec<En
         .into_iter()
         .filter(|&c| {
             let ce = call_t.entity(c);
-            !matches!(ce.get("callee_sym"), Some(Value::Ref(_))) && (num(ce.get("res")) != R_EXTERNAL || !tr.is_empty())
+            if matches!(ce.get("callee_sym"), Some(Value::Ref(_))) {
+                return false; // 確定済み
+            }
+            if num(ce.get("res")) == R_EXTERNAL && tr.is_empty() {
+                return false; // 外部に落ちた呼び出しが候補になるのは trait 実装だけ
+            }
+            !no_self || !is_method_syntax(call_t, c)
         })
         .map(|c| ref_of(call_t.entity(c).get("caller")))
         .collect();
@@ -890,6 +947,7 @@ pub(crate) fn test_reach(call_t: &Table, sym_t: &Table) -> (HashSet<EntityId>, H
     let mut by_name: HashMap<String, Vec<EntityId>> = HashMap::new();
     let mut impls_of: HashMap<(String, String), Vec<EntityId>> = HashMap::new(); // (trait, method) → 実装
     let mut is_trait_impl: HashSet<EntityId> = HashSet::new();
+    let mut no_self: HashSet<EntityId> = HashSet::new();
     let mut tests: Vec<EntityId> = Vec::new();
     for e in sym_t.all().find().unwrap_or_default() {
         let er = sym_t.entity(e);
@@ -898,6 +956,9 @@ pub(crate) fn test_reach(call_t: &Table, sym_t: &Table) -> (HashSet<EntityId>, H
         }
         if !matches!(num(er.get("kind")), K_FN | K_METHOD) {
             continue;
+        }
+        if takes_no_self(sym_t, e) {
+            no_self.insert(e);
         }
         let name = txt(er.get("name"));
         let tr = txt(er.get("impl_trait"));
@@ -931,8 +992,12 @@ pub(crate) fn test_reach(call_t: &Table, sym_t: &Table) -> (HashSet<EntityId>, H
             }
             _ => {
                 let ext = num(ce.get("res")) == R_EXTERNAL;
+                let method = is_method_syntax(call_t, c);
                 if let Some(v) = by_name.get(&name) {
-                    maybe.entry(caller).or_default().extend(v.iter().filter(|d| !ext || is_trait_impl.contains(d)));
+                    maybe
+                        .entry(caller)
+                        .or_default()
+                        .extend(v.iter().filter(|d| (!ext || is_trait_impl.contains(d)) && !(method && no_self.contains(d))));
                 }
             }
         }
