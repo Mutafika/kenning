@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 D="${KENNING_BENCH_DIR:-$HOME/.cache/kenning-bench}"
 CODEQL="${KENNING_CODEQL:-codeql}"
 OUT=bench/VS-CODEQL.md
-"$CODEQL" version >/dev/null 2>&1 || { echo "codeql CLI が無い (KENNING_CODEQL で指定)" >&2; exit 1; }
+"$CODEQL" version >/dev/null 2>&1 || { echo "codeql CLI not found (set KENNING_CODEQL)" >&2; exit 1; }
 
 measure() { # $1=出力ファイル, $2...=cmd → "wall_s peak_mb" (stage ごとに別ファイル = 上書き事故防止)
     out="$1"; shift
@@ -22,24 +22,24 @@ REPO=../enchudb
 QLDB="$D/codeql-enchudb-db"
 
 if [ -d "$QLDB" ]; then
-    echo "== db 既存 → 構築 skip (作り直しは rm -rf $QLDB) ==" >&2
-    ql_wall="(既存)"; ql_peak="-"
+    echo "== db exists → skipping build (rm -rf $QLDB to rebuild) ==" >&2
+    ql_wall="(existing)"; ql_peak="-"
 else
-    echo "== codeql database create (enchudb) — RA 系の重さ、数十分かかる ==" >&2
+    echo "== codeql database create (enchudb) — RA-class weight, takes tens of minutes ==" >&2
     set -- $(measure /tmp/vsql-create.txt "$CODEQL" database create "$QLDB" --language=rust --source-root "$REPO" --overwrite)
     ql_wall=$1; ql_peak=$2
 fi
 ql_disk=$(du -sh "$QLDB" 2>/dev/null | awk '{print $1}')
 
-echo "== codeql query run (who-calls) 初回 ==" >&2
+echo "== codeql query run (who-calls) first run ==" >&2
 set -- $(measure /tmp/vsql-q1.txt "$CODEQL" query run --database="$QLDB" bench/codeql/who-calls.ql)
 q_wall=$1; q_peak=$2
-echo "== 同 2 回目 (cache 済) ==" >&2
+echo "== same, second run (cached) ==" >&2
 set -- $(measure /tmp/vsql-q2.txt "$CODEQL" query run --database="$QLDB" bench/codeql/who-calls.ql)
 q2_wall=$1; q2_peak=$2
 n_rows=$(grep -c '^|' /tmp/vsql-q2.txt 2>/dev/null || echo "?")
 
-echo "== kenning 側 (同条件) ==" >&2
+echo "== kenning side (same conditions) ==" >&2
 tmpdb="$D/vsql-cs.db"
 rm -rf "$tmpdb"*  # db は v10 以降 directory
 set -- $(measure /tmp/vsql-cs.txt kenning index "$REPO" "$tmpdb")
@@ -51,23 +51,23 @@ cs_q_ms=$(python3 -c "import time; print(f'{(time.time()-$t0)*1000:.0f}')")
 rm -rf "$tmpdb"*  # db は v10 以降 directory
 
 {
-    echo "# vs CodeQL — 「code as data」本家との頭対頭 (corpus: enchudb)"
+    echo "# vs CodeQL — head to head with the original \"code as data\" (corpus: enchudb)"
     echo
-    echo "CodeQL の Rust extractor は rust-analyzer ベース = 構図 (解析を facts に焼いて別層で引く) は"
-    echo "本品と同じ。違いは規模と目的: CodeQL はセキュリティ解析向けの汎用リレーショナル QL、"
-    echo "本品は agent のナビゲーション専用に薄く速く。"
+    echo "CodeQL's Rust extractor is built on rust-analyzer = the same architecture as kenning (bake the analysis into facts, query them from a separate layer)."
+    echo "The difference is scale and purpose: CodeQL is a general relational QL for security analysis;"
+    echo "kenning is thin and fast, purely for agent navigation."
     echo
-    echo "| 段階 | CodeQL | kenning (syn 層) |"
+    echo "| stage | CodeQL | kenning (syn layer) |"
     echo "|---|---|---|"
-    echo "| facts 構築 wall | ${ql_wall}s | ${cs_wall}s |"
-    echo "| 構築 peak RSS | ${ql_peak} MB | ${cs_peak} MB |"
-    echo "| facts ディスク | ${ql_disk} | ${cs_disk} |"
-    echo "| 「who calls flush_writes?」初回 | ${q_wall}s (QL コンパイル込み, ${n_rows} rows) | ${cs_q_ms} ms (CLI 起動込み) |"
-    echo "| 同、2 回目 (cache 済) | ${q2_wall}s / ${q2_peak} MB | ${cs_q_ms} ms (毎回) |"
+    echo "| facts build wall | ${ql_wall}s | ${cs_wall}s |"
+    echo "| build peak RSS | ${ql_peak} MB | ${cs_peak} MB |"
+    echo "| facts on disk | ${ql_disk} | ${cs_disk} |"
+    echo "| \"who calls flush_writes?\" first run | ${q_wall}s (incl. QL compilation, ${n_rows} rows) | ${cs_q_ms} ms (incl. CLI startup) |"
+    echo "| same, second run (cached) | ${q2_wall}s / ${q2_peak} MB | ${cs_q_ms} ms (every time) |"
     echo
-    echo "注記: CodeQL の query run はコンパイル+評価込みの単発コスト (キャッシュで 2 回目以降は速くなる)。"
-    echo "QL は本品に書けない任意リレーショナル質問 (taint tracking 等) が書ける — 役割が違う。"
-    echo "本品の bake (精密モード) の構築コストは VS-RA.md の RA 列を参照 (CodeQL 構築と同系統のコスト)。"
+    echo "Note: a CodeQL query run is a one-off cost including compilation + evaluation (later runs are faster thanks to the cache)."
+    echo "QL can ask arbitrary relational questions kenning cannot (taint tracking, etc.) — different jobs."
+    echo "For the build cost of kenning's bake (precise mode), see the RA column in VS-RA.md (the same family of cost as a CodeQL build)."
 } > "$OUT"
 sed -i '' "s|$HOME|~|g" "$OUT" 2>/dev/null || sed -i "s|$HOME|~|g" "$OUT"
 echo "wrote $OUT" >&2

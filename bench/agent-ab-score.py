@@ -82,7 +82,7 @@ def load(path):
                     name = (c.get("input", {}).get("command", "").split() or ["?"])[0]
                 tools[name] += 1
     if result is None:
-        raise ValueError("result 無し")
+        raise ValueError("no result")
     return result, tools
 
 
@@ -96,7 +96,7 @@ def main(d):
         try:
             j, tools = load(os.path.join(d, name))
         except (ValueError, OSError, json.JSONDecodeError):
-            print(f"# 壊れた結果: {name}", file=sys.stderr)
+            print(f"# broken result: {name}", file=sys.stderr)
             continue
         u = j.get("usage", {})
         tok_in = u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + u.get("cache_read_input_tokens", 0)
@@ -118,7 +118,7 @@ def main(d):
             tools=tools))
 
     med = lambda xs: statistics.median(xs) if xs else float("nan")
-    print("| task | cond | n | input tok | output tok | cost $ | turns | sec | recall | precision | grep 系 (run 平均) | 道具 (run 平均) |")
+    print("| task | cond | n | input tok | output tok | cost $ | turns | sec | recall | precision | grep-like (mean/run) | tools (mean/run) |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     tot = defaultdict(lambda: defaultdict(float))
     for (task, cond), ms in sorted(rows.items()):
@@ -138,12 +138,12 @@ def main(d):
             if c == "B":
                 continue
             a = tot[c]
-            print(f"\n{c} vs B (課題ごとの中央値の和): 費用 ${a['cost']:.2f} vs ${b['cost']:.2f} "
-                  f"(B/{c} {b['cost'] / a['cost']:.2f}x)、input token B/{c} {b['tin'] / a['tin']:.2f}x、"
-                  f"output token B/{c} {b['tout'] / a['tout']:.2f}x、turn B/{c} {b['turns'] / a['turns']:.2f}x、"
-                  f"時間 B/{c} {b['sec'] / a['sec']:.2f}x")
+            print(f"\n{c} vs B (sum of per-task medians): cost ${a['cost']:.2f} vs ${b['cost']:.2f} "
+                  f"(B/{c} {b['cost'] / a['cost']:.2f}x), input token B/{c} {b['tin'] / a['tin']:.2f}x, "
+                  f"output token B/{c} {b['tout'] / a['tout']:.2f}x, turn B/{c} {b['turns'] / a['turns']:.2f}x, "
+                  f"time B/{c} {b['sec'] / a['sec']:.2f}x")
     for c in sorted(tot):
-        print(f"\n{c}: grep 系の呼び出し 課題あたり合計 {tot[c]['grep']:.1f} 回 (run 平均の和)")
+        print(f"\n{c}: grep-like calls, total per task set {tot[c]['grep']:.1f} (sum of per-run means)")
 
 
 if __name__ == "__main__":

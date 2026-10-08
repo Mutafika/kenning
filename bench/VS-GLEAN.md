@@ -1,56 +1,56 @@
-# vs Glean (Meta) — 同じ .scip を食わせた serving 層の頭対頭
+# vs Glean (Meta) — head to head on the serving layer, fed the same .scip
 
-**この対戦だけ完全に同じ弾を使える**: Glean の Rust 取込も rust-analyzer の SCIP なので、
-本品が bake した `.scip` (enchudb, 10MB) をそのまま Meta のエンジンに食わせて、
-「facts の serving 層」だけを比較した。実行環境は OrbStack (macOS) + 公式 demo image
-(`ghcr.io/facebookincubator/glean/demo`, 3.1GB, **amd64 のみ → Rosetta 実行**。
-公式 docs は image を「現在動かない」と注記しているが、この計測時点の latest は動いた)。
+**This is the one comparison that can use exactly the same input**: Glean's Rust ingestion is also rust-analyzer's SCIP, so
+the `.scip` kenning baked (enchudb, 10MB) was fed straight into Meta's engine, comparing only
+"the serving layer for the facts". Environment: OrbStack (macOS) + the official demo image
+(`ghcr.io/facebookincubator/glean/demo`, 3.1GB, **amd64 only → run under Rosetta**.
+The official docs note the image "currently does not work", but the latest at the time of measurement did).
 
-| 段階 | Glean (demo image, Rosetta) | kenning (native) |
+| stage | Glean (demo image, Rosetta) | kenning (native) |
 |---|---|---|
-| SCIP 取込 wall | 8.0s | 0.52s (+syn parse/graph 込み) |
-| 取込 peak RSS | 702 MB | 268 MB |
-| facts ディスク | **14M** (scip facts のみ) | 87M (syn call graph / 全列 facet / extref 込み) |
-| find-refs 1 問 (one-shot CLI) | ~1.0s / 114 MB | **0.011s** |
-| 常駐 | server モードが本来の運用形 | 0 (毎回 CLI) |
+| SCIP ingest wall | 8.0s | 0.52s (incl. syn parse/graph) |
+| ingest peak RSS | 702 MB | 268 MB |
+| facts on disk | **14M** (scip facts only) | 87M (incl. syn call graph / every column facet / extref) |
+| one find-refs (one-shot CLI) | ~1.0s / 114 MB | **0.011s** |
+| resident | server mode is the intended deployment | 0 (a CLI each time) |
 
-Rosetta のエミュレーション係数はせいぜい 2-3x — 取込 15x・クエリ ~90x の差は係数では説明できない。
-ただし disk は Glean の勝ち (こちらは SCIP 以外の facts も持っている)。
-→ **2026-10-02 追記:** 87M の大半はほぼ空の vocab hash 索引 (entity 数 × 16 で予約、充填 0.3%) だった。#15 で
-語数の見積もりで予約するようにした。
-→ **2026-10-05 訂正:** 10-02 に書いた「11.7 MB」は測り違いで、実際は ~50 MB だった。残りは列 (himo) の配列が
-DB 全体の通し eid を添字に取り、後ろの table の列が前置きの 0 を抱え、APFS が 16 MB 以下の file の穴を実体化して
-いたため (enchudb#400)。enchudb 0.30 で解消し、今の (この時より大きい 366 files の) enchudb で **14.2 MB** = Glean と互角。
+Rosetta's emulation factor is 2-3x at most — it cannot explain a 15x gap on ingest and ~90x on queries.
+Disk, however, goes to Glean (kenning also holds facts beyond SCIP).
+→ **Added 2026-10-02:** most of the 87M was a nearly empty vocab hash index (reserved at entity count × 16, 0.3% full). #15
+made it reserve from an estimate of the term count.
+→ **Correction 2026-10-05:** the "11.7 MB" written on 10-02 was a mismeasurement; it was really ~50 MB. The rest came from column (himo) arrays
+indexed by the DB-wide eid, so later tables' columns carried leading zeros, and APFS materialised the holes of files
+under 16 MB (enchudb#400). Fixed in enchudb 0.30; today's enchudb (larger than at that time, 366 files) is **14.2 MB** = on par with Glean.
 
-## 回答の突き合わせ (4 本目の相互検証)
+## Comparing the answers (the 4th cross-check)
 
-「Engine::flush_writes の参照は?」— **Glean 57 vs kenning 58** (同じ scip スナップショット。
-差 1 は definition-role occurrence を refs に数えるかの流儀差)。旧 scip でも 57 = 57。
-serving 層が違っても facts が同じなら答えは同じ、という当たり前を確認できたのが収穫。
+"References to Engine::flush_writes?" — **Glean 57 vs kenning 58** (same scip snapshot;
+the difference of 1 is a convention: whether the definition-role occurrence counts as a ref). With the older scip it was 57 = 57.
+Different serving layers give the same answer when the facts are the same — confirming the obvious was the takeaway.
 
-## beyond 系 (impact / callers / impls / faceted) は Glean では測れない — 能力差
+## The beyond queries (impact / callers / impls / faceted) cannot be measured in Glean — a capability gap
 
-scip.angle の全 predicate を確認した (Definition / Reference / SymbolKind / SymbolName 等 20 個):
-**call edge も enclosing-symbol も facet も存在しない**。つまり OSS の Rust 経路 (SCIP 取込) では:
+Checked every predicate in scip.angle (Definition / Reference / SymbolKind / SymbolName etc., 20 in all):
+**there is no call edge, no enclosing symbol, no facet**. So on the OSS Rust path (SCIP ingestion):
 
-- **find-refs / goto-def**: ✅ (上で実測した通り、正確)
-- **outline 相当**: △ (DefinitionLocation を file で引けば近いものは出る)
-- **who-calls の caller 帰属 / 推移的 impact / impls / faceted AND**: ❌ 表現不能。
-  Angle は再帰クエリを書ける言語だが、土台の call edge fact が無いので再帰する対象が無い
-  (Meta 社内では Hack/C++ 等のリッチな専用 indexer がこれを供給する。Rust の OSS 経路には無い)
+- **find-refs / goto-def**: ✅ (accurate, as measured above)
+- **outline equivalent**: △ (looking up DefinitionLocation by file gives something close)
+- **caller attribution for who-calls / transitive impact / impls / faceted AND**: ❌ cannot be expressed.
+  Angle can express recursive queries, but with no call-edge facts underneath there is nothing to recurse over
+  (inside Meta, rich dedicated indexers for Hack/C++ etc. supply these. The OSS Rust path has none)
 
-本品が同じ .scip から impact 52x / impls / faceted を出せるのは、**SCIP と並行して syn 層
-(call-site + enclosing + facet) を持っている**から — 「syn × SCIP の結婚」の価値が
-この対戦で一番はっきり出た。
+kenning can produce impact 52x / impls / faceted from the same .scip because **it keeps a syn layer
+(call sites + enclosing + facets) alongside SCIP** — the value of "marrying syn × SCIP" showed most clearly
+in this comparison.
 
-## この対戦で見つかった設計差 (勝敗より重要)
+## Design differences this comparison surfaced (more important than who wins)
 
-- **Glean は SCIP を as-is で serve** する (ソース不要) → 弾が古くても壊れない。
-  **本品は live ソースに位置 join** する → SCIP が古いとその分の精密 facts が剥がれる
-  (実際この対戦中、bake 後のソース編集で refs が 0 になっているのを発見 → fresh bake で回復。
-  bake 鮮度は meta の upd_since_bake で追跡・警告される)
-- Glean は多言語 schema 基盤 + Angle クエリ言語 + server/シャーディング — 組織スケールの設計。
-  本品は「1 開発者 × N repo × agent」に特化して、儀式ゼロ・常駐ゼロ・ms を取った
-- Meta 級インフラの構図 (facts を焼いて別層で serve) は単一バイナリでも成立する、が記事の結論
+- **Glean serves SCIP as-is** (no source needed) → a stale input does not break it.
+  **kenning joins against the live source by position** → when SCIP is stale, the precise facts for that part fall off
+  (during this comparison, refs dropped to 0 after editing the source post-bake → recovered with a fresh bake.
+  Bake freshness is tracked and warned about via upd_since_bake in meta)
+- Glean is a multi-language schema platform + the Angle query language + server/sharding — designed for organisation scale.
+  kenning is specialised for "one developer × N repos × an agent", trading for zero ceremony, zero residency, and ms
+- The conclusion for the write-up: the Meta-scale architecture (bake facts, serve them from a separate layer) also works in a single binary
 
-再現: OrbStack/Docker で `./bench/vs-glean.sh` (image pull ~3GB が別途要る)。
+Reproduce: `./bench/vs-glean.sh` with OrbStack/Docker (the ~3GB image pull is extra).

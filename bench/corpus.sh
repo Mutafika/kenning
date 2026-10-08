@@ -22,6 +22,6 @@ fi
 echo "corpus dir: $D"
 echo "  tokio @ $TOKIO_TAG"
 echo "  ripgrep @ $RIPGREP_TAG"
-echo "  enchudb @ $ENCHUDB_REV (agent-ab 用。bake は KENNING_BAKE_DEFAULT_FEATURES=1)"
+echo "  enchudb @ $ENCHUDB_REV (for agent-ab; bake with KENNING_BAKE_DEFAULT_FEATURES=1)"
 echo
-echo "精度を出すには各 corpus で: (cd $D/<repo> && kenning bake)"
+echo "For precision, in each corpus: (cd $D/<repo> && kenning bake)"

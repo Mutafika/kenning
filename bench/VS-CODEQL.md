@@ -1,34 +1,34 @@
-# vs CodeQL — 「code as data」本家との頭対頭 (corpus: enchudb)
+# vs CodeQL — head to head with the original "code as data" (corpus: enchudb)
 
-CodeQL の Rust extractor は rust-analyzer ベース = 構図 (解析を facts に焼いて別層で引く) は
-本品と同じ。違いは規模と目的: CodeQL はセキュリティ解析向けの汎用リレーショナル QL、
-本品は agent のナビゲーション専用に薄く速く。(CodeQL 2.26.1 / rust-all 0.2.17)
+CodeQL's Rust extractor is built on rust-analyzer = the same architecture as kenning (bake the analysis into facts, query them from a separate layer).
+The difference is scale and purpose: CodeQL is a general relational QL for security analysis;
+kenning is thin and fast, purely for agent navigation. (CodeQL 2.26.1 / rust-all 0.2.17)
 
-| 段階 | CodeQL | kenning (syn 層) |
+| stage | CodeQL | kenning (syn layer) |
 |---|---|---|
-| facts 構築 wall | **4073s (68 分)** | 2.4s |
-| 構築 peak RSS | 9930 MB | 174 MB |
-| facts ディスク | 301M | 67M |
-| 「who calls flush_writes?」初回 | 1418s (QL コンパイル込み) | 101 ms (CLI 起動込み) |
-| 同、2 回目 (cache 済) | 47.5s / 1764 MB | 101 ms (毎回) |
+| facts build wall | **4073s (68 min)** | 2.4s |
+| build peak RSS | 9930 MB | 174 MB |
+| facts on disk | 301M | 67M |
+| "who calls flush_writes?" first run | 1418s (incl. QL compilation) | 101 ms (incl. CLI startup) |
+| same, second run (cached) | 47.5s / 1764 MB | 101 ms (every time) |
 
-## 回答の突き合わせ (相互検証)
+## Comparing the answers (cross-check)
 
-同じ問いに CodeQL は 57 行、kenning は確実 117 行。内訳を突き合わせると:
+For the same question CodeQL returns 57 rows, kenning 117 confirmed rows. Lining up the breakdown:
 
-- **lib コード (crates/enchudb-engine): 44 = 44 で完全一致** — RA ベースの解決同士、
-  数字が合う。本品の確実 edge の正確さの独立検証がまた 1 本
-- 差分はほぼ全部 **tests/**: CodeQL の extractor は integration test の caller 60+ 件を
-  ほぼ落とした (57 行中 tests/ は 1 行のみ)。examples/ と benches/ は両者拾えている
+- **Library code (crates/enchudb-engine): 44 = 44, an exact match** — two RA-based resolvers,
+  the numbers agree. One more independent check that kenning's confirmed edges are accurate
+- The difference is almost entirely **tests/**: CodeQL's extractor dropped nearly all 60+ callers in integration tests
+  (only 1 of the 57 rows is in tests/). Both pick up examples/ and benches/
 
-## 注記 (公平のため)
+## Notes (for fairness)
 
-- QL は本品に書けない任意リレーショナル質問 (taint tracking、データフロー等) が書ける。
-  役割が違う — 「セキュリティ解析の副産物として navigation もできる」のが CodeQL、
-  navigation 専用に構築 2.4s・クエリ 0.1s に削ったのが本品
-- 本品の bake (精密モード) の構築コストは VS-RA.md の RA 列 (~40s/6GB) — CodeQL 構築と
-  同系統だが 100x 軽い (extractor の目的が違うので当然ではある)
-- CodeQL の Rust 対応はまだ若い (rust-all 0.2.x)。tests/ の欠落は将来直る可能性がある
+- QL can ask arbitrary relational questions kenning cannot (taint tracking, data flow, etc.).
+  Different jobs — CodeQL "can also navigate, as a by-product of security analysis";
+  kenning was cut down to navigation only, with a 2.4s build and 0.1s queries
+- kenning's bake (precise mode) build cost is the RA column in VS-RA.md (~40s/6GB) — the same family as a CodeQL build,
+  but 100x lighter (expected, since the extractors have different purposes)
+- CodeQL's Rust support is still young (rust-all 0.2.x). The missing tests/ may be fixed in the future
 
-再現: `codeql` CLI を PATH に置いて `KENNING_CODEQL=<path> ./bench/vs-codeql.sh`
-(db が既にあれば構築は skip される)。
+Reproduce: put the `codeql` CLI on PATH and run `KENNING_CODEQL=<path> ./bench/vs-codeql.sh`
+(the build is skipped if the db already exists).

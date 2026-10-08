@@ -1,67 +1,67 @@
-# vs rust-analyzer — cold から正確に答えられるまで
+# vs rust-analyzer — from cold to an accurate answer
 
-RA 側は本家ベンチ `analysis-stats` (全 workspace 解析+型推論 = 正確な find-refs の前提知識)。
-kenning 側は `index` (syn 層)。**精密モード (bake) の構築コストは RA 列と同じもの** —
-それを常駐でなく一発のバッチとして払い、以後の全クエリを index から µs-ms で返すのが本品の設計。
+The RA side is its own benchmark, `analysis-stats` (whole-workspace analysis + type inference = what accurate find-refs needs to know).
+The kenning side is `index` (syn layer). **The build cost of precise mode (bake) is the same thing as the RA column** —
+kenning pays it once as a batch instead of keeping it resident, then answers every later query from the index in µs-ms.
 
-| corpus | 対象 | 構築 wall | peak RSS | 構築後のクエリ |
+| corpus | tool | build wall | peak RSS | queries after build |
 |---|---|---|---|---|
-| enchudb | rust-analyzer (resident 相当) | 16.30s | 3179 MB | LSP 常駐が続く限り ms |
-| enchudb | kenning (syn 層) | 0.30s | 118 MB | 35 ms (CLI 起動込み)、常駐 0 |
-| tokio | rust-analyzer (resident 相当) | 17.04s | 2477 MB | LSP 常駐が続く限り ms |
-| tokio | kenning (syn 層) | 0.34s | 133 MB | 48 ms (CLI 起動込み)、常駐 0 |
+| enchudb | rust-analyzer (resident equivalent) | 16.30s | 3179 MB | ms, for as long as the LSP stays resident |
+| enchudb | kenning (syn layer) | 0.30s | 118 MB | 35 ms (incl. CLI startup), nothing resident |
+| tokio | rust-analyzer (resident equivalent) | 17.04s | 2477 MB | ms, for as long as the LSP stays resident |
+| tokio | kenning (syn layer) | 0.34s | 133 MB | 48 ms (incl. CLI startup), nothing resident |
 
-kenning 側の peak RSS は enchudb 0.26.11 (bulk load が誰も引かない逆索引を育てるのをやめた
-#270) で再測した値 (2026-09-15、enchudb 136→118 MB / tokio 156→133 MB)。wall は前回計測
-(2026-09-06) のまま — 再測日は load average 75 の高負荷で、0.26.8 / 0.26.11 とも ~1s に
-伸びた (版差ではなく機械側の状態差) ため差し替えていない。
+kenning's peak RSS was re-measured with enchudb 0.26.11 (#270: bulk load stopped growing a reverse index nobody reads)
+on 2026-09-15 (enchudb 136→118 MB / tokio 156→133 MB). Wall times are still from the earlier run
+(2026-09-06): on the re-measure day the load average was 75 and both 0.26.8 and 0.26.11 stretched to ~1s
+(a machine-state difference, not a version difference), so they were not replaced.
 
-公平のための注記: ①kenning (syn 層) は RA より解決精度が低い (型推論なし。callers は
-確実∪候補のラベル付きで返す) — 精密が要る時の bake コスト ≈ RA 列を一発だけ払う。
-②RA は各 corpus の default features 分しか解析しない (tokio の default は最小構成なので
-RA 列が軽く見える — features=all なら更に重い)。③analysis-stats は全域推論の一括実行で、
-実際の LSP は必要箇所から lazy に解析する (体感の初回応答はこれより早いが、知識の総コストは同じ)。
+Notes for fairness: (1) kenning (syn layer) resolves less precisely than RA (no type inference; callers come back
+labelled confirmed ∪ candidates) — when precision is needed, bake pays roughly the RA column once.
+(2) RA analyses only each corpus's default features (tokio's default is minimal, so the RA column looks light —
+with features=all it is heavier). (3) analysis-stats infers everything in one batch;
+a real LSP analyses lazily from where it is needed (the first response feels faster, but the total cost of the knowledge is the same).
 
-できることの差 (どちらが強い、でなく役割が違う):
+What each can do (not which is stronger — they have different jobs):
 
-| 能力 | rust-analyzer | kenning |
+| capability | rust-analyzer | kenning |
 |---|---|---|
-| hover 型推論 / 補完 / 診断 | ✅ | ❌ (agent は cargo check で足りる) |
-| 正確 find-refs / who-calls | ✅ (常駐前提) | ✅ bake 後 (= RA の facts を位置 join) |
+| hover type inference / completion / diagnostics | ✅ | ❌ (cargo check is enough for an agent) |
+| accurate find-refs / who-calls | ✅ (needs to stay resident) | ✅ after bake (= RA's facts joined by position) |
 | faceted AND (kind×vis×crate×…) | ❌ | ✅ µs |
-| 推移的 impact / call path | ❌ (1 hop ずつ) | ✅ 1 クエリ |
-| 非活性 cfg 側の解析 | ❌ | ✅ (syn が cfg-blind に全ブランチ) |
-| repo 横断 (across) | ❌ (単一 workspace) | ✅ (SCIP symbol join) |
-| 常駐メモリ | GB 級 | 0 (index はファイル) |
+| transitive impact / call path | ❌ (one hop at a time) | ✅ one query |
+| analysis of inactive cfg branches | ❌ | ✅ (syn sees every branch, cfg-blind) |
+| across repos (across) | ❌ (single workspace) | ✅ (SCIP symbol join) |
+| resident memory | GBs | 0 (the index is a file) |
 
-## 精度: RA と「どれだけ同じことを言うか」 (bake 後)
+## Precision: how often kenning says the same thing as RA (after bake)
 
-kenning の**確定**は RA の facts そのもの (SCIP occurrence を位置 join したもの) なので、
-「RA と精度が違うか」ではなく **「RA が答えた所をどれだけ拾えているか」+「RA が黙る所をどうするか」**
-が実際の比較軸。`kenning index --scip` の内訳 (2026-09-06 実測、features=all / enchudb は default):
+kenning's **confirmed** set is RA's facts themselves (SCIP occurrences joined by position), so the real question is not
+"is it as precise as RA" but **"how much of what RA answered does it pick up" + "what does it do where RA is silent"**.
+Breakdown from `kenning index --scip` (measured 2026-09-06, features=all / enchudb with default):
 
-| corpus | repo 内 call-site | 確定 | うち RA(SCIP) 由来 | syn 回収 (RA 沈黙域) | 未確定 |
+| corpus | in-repo call sites | confirmed | from RA (SCIP) | syn recovered (RA silent) | unconfirmed |
 |---|---|---|---|---|---|
 | tokio | 20,390 | 12,073 (59.2%) | 11,235 (93.1%) | 838 | 8,317 |
 | ripgrep | 10,508 | 9,611 (91.5%) | 9,589 (99.8%) | 22 | 897 |
 | enchudb | 20,296 | 16,265 (80.1%) | 16,230 (99.8%) | 35 | 4,031 |
 
-分母は **repo 内呼び出し** (std / 依存 crate への呼び出しは index に定義が無く解決不能なので除く)。
+The denominator is **in-repo calls** (calls into std / dependency crates have no definition in the index and cannot be resolved, so they are excluded).
 
-- **確定は RA と同じか、それより多い。** RA に無い分 (syn 回収) は RA が沈黙した領域を
-  保守的な syn resolver が拾ったもの。RA の答えを上書きすることはない。
-- **未確定 = RA も occurrence を出していない所。** tokio の源は SCIP occurrence が無い 9,134 箇所で、
-  内訳は「document 自体が SCIP に無い」4,095 + 「document はあるが該当位置に occurrence 無し」5,039。
-  **RA なら "no references" で終わる所**を、kenning は `[method-name]` / `[value-ref]` /
-  `[macro-token]` の候補として位置付きで見せる。
-- **位置 join の取りこぼしではない。** 「同じ行に別の occurrence はある」のが 995 箇所あるが、
-  中身を見ると `assert_eq!(b.next()…)` の行で RA が出しているのは `assert_eq` (col 4) だけで、
-  `.next` (col 17) には何も無い — RA が path / マクロ名は解決し、その行の method 呼びは
-  解決していない形。列のズレで取り落としているのではない。
-- **tokio が低いのは repo 側の事情。** `--cfg tokio_unstable` を渡して焼き直すと
-  確定 11,235 → 12,332、**59.2% → 65.0%**。RUSTFLAGS 依存の cfg は Cargo.toml に現れないので
-  自動では当てられない → `KENNING_BAKE_RUSTFLAGS='--cfg tokio_unstable' kenning bake` で渡す。
-  target 種別で切っても src 60.2% / tests 63.5% / benches 74.0% / examples 66.0% と差は小さく、
-  「test だけ解析されていない」といった単純な話ではない (`kenning stats path:<dir>` で確認できる)。
-- **未 bake (syn 層のみ) は 15〜24%** と大きく落ちる。受け手の型が分からない method 呼びを
-  確定させないため — 嘘はつかないが、精度が要るなら bake は必須。
+- **Confirmed is the same as RA or more.** The extra (syn recovered) is where RA was silent and the
+  conservative syn resolver picked it up. It never overrides an RA answer.
+- **Unconfirmed = places where RA emitted no occurrence either.** In tokio the source is 9,134 sites with no SCIP occurrence:
+  4,095 where "the document itself is missing from SCIP" + 5,039 where "the document exists but has no occurrence at that position".
+  **Where RA would end with "no references"**, kenning shows them as `[method-name]` / `[value-ref]` /
+  `[macro-token]` candidates with positions.
+- **Not a position-join miss.** 995 sites have "another occurrence on the same line", but looking at them,
+  on lines like `assert_eq!(b.next()…)` RA emits only `assert_eq` (col 4) and nothing at
+  `.next` (col 17) — RA resolves the path / macro name and leaves the method call on that line
+  unresolved. It is not dropped because of a column offset.
+- **tokio is low because of the repo itself.** Re-baking with `--cfg tokio_unstable` takes
+  confirmed 11,235 → 12,332, **59.2% → 65.0%**. cfgs that depend on RUSTFLAGS do not appear in Cargo.toml, so they
+  cannot be applied automatically → pass them with `KENNING_BAKE_RUSTFLAGS='--cfg tokio_unstable' kenning bake`.
+  Split by target kind it is src 60.2% / tests 63.5% / benches 74.0% / examples 66.0% — small differences,
+  so it is not as simple as "tests are not analysed" (check with `kenning stats path:<dir>`).
+- **Without bake (syn layer only) it drops to 15–24%.** Method calls whose receiver type is unknown
+  are not confirmed — it does not lie, but if you need precision, bake is required.

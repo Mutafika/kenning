@@ -13,19 +13,19 @@ mkdir -p "$GDB"
 
 docker image inspect "$IMG" >/dev/null 2>&1 || docker pull --platform linux/amd64 "$IMG"
 
-echo "== Glean: SCIP 取込 (wall / cgroup peak) ==" >&2
+echo "== Glean: SCIP ingest (wall / cgroup peak) ==" >&2
 docker run --rm --platform linux/amd64 --entrypoint /bin/bash \
     -v "$SCIP":/work/in.scip:ro -v "$GDB":/gdb "$IMG" -c '
     time glean --db-root /tmp/g --schema dir:/glean-demo/schema/source index scip /work/in.scip --db bench/0 >/dev/null 2>&1
     echo "peak_mb=$(( $(cat /sys/fs/cgroup/memory.peak) / 1048576 ))"
     rm -rf /gdb/bench-persist; cp -r /tmp/g /gdb/bench-persist'
 
-echo "== Glean: find-refs 1 問 (one-shot CLI) ==" >&2
+echo "== Glean: one find-refs (one-shot CLI) ==" >&2
 docker run --rm --platform linux/amd64 --entrypoint /bin/bash -v "$GDB":/gdb "$IMG" -c "
     Q='scip.Reference { symbol = scip.Symbol \"$SYM\" }'
     time glean --db-root /gdb/bench-persist --schema dir:/glean-demo/schema/source query --db bench/0 --limit 1000 \"\$Q\" 2>/dev/null | wc -l
     echo \"peak_mb=\$(( \$(cat /sys/fs/cgroup/memory.peak) / 1048576 ))\""
 
-echo "== kenning: 同じ scip の取込 + refs (比較側) ==" >&2
+echo "== kenning: ingest of the same scip + refs (the other side) ==" >&2
 echo "  index: /usr/bin/time -l kenning index <repo> <db> --scip $SCIP"
-echo "  query: time kenning refs <name>  (bake 済み repo 内で)"
+echo "  query: time kenning refs <name>  (inside a baked repo)"

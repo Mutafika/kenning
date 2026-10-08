@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 D="${KENNING_BENCH_DIR:-$HOME/.cache/kenning-bench}"
 RA="${KENNING_RA:-$(ls "$HOME"/.rustup/toolchains/*/bin/rust-analyzer 2>/dev/null | head -1)}"
 OUT=bench/VS-RA.md
-[ -x "$RA" ] || { echo "rust-analyzer が見つからない (KENNING_RA で指定)" >&2; exit 1; }
+[ -x "$RA" ] || { echo "rust-analyzer not found (set KENNING_RA)" >&2; exit 1; }
 
 measure() { # $@=cmd → "wall_s peak_mb" (time -l の報告は stderr に出る)
     /usr/bin/time -l "$@" > /dev/null 2> /tmp/vsra-time.txt || true
@@ -21,13 +21,13 @@ measure() { # $@=cmd → "wall_s peak_mb" (time -l の報告は stderr に出る
 }
 
 {
-    echo "# vs rust-analyzer — cold から正確に答えられるまで"
+    echo "# vs rust-analyzer — from cold to an accurate answer"
     echo
-    echo "RA 側は本家ベンチ \`analysis-stats\` (全 workspace 解析+型推論 = 正確な find-refs の前提知識)。"
-    echo "kenning 側は \`index\` (syn 層)。**精密モード (bake) の構築コストは RA 列と同じもの** —"
-    echo "それを常駐でなく一発のバッチとして払い、以後の全クエリを index から µs-ms で返すのが本品の設計。"
+    echo "The RA side is its own benchmark, \`analysis-stats\` (whole-workspace analysis + type inference = what accurate find-refs needs to know)."
+    echo "The kenning side is \`index\` (syn layer). **The build cost of precise mode (bake) is the same thing as the RA column** —"
+    echo "kenning pays it once as a batch instead of keeping it resident, then answers every later query from the index in µs-ms."
     echo
-    echo "| corpus | 対象 | 構築 wall | peak RSS | 構築後のクエリ |"
+    echo "| corpus | tool | build wall | peak RSS | queries after build |"
     echo "|---|---|---|---|---|"
 } > "$OUT"
 
@@ -48,30 +48,30 @@ for repo in ../enchudb "$D/tokio"; do
     q_ms=$(python3 -c "import time; print(f'{(time.time()-$t0)*1000:.0f}')")
     rm -rf "$tmpdb"*  # db は v10 以降 directory
     {
-        echo "| $name | rust-analyzer (resident 相当) | ${ra_wall}s | ${ra_peak} MB | LSP 常駐が続く限り ms |"
-        echo "| $name | kenning (syn 層) | ${cs_wall}s | ${cs_peak} MB | ${q_ms} ms (CLI 起動込み)、常駐 0 |"
+        echo "| $name | rust-analyzer (resident equivalent) | ${ra_wall}s | ${ra_peak} MB | ms, for as long as the LSP stays resident |"
+        echo "| $name | kenning (syn layer) | ${cs_wall}s | ${cs_peak} MB | ${q_ms} ms (incl. CLI startup), nothing resident |"
     } >> "$OUT"
 done
 
 {
     echo
-    echo "公平のための注記: ①kenning (syn 層) は RA より解決精度が低い (型推論なし。callers は"
-    echo "確実∪候補のラベル付きで返す) — 精密が要る時の bake コスト ≈ RA 列を一発だけ払う。"
-    echo "②RA は各 corpus の default features 分しか解析しない (tokio の default は最小構成なので"
-    echo "RA 列が軽く見える — features=all なら更に重い)。③analysis-stats は全域推論の一括実行で、"
-    echo "実際の LSP は必要箇所から lazy に解析する (体感の初回応答はこれより早いが、知識の総コストは同じ)。"
+    echo "Notes for fairness: (1) kenning (syn layer) resolves less precisely than RA (no type inference; callers come back"
+    echo "labelled confirmed ∪ candidates) — when precision is needed, bake pays roughly the RA column once."
+    echo "(2) RA analyses only each corpus's default features (tokio's default is minimal, so the RA column looks light —"
+    echo "with features=all it is heavier). (3) analysis-stats infers everything in one batch;"
+    echo "a real LSP analyses lazily from where it is needed (the first response feels faster, but the total cost of the knowledge is the same)."
     echo
-    echo "できることの差 (どちらが強い、でなく役割が違う):"
+    echo "What each can do (not which is stronger — they have different jobs):"
     echo
-    echo "| 能力 | rust-analyzer | kenning |"
+    echo "| capability | rust-analyzer | kenning |"
     echo "|---|---|---|"
-    echo "| hover 型推論 / 補完 / 診断 | ✅ | ❌ (agent は cargo check で足りる) |"
-    echo "| 正確 find-refs / who-calls | ✅ (常駐前提) | ✅ bake 後 (= RA の facts を位置 join) |"
+    echo "| hover type inference / completion / diagnostics | ✅ | ❌ (cargo check is enough for an agent) |"
+    echo "| accurate find-refs / who-calls | ✅ (needs to stay resident) | ✅ after bake (= RA's facts joined by position) |"
     echo "| faceted AND (kind×vis×crate×…) | ❌ | ✅ µs |"
-    echo "| 推移的 impact / call path | ❌ (1 hop ずつ) | ✅ 1 クエリ |"
-    echo "| 非活性 cfg 側の解析 | ❌ | ✅ (syn が cfg-blind に全ブランチ) |"
-    echo "| repo 横断 (across) | ❌ (単一 workspace) | ✅ (SCIP symbol join) |"
-    echo "| 常駐メモリ | GB 級 | 0 (index はファイル) |"
+    echo "| transitive impact / call path | ❌ (one hop at a time) | ✅ one query |"
+    echo "| analysis of inactive cfg branches | ❌ | ✅ (syn sees every branch, cfg-blind) |"
+    echo "| across repos (across) | ❌ (single workspace) | ✅ (SCIP symbol join) |"
+    echo "| resident memory | GBs | 0 (the index is a file) |"
 } >> "$OUT"
 sed -i '' "s|$HOME|~|g" "$OUT" 2>/dev/null || sed -i "s|$HOME|~|g" "$OUT"
 echo "wrote $OUT" >&2

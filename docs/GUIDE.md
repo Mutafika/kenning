@@ -1,171 +1,194 @@
-# kenning 詳細ガイド
+# kenning detailed guide
 
-要点は repo 直下の `CLAUDE.md` (毎 turn 読まれる物)。これは必要な節だけ `kenning read docs/GUIDE.md#<見出し>` で読む詳細版。
+The short version is `CLAUDE.md` at the repo root (read every turn). This is the detailed version: read only the
+section you need with `kenning read docs/GUIDE.md#<heading>`.
 
-これは Rust コードの **semantic navigation CLI**。顧客は「コード探索する Claude 自身」。
-grep+Read の代わりに、精密な少数行 (`path:line<TAB>詳細` = そのまま Read に渡せる) を返す。
+kenning is a **semantic navigation CLI** for Rust code. Its customer is Claude itself, exploring code.
+Instead of grep + Read, it returns a few precise rows (`path:line<TAB>detail`, which can go straight to Read).
 
-## ルール (1 行)
+## The rule (one line)
 
-**Rust repo 内の検索は kenning。** シンボル軸の問い (定義 / 呼び元 / 呼び先 / 実装 / 影響範囲 /
-faceted) は `kenning <cmd>`、全文検索は `kenning text` — **`.rs` も `.md`/`.toml`/`.yml` も同じ 1 本**で、
-文脈注釈が付く分 grep の上位互換。db 管理は考えなくていい (自動)。
-grep に落ちるのは対象外だけ: binary / 1MiB 超 / gitignore 済み / 生成 lock ファイル。正規表現は `text -e`、
-dir 絞りは `text … path:<dir>`、同名 symbol は `read` の `crate:` / `path:` / `--all`、行の周辺は `read <path>:<line>` (範囲は `read <path>:<from>-<to>`)、
-md の見出し配下は `read <file>#<見出し>`、crate の地図は `outline <dir>`。stderr は要点 1 行だけなので `2>/dev/null` は不要。
+**Search inside a Rust repo with kenning.** Symbol questions (definition / callers / callees / implementations /
+impact / faceted) go to `kenning <cmd>`; full-text search goes to `kenning text` — **`.rs`, `.md`, `.toml` and `.yml`
+all through the same tool**, with context annotations, so it is a superset of grep. No db management (it is automatic).
+Fall back to grep only for files kenning skips: binary / over 1 MiB / gitignored / generated lock files. Regex is
+`text -e`, a dir filter is `text … path:<dir>`, same-named symbols are narrowed with `read`'s `crate:` / `path:` /
+`--all`, the code around a line is `read <path>:<line>` (a range is `read <path>:<from>-<to>`), a md section is
+`read <file>#<heading>`, a crate map is `outline <dir>`. stderr is a single summary line, so `2>/dev/null` is unnecessary.
 
-## 使い方 (儀式ゼロ: cd して聞くだけ)
+## Usage (zero ceremony: cd and ask)
 
 ```bash
-cd <rust-repo>                     # あとは聞くだけ。db は ~/.cache/kenning/ に自動作成・
-kenning callers <name>          # 変更があれば自動増分 update (進捗は stderr、stdout はデータのみ)
+cd <rust-repo>                     # then just ask. The db is created in ~/.cache/kenning/ automatically
+kenning callers <name>          # and incrementally updated on changes (progress on stderr, stdout is data only)
 ```
 
 ```bash
-kenning def     <name> [path:S]     # 定義位置 + シグネチャ + doc 1 行目 (hover 相当)
-kenning read    <name> [container] [crate:X] [path:S] [--all]  # 定義本体 (def + Read の 1 手化。まずこれ)。同名は絞るか --all
-kenning read    <path>:<line>       # その行を囲む item の本体 (grep -n → sed の代わり)。非 Rust は見出し配下
-kenning read    <path>:<from>-<to>  # 行範囲 (sed -n 'A,Bp' の代わり)。範囲が跨ぐ定義 / 見出しを頭に列挙
-kenning read    <file>#<見出し>      # md の見出し / toml の [table] / yaml のキー配下 (CHANGELOG を awk で切る代わり)
-kenning find    <substr>            # symbol 名 + ファイル名 (basename) の部分一致 (発見用。`find -name` 相当も兼ねる)
-kenning text    <term>... [-e] [--and] [--files] [path:S]  # 全文検索 + 文脈注釈 (.rs=関数 / .md=見出し階層 /
-                                    #   .toml=[table])。複数語は既定 OR / `--and` で全語 AND (`grep X | grep Y`)、
-                                    #   -e で正規表現 ((?-i) で大小区別)、`--files` で file 別件数だけ (`rg -c` = 広い語の
-                                    #   triage)、path: で dir 絞り。末尾に `# N hits / M files`
-kenning callers <name> [container] [crate:X] [path:S]  # who-calls: 確実 ∪ 未確定候補を位置付き (同名の自由関数は path: で絞る)
-kenning callees <name> [container] [path:S]  # X が呼ぶ先 (outgoing)
-kenning edges                       # 全 cross-file call edge の集計 TSV (from TAB to TAB count)。依存グラフの素材
-kenning refs    <name> [container]  # find-all-refs (要 --scip index、型/読み書きも)
-kenning impls   <trait|type>        # go-to-implementation (trait↔型)
-kenning across  <name>              # 全 repo 横断: 全 repo の定義/利用 + repo 跨ぎ精密参照
-kenning impact  <name> [container] [path:S] [--confirmed-only]  # 変えると壊れる推移的 callers。既定は値渡し参照
-                                    #   (map(f)、名前が一意な時) と候補経由 (名前一致どまりの edge 1 本) も出す。
-                                    #   確定 edge だけなら --confirmed-only
-kenning tests   <name> [container] [path:S]  # これに届くテスト = impact ∩ is_test (変更後に何を回すか。[d]=確定 / [c1]=候補経由)
-kenning path    <from> <to>         # from→to の呼び出し経路 (最短)。to が同名複数 (`park`) なら、終点から同名の定義へ
-                                    #   続く委譲 (enum の振り分け先を含む) を木で続けて出す
+kenning def     <name> [path:S]     # location + signature + first doc line (like hover)
+kenning read    <name> [container] [crate:X] [path:S] [--all]  # body of the definition (def + Read in one step; start here). Narrow same-named ones or --all
+kenning read    <path>:<line>       # body of the item enclosing that line (instead of grep -n → sed). Non-Rust: the section under the heading
+kenning read    <path>:<from>-<to>  # a line range (instead of sed -n 'A,Bp'). Lists the definitions / headings it spans first
+kenning read    <file>#<heading>    # under a md heading / toml [table] / yaml key (instead of cutting CHANGELOG with awk)
+kenning find    <substr>            # substring match on symbol names + file basenames (discovery; doubles as `find -name`)
+kenning text    <term>... [-e] [--and] [--files] [path:S]  # full-text search + context (.rs = function / .md = heading path /
+                                    #   .toml = [table]). Several terms = OR by default / `--and` = every term (`grep X | grep Y`),
+                                    #   -e = regex ((?-i) for case-sensitive), `--files` = per-file counts only (`rg -c`, to
+                                    #   triage a wide term), path: = dir filter. Ends with `# N hits / M files`
+kenning callers <name> [container] [crate:X] [path:S]  # who-calls: confirmed ∪ unresolved candidates, with positions (narrow same-named free fns with path:)
+kenning callees <name> [container] [path:S]  # what X calls (outgoing)
+kenning edges                       # TSV of all cross-file call edges (from TAB to TAB count). Raw material for a dependency graph
+kenning refs    <name> [container]  # find-all-refs (needs a --scip index; includes type refs and reads/writes)
+kenning impls   <trait|type>        # go-to-implementation (trait ↔ type)
+kenning across  <name>              # across all repos: definitions / uses in every repo + precise cross-repo refs
+kenning impact  <name> [container] [path:S] [--confirmed-only]  # transitive callers = what breaks if it changes. By default also
+                                    #   follows pass-by-value refs (map(f), when the name is unique) and via candidates
+                                    #   (one name-match-only edge). Confirmed edges only: --confirmed-only
+kenning tests   <name> [container] [path:S]  # tests that reach it = impact ∩ is_test (what to run after a change. [d] = confirmed / [c1] = via candidates)
+kenning path    <from> <to>         # call chain from → to (shortest). If `to` has several same-named definitions (`park`),
+                                    #   continues from the end as a tree of delegations to them (including enum dispatch targets)
 kenning search  kind:method vis:pub container:Engine calls:unwrap path:engine.rs  # faceted AND
-kenning search  reachable:0         # **消せる候補はこれ**: live root (pub / #[test] / trait 実装 / main /
-                                    #   item 直下マクロ) から到達しない定義。鎖や相互再帰で繋がった dead な塊も
-                                    #   1 パスで出る。定義以外に名前が字句として出る物は自動除外 (--no-lexical で切れる)。
-                                    #   除外の判定は「候補と dead の**定義本体**の外での、コード上の出現」。
-                                    #   コメント / 文字列 / 束縛 (field 宣言・局所変数・`.field` アクセス) は
-                                    #   使用に数えない。cfg で分岐した同名定義も候補から外す (索引は cfg-blind
-                                    #   なので非活性側に流入が付かないため)
-kenning search  attr:deprecated     # 属性の部分一致 (attr:allow(dead_code) / attr:serde / attr:cfg(...))
-kenning search  unsafe:block self:ref  # unsafe:(1|fn|block|0) = unsafe fn / 本体に unsafe block の safe fn (健全性の境界)、
-                                    #   self:(ref|mut|owned|none) = 受け手 (&self / &mut self / self / 無し)
-kenning search  unsafe:1 reachable-from:Engine::pull_raw  # 到達性の facet: reachable-from:X (X から届く) /
-                                    #   reaches:X (X に届く = impact の集合)。確定 + 値渡し参照の edge
-kenning uncovered [facet...]        # どのテストからも静的に届かない fn/method (#8)。候補 edge も数えて届かない物 =
-                                    #   強い主張。候補経由でのみ届く物と trait 実装 (判定外) は別に数える。本命は unsafe:1
-kenning search  kind:fn callers:0 namecalls:0 test:0  # 1 段だけの版 (入次数 0)。定義以外に
-                                    #   名前が字句として出る物は自動で除外 (DSL マクロ等。`--no-lexical` で切れる)。(callers=確実 /
-                                    #   namecalls=名前一致。確実だけ 0 なら「未解決の呼び出しかも」)。method は
-                                    #   `traitimpl:0` も付ける (trait 実装は trait 経由で呼ばれ、構造的に 0 になる)
-kenning outline <path|dir>          # ファイル構造 (Read せず)。`.` で repo の地図。.md/.toml/.yml は見出し構造 = read <file>#… の目次。
-                                    #   dir なら配下 file の地図 (symbol 数 / loc)。`read <path>` も同じ (file 全体は Read)
-kenning changes --since HEAD        # commit していない作業の**意味的な差分** (git diff の意味版、状態なし)。
-                                    #   broken (定義が消えたのに呼び出しが残る。位置 = 残った呼び出し = 直す場所) /
-                                    #   sig (シグネチャ変更 + callers 数) / dead (届かなくなった・足したが繋がっていない) /
-                                    #   revived / callers → 0 (重複定義で解決を奪われた等)。--since は任意の git ref
-                                    #   (`main` / `HEAD~3`)。呼び元数の増減は件数だけ (`--all` で行も)、--json で NDJSON。
-                                    #   継続監視は `--cursor <name>` (起点を kenning 側で進める、呼び手ごとに独立) か
-                                    #   `--since <token>`。snapshot は `<db>.changes/` (自動掃除)
-kenning stats [path:<substr>]        # 規模と解決の内訳 (repo 内確定率 + 外部/同名複数/値渡し/マクロ)
-kenning cache [ls|prune] [--older-than D] [--dry-run]  # 自動 db の棚卸し / 掃除 (repo 消失・旧版を回収)
+kenning search  reachable:0         # **removal candidates**: definitions no live root (pub / #[test] / trait impl / main /
+                                    #   item-level macros) reaches. Dead clusters linked by chains or mutual recursion come out
+                                    #   in one pass. Names that appear lexically outside their definition are dropped
+                                    #   automatically (--no-lexical turns that off). The check is "an occurrence in code outside
+                                    #   the **bodies** of the candidate and the dead definitions". Comments / strings / bindings
+                                    #   (field declarations, locals, `.field` access) do not count as uses. Same-named
+                                    #   definitions split by cfg are also dropped (the index is cfg-blind, so the inactive
+                                    #   side gets no incoming edges)
+kenning search  attr:deprecated     # substring match on attributes (attr:allow(dead_code) / attr:serde / attr:cfg(...))
+kenning search  unsafe:block self:ref  # unsafe:(1|fn|block|0) = unsafe fn / safe fn with an unsafe block in its body (the soundness
+                                    #   boundary), self:(ref|mut|owned|none) = receiver (&self / &mut self / self / none)
+kenning search  unsafe:1 reachable-from:Engine::pull_raw  # reachability facets: reachable-from:X (reached from X) /
+                                    #   reaches:X (reaches X = the impact set). Confirmed + pass-by-value edges
+kenning uncovered [facet...]        # fn/methods no test reaches statically (#8). Unreached even counting candidate edges =
+                                    #   a strong claim. Reached only via candidates and trait impls (not judged) are counted
+                                    #   separately. The main use is unsafe:1
+kenning search  kind:fn callers:0 namecalls:0 test:0  # the one-level version (in-degree 0). Names that appear lexically
+                                    #   outside their definition are dropped automatically (DSL macros etc.; `--no-lexical`
+                                    #   turns it off). (callers = confirmed / namecalls = name matches. Only confirmed at 0 =
+                                    #   "maybe an unresolved call".) For methods add `traitimpl:0` (trait impls are called
+                                    #   through the trait, so they are structurally 0)
+kenning outline <path|dir>          # file structure without reading it. `.` = map of the repo. .md/.toml/.yml = heading
+                                    #   structure = the table of contents for read <file>#…. For a dir, a map of its files
+                                    #   (symbol count / loc). `read <path>` does the same (whole file: Read)
+kenning changes --since HEAD        # **semantic diff** of uncommitted work (a meaning-level git diff, stateless).
+                                    #   broken (definition removed but calls remain; position = the remaining call = where to fix) /
+                                    #   sig (signature changed + caller count) / dead (no longer reached, or added but not wired up) /
+                                    #   revived / callers → 0 (e.g. a duplicate definition stole the resolution). --since takes any
+                                    #   git ref (`main` / `HEAD~3`). Caller-count changes are counts only (`--all` for rows),
+                                    #   --json for NDJSON. For continuous monitoring use `--cursor <name>` (kenning advances the
+                                    #   baseline, independently per caller) or `--since <token>`. Snapshots live in `<db>.changes/`
+                                    #   (pruned automatically)
+kenning stats [path:<substr>]       # size and resolution breakdown (in-repo confirmed rate + external / same-named / by value / macro)
+kenning cache [ls|prune] [--older-than D] [--dry-run]  # inventory / cleanup of the automatic dbs (reclaims missing repos and old versions)
 ```
 
-索引対象は **rg と同じ規約** (.gitignore / .ignore / 隠し dir を尊重、`target/` と `node_modules/` は常に除外)。
-gitignore 済みだが実際に compile される生成 `.rs` を持つ repo だけ `KENNING_NO_IGNORE=1`。
+What gets indexed follows **the same rules as rg** (respects .gitignore / .ignore / hidden dirs; `target/` and
+`node_modules/` are always excluded). Only repos with gitignored generated `.rs` that is actually compiled need
+`KENNING_NO_IGNORE=1`.
 
-手動制御が要る時だけ: `--db <path>` / env `KENNING_DB` (明示 db は自動 index しない)、
-`KENNING_NO_AUTO=1` (魔法全停止)、`KENNING_NO_STALE=1` (鮮度チェックのみ停止)。
-binary は `~/.cargo/bin/kenning` (cargo install --path . 済み)。
+Manual control, only when needed: `--db <path>` / env `KENNING_DB` (an explicit db is not auto-indexed),
+`KENNING_NO_AUTO=1` (turns off all the magic), `KENNING_NO_STALE=1` (turns off only the freshness check).
+The binary is `~/.cargo/bin/kenning` (installed with cargo install --path .).
 
-## リファクタの途中の確認 (cargo check を毎回回さない)
+## Checking mid-refactor (don't run cargo check every time)
 
-何ファイルにも跨る変更の**途中**は `kenning changes --since HEAD` で確認し、シグネチャを変えた物は
-`kenning callers <name>` で直す場所を列挙する。**`cargo check` はターンの最後に 1 回** (正確さの最終関門)。
-並列 session が多い機械では build の CPU と `target/` の lock 待ちが効くため。実測 (enchudb 13 crate、増分):
+**During** a change that spans many files, check with `kenning changes --since HEAD`, and for anything whose signature
+changed, list the places to fix with `kenning callers <name>`. **Run `cargo check` once at the end of the turn** (the
+final gate for correctness). On machines with many parallel sessions, build CPU and waiting on the `target/` lock add up.
+Measured (enchudb, 13 crates, incremental):
 
-| 編集 | kenning changes | cargo check |
+| Edit | kenning changes | cargo check |
 |---|---|---|
-| 本体だけ変更 | 0.5 CPU 秒 / 0.5 s | 32 CPU 秒 / 7〜11 s |
-| pub fn の sig 変更 (呼び元 113) | 0.2 CPU 秒 / 0.3 s | 3.7 CPU 秒 / 2.6〜3 s (エラー 35 件) |
+| body-only change | 0.5 CPU s / 0.5 s | 32 CPU s / 7–11 s |
+| pub fn signature change (113 callers) | 0.2 CPU s / 0.3 s | 3.7 CPU s / 2.6–3 s (35 errors) |
 
-changes は syn 層の近似で型エラーは見ない — 途中の目安であって `cargo check` の代わりではない。
-逆に `cargo check` が黙る物 (重複定義で呼び出しの解決を奪われた = callers → 0、pub のまま誰も呼ばない)
-は changes にしか出ない。
+changes is an approximation at the syn layer and does not see type errors — a mid-way check, not a replacement for
+`cargo check`. Conversely, things `cargo check` stays silent about (a duplicate definition stealing call resolution =
+callers → 0, a pub item nobody calls) show up only in changes.
 
-## 精度を上げる (bake = 一発)
+## Raising precision (bake = one step)
 
 ```bash
-kenning bake        # repo 内で。RA scip (features=all 注入) → 精密 index まで自動
+kenning bake        # inside the repo. RA scip (injects features=all) → precise index, all automatic
 ```
-who-calls/refs が **rust-analyzer と同じ正確さ**になる。焼くのは **cwd を含む cargo workspace**
-(repo root 全体ではない。RA は 1 project しか読めないため。曖昧なら焼かずに選択を促す)。
-syn 層の索引は repo 全体のままなので、workspace 外は精度控えめで動き続ける。常駐なしのバッチで、実測は
-kenning (3 rs) 10s / 1.0GB、enchudb (256 rs、12 crate) 初回 3 分 (依存の build script 込み) → 2 回目 26s / 2.3GB。
-features=all → default の順に試す。all は optional dep の build script (bundled C++ / binary DL) で数分かかり、
-RA が固まる事故もあるので上限 15 分 (`KENNING_BAKE_TIMEOUT=<秒>`) で group ごと止めて default に退避、
-以後その repo は marker (`<db>.bake-default`) で default から焼く。最初から default なら `KENNING_BAKE_DEFAULT_FEATURES=1`。
-repo が RUSTFLAGS 前提の custom cfg を要る場合 (tokio の `--cfg tokio_unstable` 等。Cargo.toml に
-現れないので自動では当てられない) は `KENNING_BAKE_RUSTFLAGS='--cfg tokio_unstable' kenning bake`
-— 実測で tokio の確定率 59.2% → 65.0%。
-空きメモリゲート + 直列 lock 付き — 刺さる状況では焚かない。bake しなくても syn 層で全 navigation は
-動く (精度控えめ・嘘なし)。
+who-calls / refs become **as precise as rust-analyzer**. What gets baked is **the cargo workspace containing the cwd**
+(not the whole repo root: RA reads only one project. If it is ambiguous, kenning asks you to choose instead of baking).
+The syn-layer index still covers the whole repo, so code outside the workspace keeps working at lower precision. It is a
+batch run with nothing resident. Measured: kenning (3 rs) 10 s / 1.0 GB; enchudb (256 rs, 12 crates) 3 min the first time
+(including dependency build scripts) → 26 s / 2.3 GB the second time.
+It tries features=all, then default. all can take minutes on optional dependencies' build scripts (bundled C++ / binary
+downloads) and RA has been seen to hang, so it is capped at 15 min (`KENNING_BAKE_TIMEOUT=<seconds>`): the whole process
+group is stopped, it falls back to default, and from then on that repo bakes from default via a marker
+(`<db>.bake-default`). To start with default, set `KENNING_BAKE_DEFAULT_FEATURES=1`.
+If the repo needs custom cfgs from RUSTFLAGS (e.g. tokio's `--cfg tokio_unstable`; they don't appear in Cargo.toml, so
+they can't be applied automatically), use `KENNING_BAKE_RUSTFLAGS='--cfg tokio_unstable' kenning bake`
+— measured: tokio's confirmed rate 59.2% → 65.0%.
+It has a free-memory gate and a serializing lock — it won't fire when it would get stuck. Without a bake, all navigation
+still works on the syn layer (lower precision, never wrong).
 
-**自動 bake (既定オン、一度手で bake した repo だけ):** bake 後 20 ファイル変わると、query の増分 update が
-裏で `bake` を切り離して起動する (nice・別 process group、query は待たない、ログ `<db>.auto-bake.log`)。
-活発な repo では放置すると効きが数日で消えるため (enchudb 実測: 確定率 80.2% → 193 file 変更後 18.5%)。
-起こさない条件: 前回起動から 30 分以内 / load が CPU 数以上 / 空きメモリ不足 (bake 側ゲート) / 別の bake 中。
-**無効化は `KENNING_AUTO_BAKE=0`** (`KENNING_NO_AUTO=1` でも止まる)。stderr の 1 行で状態が分かる。
+**Auto-bake (on by default, only for repos you baked by hand once):** once 20 files have changed since the bake, a
+query's incremental update starts a detached `bake` in the background (nice, separate process group, the query doesn't
+wait, log in `<db>.auto-bake.log`). On an active repo the benefit otherwise fades within days (enchudb measured: confirmed
+rate 80.2% → 18.5% after 193 files changed).
+It does not start: within 30 min of the previous start / when load ≥ CPU count / when free memory is short (the bake's
+own gate) / while another bake runs.
+**Disable with `KENNING_AUTO_BAKE=0`** (`KENNING_NO_AUTO=1` also stops it). The one stderr line tells you the state.
 
-## 出力の読み方 (Claude 向け)
+## Reading the output (for Claude)
 
-- 各行 `path:line<TAB>詳細` = **そのまま Read に渡せる**。stdout はデータのみ (装飾なし・決定的順序)。
-- 出力に出る修飾名 (`Engine::open_readonly` / `IndexLock::acquire`) は **そのまま次のコマンドの引数に渡せる**
-  (`def` / `read` / `callers` / `callees` / `refs` / `impact` / `tests` / `path` / `across`)。同名の絞り込みが 1 手で済む。
-- stderr は自動 index / update の要点 1 行 (初回 2 行) と `⚠` 警告だけ。捨てずに読む (古い結果の警告が載る)。
-- `#` 行 = 件数と次の一手 (「確実 N + 候補 M」「絞る: callers X <container>」など)。
-- `in (item 直下)` = 関数の外 (item 直下のマクロ引数、`criterion_group!(benches, bench_x, …)` など) からの参照。
-- 候補の `[macro-token]` = parse できない DSL マクロ (proptest! 等) の中で字句として見つけた呼び出し。
-  当て推量なので確定はしない (「確実 = 誤りなし」を保つ) が、「使われているか」には答えられる。
-- 候補の `[method-name]` = 受け手の型が分からない method 呼び (`x.f()`)。同名 method が repo に
-  1 つしか無くても確定しない (std/dep の `.next()` / `.len()` を自前の定義に誤確定しないため)。
-  確定するのは受け手の型がソースに書いてある物 (`self` / 引数・`let` の型 / `T::new()` や自由関数の戻り値 /
-  `Box::pin(x)` 越し) と SCIP が答えた分。bake すればここは減る。
-- 候補の `[external]` = SCIP または名前照合が「呼び先は repo の外 (std / 依存 crate)」と判定した物。
-  同名の定義が repo にあっても、その呼び出しは別物という意味。
-- 候補の `[value-ref]` = 関数を値として渡した参照 (`map(f)` / `&f` / `Some(f)` / `S { f: g }` / `vec![f]`)。
-  同じボディで束縛された名前 (局所変数) は除外済み。呼ぶのは渡した先なので確定しないが、
-  「まだ使われているか」の判断には使える (`search callers:0 namecalls:0` の偽 "未使用" を防ぐのはこれ)。
-- trait 実装 method の `callers` が 0 件なのは **trait 経由で呼ばれる**から (未使用ではない)。その旨と
-  `impls <Trait>` への導線が `#` 行に出る。未使用判定は `search … traitimpl:0` で外す。
-- `callers` は **確実 (callee_sym 逆引き、誤りなし) + 候補 (未確定=要 Read で確認) + 別 sym に確定** の3分割。
-  「全 caller を掴んだか」はこの3つの合計で判断でき、grep に戻らなくていい。
-- `tests` / `impact` は **確定 `[dN]` (N = 呼び出しの段数) + 候補経由 `[c1]`** の 2 層。`[c1]` = 確定では届かず、
-  名前一致どまりの edge (受け手の型が分からない method 呼び / trait 経由の呼び出し = `impl Stream for X` の
-  `poll_next` を generic な包みが呼ぶ形) を 1 本通って届く物。静的に届き得るのは両方で全部なので、grep で
-  足さなくていい。回すテストは両方が安全側、絞るなら `[c1]` を読んで判断。同名定義が多すぎて候補を辿らなかった
-  名前は `#` 行に出る (`callers <その修飾名>` の⚠で確認)。`Drop::drop` は名前で呼べないので候補にしない。
-- `use a::f as g` の `g()` は `f` の呼び出しとして数える (`callers f` に出る)。`use a::{self as aa}` / `use a::T as U` も同じ。
-- 名前が無いと **近い名前を自動提案** (typo 救済)。
+- Each row is `path:line<TAB>detail` = **can go straight to Read**. stdout is data only (no decoration, deterministic order).
+- Qualified names in the output (`Engine::open_readonly` / `IndexLock::acquire`) **can be passed straight to the next
+  command** (`def` / `read` / `callers` / `callees` / `refs` / `impact` / `tests` / `path` / `across`). Narrowing
+  same-named symbols takes one step.
+- stderr is only the one-line summary of auto index / update (two lines the first time) and `⚠` warnings. Read it, don't
+  discard it (stale-result warnings appear there).
+- `#` lines = counts and the next step ("N confirmed callers", "N unresolved candidates", "narrow with container /
+  crate:X / path:S", etc.).
+- `in (item level)` = a reference from outside any function (arguments of an item-level macro such as
+  `criterion_group!(benches, bench_x, …)`).
+- `[macro-token]` on a candidate = a call found lexically inside a DSL macro that can't be parsed (proptest! etc.).
+  It is a guess, so it is never confirmed (keeping "confirmed = never wrong"), but it does answer "is this used?".
+- `[method-name]` on a candidate = a method call whose receiver type is unknown (`x.f()`). Even if the repo has only one
+  method of that name, it is not confirmed (so std/dep `.next()` / `.len()` aren't wrongly confirmed to your own
+  definition). Confirmed are the ones whose receiver type is written in the source (`self` / argument and `let` types /
+  return values of `T::new()` and free functions / through `Box::pin(x)`) and whatever SCIP answered. Baking shrinks this.
+- `[external]` on a candidate = SCIP or name matching decided the callee is outside the repo (std / a dependency crate).
+  Even if the repo has a same-named definition, that call is something else.
+- `[value-ref]` on a candidate = a reference passing the function as a value (`map(f)` / `&f` / `Some(f)` / `S { f: g }` /
+  `vec![f]`). Names bound in the same body (locals) are already excluded. The call happens wherever it was passed, so it
+  is not confirmed, but it tells you whether something is still used (this is what prevents false "unused" from
+  `search callers:0 namecalls:0`).
+- 0 `callers` for a trait-impl method means it is **called through the trait** (not unused). A `#` line says so and
+  points to `impls <Trait>`. Exclude them from unused checks with `search … traitimpl:0`.
+- `callers` is split three ways: **confirmed (never wrong) + unresolved candidates (check them with Read) + resolved to
+  another same-named symbol**. Whether you have every caller is decided by the sum of the three; no need to go back to grep.
+- `tests` / `impact` have two layers: **confirmed `[dN]` (N = call depth) + via candidates `[c1]`**. `[c1]` = not reached
+  by confirmed edges, but reached by crossing one name-match-only edge (a method call with an unknown receiver type /
+  a call through a trait = a generic wrapper calling `poll_next` of `impl Stream for X`). Together they are everything
+  statically reachable, so don't add grep results. Running both sets of tests is the safe side; to narrow, read `[c1]`
+  and decide. Names with too many same-named definitions to follow candidates appear on a `#` line (check with the ⚠ of
+  `callers <that qualified name>`). `Drop::drop` can't be called by name, so it is never a candidate.
+- `g()` from `use a::f as g` counts as a call to `f` (it shows up in `callers f`). Same for `use a::{self as aa}` /
+  `use a::T as U`.
+- An unknown name **suggests similar names automatically** (typo rescue).
 
-## 効いてくる正直な限界
+## Honest limits that matter
 
-- **鮮度は自動 (query 時に古ければ増分 update してから回答、ms オーダー)。** 判定は既知 dir / file の stat のみ
-  (walk は dir に増減があった時だけ)、編集直後の query は編集した file だけ読む。lock が取れない時だけ
-  古い結果+stderr 警告に落ちる。full 再 index (heal / 初回) は db ごとの flock で直列化 — 並列に叩いても
-  待って成果を再利用するだけで、壊れも二重焼きもしない (作りかけは `<db>.tmp-<pid>` に焼いて rename で差し替え)。
-- **精度は食わせた SCIP の feature 網羅に依存 (GIGO)。** 確定 facts は rust-analyzer のもの。
-- **`stats` の率は「repo 内呼び出しのうち確定できた割合」。** std / 依存 crate への呼び出しは
-  index に定義が無く構造的に解決不能なので分母から外す (混ぜると corpus の外部依存率になる —
-  tokio は call-site の 47% が外部)。実測: bake 済みで tokio 73.7% / ripgrep 92.7% / enchudb 89.5%、
-  syn 層のみだと 29〜61% (書いてある型から受け手が読めない method は確定させない分)。`stats path:<substr>` で
-  repo の一部だけの率も出る (どこなら確定を信じてよいかが分かる)。
-- **hover / 補完 / 診断 / 式の型推論は無い** (人間のエディタ用機能。Claude は Read + `cargo check` で足りる)。
-- **full 再 index (INDEX_VER 更新 / heal / 明示 index) は SCIP facts を落とす。** 精度が黙って syn 層まで
-  下がるので、その時は stderr に焼き直し推奨が出る。今の状態は `kenning stats` の `bake:` 行で分かる。
-- index は派生物 → **VCS に混ぜない** (gitignore、local に持つ)。
+- **Freshness is automatic (a query on a stale index updates incrementally first, in milliseconds).** The check only
+  stats known dirs / files (a walk happens only when a dir gained or lost entries), and a query right after an edit reads
+  only the edited files. Only when the lock can't be taken does it fall back to the old result + a stderr warning. Full
+  re-indexes (heal / first time) are serialized by a per-db flock — hitting it in parallel just waits and reuses the
+  result, never corrupting or building twice (the work in progress is built in `<db>.tmp-<pid>` and swapped in by rename).
+- **Precision depends on the feature coverage of the SCIP you feed it (GIGO).** Confirmed facts come from rust-analyzer.
+- **The rate in `stats` is "the share of in-repo calls that could be confirmed".** Calls into std / dependency crates
+  have no definition in the index and are structurally unresolvable, so they are left out of the denominator (mixing
+  them in turns it into the corpus's external-dependency rate — 47% of tokio's call sites are external). Measured: baked
+  tokio 73.7% / ripgrep 92.7% / enchudb 89.5%; syn layer alone 29–61% (because methods whose receiver can't be read from
+  written types are not confirmed). `stats path:<substr>` gives the rate for part of the repo (tells you where confirmed
+  results can be trusted).
+- **No hover / completion / diagnostics / expression type inference** (editor features for humans; Claude gets by with
+  Read + `cargo check`).
+- **A full re-index (INDEX_VER bump / heal / explicit index) drops the SCIP facts.** Precision silently falls to the syn
+  layer, so stderr recommends re-baking when it happens. The current state is on the `bake:` line of `kenning stats`.
+- The index is derived data → **keep it out of VCS** (gitignore it, keep it local).
