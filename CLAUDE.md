@@ -21,7 +21,7 @@ kenning changes --since HEAD         # semantic diff of uncommitted work (broken
 
 `callers` accounts for every call site of the name: confirmed / candidates (need a look) /
 resolved to another same-named symbol (listed per target) — no need to re-count with grep.
-Same-named symbols: narrow with a container (`callers new Engine`) or `path:`.
+Same-named symbols: narrow with a container (`callers new Engine`; `-` = the free fn) or `path:`.
 Mid-refactor, check with `changes --since HEAD`; run `cargo check` once at the end of the turn.
 `kenning bake` (one rust-analyzer run, nothing resident) raises precision; baked repos re-bake in the
 background (`KENNING_AUTO_BAKE=0` to stop). Details: `kenning read docs/GUIDE.md#<heading>`.

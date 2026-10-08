@@ -638,7 +638,7 @@ pub(crate) fn run_read(db_path: &str, name: &str, narrow: &Narrow, all: bool, li
     }
     if defs.len() > 1 && !all {
         println!(
-            "# \"{name}\" has {} same-named definitions. Narrow: `read {name} <container>` / `crate:<crate>` / `path:<part of path>`; show all with `--all`:",
+            "# \"{name}\" has {} same-named definitions. Narrow: `read {name} <container>` (`-` = free fn) / `crate:<crate>` / `path:<part of path>`; show all with `--all`:",
             defs.len()
         );
         print_syms(&sym_t, &paths, &defs, limit, true);
@@ -755,7 +755,7 @@ pub(crate) fn search_hits(sym_t: &Table, call_t: &Table, paths: &HashMap<EntityI
                 q = q.where_eq("name", n);
                 applied.push(format!("name={n}"));
                 if let Some(c) = c.filter(|_| !facets.iter().any(|f| f.starts_with("container:"))) {
-                    q = q.where_eq("container", c);
+                    q = q.where_eq("container", container_arg(c));
                     applied.push(format!("container={c}"));
                 }
             }
@@ -792,7 +792,7 @@ pub(crate) fn search_hits(sym_t: &Table, call_t: &Table, paths: &HashMap<EntityI
             // 入次数 0 (`callers:0`) と違い、鎖や相互再帰で繋がった dead な塊も 1 パスで出る。
             "reachable" => { want_reachable = Some(bool01(v) == 1); applied.push(format!("reachable={v}")); }
             "crate" => { q = q.where_eq("crate_", v); applied.push(format!("crate={v}")); }
-            "container" => { q = q.where_eq("container", v); applied.push(format!("container={v}")); }
+            "container" => { q = q.where_eq("container", container_arg(v)); applied.push(format!("container={v}")); }
             "module" => { q = q.where_eq("module", v); applied.push(format!("module={v}")); }
             "calls" => { calls_filters.push(v.to_string()); applied.push(format!("calls={v}")); }
             // 到達性を facet に (#7): graph 系の集合と他の facet を AND できる。edge は impact と同じ確定 + 値渡し参照。
@@ -957,16 +957,16 @@ pub(crate) fn run_callers(db_path: &str, name: &str, narrow: &Narrow, limit: usi
             let er = sym_t.entity(*d);
             let ct = txt(er.get("container"));
             let path = paths.get(&ref_of(er.get("file"))).map(String::as_str).unwrap_or("?");
-            println!("  {n:>5}  {}::{name}  ({})  {path}:{}", if ct.is_empty() { "·".into() } else { ct }, txt(er.get("crate_")), num(er.get("line")));
+            println!("  {n:>5}  {}::{name}  ({})  {path}:{}", if ct.is_empty() { FREE_FN.into() } else { ct }, txt(er.get("crate_")), num(er.get("line")));
         }
         let unresolved = name_total.saturating_sub(precise_sum);
         let top = sym_t.entity(rows[0].1);
         let hint = match txt(top.get("container")) {
-            // 自由関数は container が無い → 定義の file で絞る
-            c if c.is_empty() => format!("path:{}", paths.get(&ref_of(top.get("file"))).map(String::as_str).unwrap_or("?")),
+            // 自由関数は container の代わりに印 + 定義の file で絞る (同じ file の `Type::name` と割れる)
+            c if c.is_empty() => format!("- path:{}", paths.get(&ref_of(top.get("file"))).map(String::as_str).unwrap_or("?")),
             c => c,
         };
-        println!("# narrow: `callers {name} <container>` / `crate:<crate>` / `path:<part of path>` (e.g. `callers {name} {hint}`) — unresolved candidates are listed with positions too");
+        println!("# narrow: `callers {name} <container>` (`-` = free fn) / `crate:<crate>` / `path:<part of path>` (e.g. `callers {name} {hint}`) — unresolved candidates are listed with positions too");
         if unresolved > 0 {
             println!("# {precise_sum} of {name_total} call sites with this name confirmed. The other {unresolved} are unresolved candidates (narrow to see positions).");
         }
@@ -1169,7 +1169,7 @@ pub(crate) fn run_callees(db_path: &str, name: &str, narrow: &Narrow, limit: usi
     }
     if defs.len() > 1 {
         // 同名を混ぜて読まれないよう、定義ごとに分けて出すことを先に言う。
-        println!("# \"{name}\"{} has {} same-named definitions — listed per definition (narrow with container / crate:X / path:S)", narrow.describe(), defs.len());
+        println!("# \"{name}\"{} has {} same-named definitions — listed per definition (narrow with container (`-` = free fn) / crate:X / path:S)", narrow.describe(), defs.len());
     }
     for &d in &defs {
         println!("{}", fmt_sym(&sym_t, &paths, d));

@@ -105,7 +105,7 @@ kenning text    <term>... [-e] [--and] [--files] [path:S]
                                     the line (`grep X | grep Y`), -e = regex, --files = per-file
                                     hit counts (`rg -c`, for triaging a wide term), path: = dir filter
 kenning callers <name> [container] [crate:X] [path:S]  who-calls: confirmed ∪ unresolved candidates,
-                                    with positions (crate: / path: narrow same-named free fns)
+                                    with positions (container `-` = the free fn; crate: / path: also narrow)
 kenning callees <name> [container] [path:S]  outgoing calls
 kenning edges                       all cross-file call edges, aggregated (from\tto\tcount TSV)
 kenning refs    <name> [container]  find-all-references (needs bake; includes type refs, read/write)

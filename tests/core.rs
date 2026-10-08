@@ -779,6 +779,23 @@ fn callees_and_def_honor_narrowing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 同じ file に `C::dup` と自由関数 `dup` が並ぶと path: では割れない。自由関数は `-` (出力の `·::dup` も) で選ぶ。
+#[test]
+fn free_fn_is_selectable_next_to_a_same_named_method() {
+    let (_dir, db) = indexed();
+    let out = query(&["def", "dup", "-"], &db);
+    assert!(out.contains("1 symbols") && out.contains("fn dup") && !out.contains("C::dup"), "def で自由関数だけ:\n{out}");
+    let out = query(&["read", "dup", "-"], &db);
+    assert!(out.contains("pub fn dup() {}") && !out.contains("pub fn dup(&self) {}"), "read で自由関数だけ:\n{out}");
+    let out = query(&["callers", "·::dup"], &db);
+    let head = out.lines().next().unwrap_or("");
+    assert!(!out.contains("same-named definitions") && head.contains("pub fn dup ") && !head.contains("C::dup"), "出力の表記 ·::dup をそのまま受ける:\n{out}");
+    let out = query(&["callees", "dup", "container:-"], &db);
+    assert!(!out.contains("same-named") && !out.contains("is not defined"), "container:- も同じ:\n{out}");
+    let out = query(&["callers", "dup"], &db);
+    assert!(out.contains("·::dup") && out.contains("`-` = free fn"), "一覧が自由関数の印と選び方を出す:\n{out}");
+}
+
 /// macro 引数の中の呼び出し (`println!("{}", target())`) も call graph に入ること。
 /// ここが抜けていると「確実 + 候補 + 別 sym の合計 = 全 caller」という kenning の中心的な約束が破れ、
 /// 実際に使われている関数が `callers 0` に見える (この repo の append_src / role_name がそうだった)。

@@ -105,7 +105,7 @@ kenning text    <term>... [-e] [--and] [--files] [path:S]
                                     -e で正規表現、--files で file 別件数だけ (rg -c 相当の
                                     triage)、path: で dir 絞り
 kenning callers <name> [container] [crate:X] [path:S]  who-calls: 確実 ∪ 未確定候補を位置付きで
-                                    (同名の自由関数は crate: / path: で絞る)
+                                    (同名は container で、自由関数は `-` か crate: / path: で絞る)
 kenning callees <name> [container] [path:S]  呼ぶ先 (outgoing)
 kenning edges                       全 cross-file call edge を集計 (from\tto\tcount TSV)
 kenning refs    <name> [container]  find-all-references (要 bake; 型参照・読み書きも)

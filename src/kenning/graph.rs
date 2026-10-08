@@ -208,7 +208,7 @@ pub fn cmd_refs(args: &[String]) {
         for (n, d) in rows.iter().take(o.limit) {
             let er = sym_t.entity(*d);
             let ct = txt(er.get("container"));
-            println!("  {n:>5}  {}::{name}  ({})", if ct.is_empty() { "·".into() } else { ct }, txt(er.get("crate_")));
+            println!("  {n:>5}  {}::{name}  ({})", if ct.is_empty() { FREE_FN.into() } else { ct }, txt(er.get("crate_")));
         }
         println!("# narrow: `refs {name} <container>`");
         return;
@@ -366,6 +366,14 @@ pub(crate) fn split_qualified(s: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// 自由関数 (container 無し) の表記。出力 (`callers` の同名一覧の `·::f`) と入力で同じ印を使う。
+/// 入力は打ちやすい `-` も受ける。同じ file に `Type::f` と自由関数 `f` が並ぶと path: では割れないので要る。
+pub(crate) const FREE_FN: &str = "·";
+/// 入力の container 指定を sym の container 値に直す (自由関数の印 → "")。
+pub(crate) fn container_arg(c: &str) -> &str {
+    if c == FREE_FN || c == "-" { "" } else { c }
+}
+
 /// name[+container] → 定義 eid 群 (def/read/callers/callees/refs/impact/tests/path 共通、DRY)。
 /// container 未指定なら `Type::method` 形を分解して受ける (出力 → 次のコマンドの往復を閉じる)。
 pub(crate) fn defs_of(sym_t: &Table, name: &str, container: Option<&str>) -> Vec<EntityId> {
@@ -373,7 +381,7 @@ pub(crate) fn defs_of(sym_t: &Table, name: &str, container: Option<&str>) -> Vec
     let (name, parsed) = split_qualified(name);
     let container = container.or(parsed);
     let mut defs = sym_t.where_eq("name", name).find().unwrap();
-    if let Some(c) = container {
+    if let Some(c) = container.map(container_arg) {
         defs.retain(|&e| txt(sym_t.entity(e).get("container")) == c);
     }
     defs

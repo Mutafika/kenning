@@ -34,7 +34,7 @@ kenning text    <term>... [-e] [--and] [--files] [path:S]  # full-text search + 
                                     #   .toml = [table]). Several terms = OR by default / `--and` = every term (`grep X | grep Y`),
                                     #   -e = regex ((?-i) for case-sensitive), `--files` = per-file counts only (`rg -c`, to
                                     #   triage a wide term), path: = dir filter. Ends with `# N hits / M files`
-kenning callers <name> [container] [crate:X] [path:S]  # who-calls: confirmed ∪ unresolved candidates, with positions (narrow same-named free fns with path:)
+kenning callers <name> [container] [crate:X] [path:S]  # who-calls: confirmed ∪ unresolved candidates, with positions (container `-` selects the free fn; crate: / path: also narrow)
 kenning callees <name> [container] [path:S]  # what X calls (outgoing)
 kenning edges                       # TSV of all cross-file call edges (from TAB to TAB count). Raw material for a dependency graph
 kenning refs    <name> [container]  # find-all-refs (needs a --scip index; includes type refs and reads/writes)
