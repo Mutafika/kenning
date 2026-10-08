@@ -135,6 +135,15 @@ It does not start: within 30 min of the previous start / when load ≥ CPU count
 own gate) / while another bake runs.
 **Disable with `KENNING_AUTO_BAKE=0`** (`KENNING_NO_AUTO=1` also stops it). The one stderr line tells you the state.
 
+**When a bake keeps failing**, every query says so on stderr until a bake succeeds — otherwise the repo silently drops
+to syn precision (enchudb went 7 weeks unnoticed):
+`# ⚠ bake failing since <date> (<reason>) — last good bake <date>; files changed since then are at syn (heuristic) precision`.
+The failure (first/last time, reason) is kept in `<db>.bake-fail` by both manual and auto bakes and removed on success.
+rust-analyzer 1.93 panics with `file emitted multiple times` when one file belongs to several crates (the usual
+`tests/common/mod.rs` included by two integration tests with `mod common;`). RA doesn't name the file; kenning follows the
+`mod` declarations from every crate root (lib / main / bin / tests / examples / benches / `path =`) and names it. Fix by
+keeping one includer, moving the helpers into a crate, or `rustup update` (1.94.1 bakes the same layout fine).
+
 ## Reading the output (for Claude)
 
 - Each row is `path:line<TAB>detail` = **can go straight to Read**. stdout is data only (no decoration, deterministic order).

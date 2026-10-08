@@ -262,6 +262,7 @@ mod graph;
 mod bench;
 mod cache;
 mod changes;
+mod bake_diag;
 
 pub(crate) use parse::*;
 pub(crate) use scip_facts::*;
@@ -274,6 +275,7 @@ pub(crate) use graph::*;
 pub(crate) use bench::*;
 pub(crate) use cache::*;
 pub(crate) use changes::*;
+pub(crate) use bake_diag::*;
 
 #[cfg(test)]
 mod tests;

@@ -1047,3 +1047,72 @@ fn blanket_self_types_are_params_or_pointers_to_params() {
     assert!(!is("impl<R> Tr for BufReader<R> {}"), "型引数を持つ具体的な型は blanket ではない");
     assert!(!is("impl Tr for A {}"));
 }
+
+#[test]
+fn ymd_formats_utc_dates() {
+    assert_eq!(ymd(0), "1970-01-01");
+    assert_eq!(ymd(951_868_800), "2000-03-01");
+    assert_eq!(ymd(1_709_164_800), "2024-02-29");
+    assert_eq!(ymd(1_709_251_199), "2024-02-29", "日の終わりまで同じ日");
+}
+
+/// RA の panic は「thread 'main' panicked at …:」の次の行が本文 (#18 の理由 1 行)。
+#[test]
+fn ra_failure_reason_takes_the_panic_message() {
+    let errs = "noise\nthread 'main' panicked at src/tools/rust-analyzer/crates/rust-analyzer/src/cli/scip.rs:227:17:\nInvariant violation: file emitted multiple times.\nnote: run with `RUST_BACKTRACE=1`\n";
+    assert_eq!(ra_failure_reason(errs), "rust-analyzer panicked: Invariant violation: file emitted multiple times");
+    assert!(ra_failure_reason("a\nerror: could not load workspace\n").contains("could not load workspace"));
+    assert_eq!(ra_failure_reason(""), "rust-analyzer failed without output");
+}
+
+/// 失敗の記録は連続失敗の最初の時刻を保ち、成功で消える (#18)。query の警告はそれを 1 行で言う。
+#[test]
+fn bake_failure_is_recorded_kept_since_first_and_cleared() {
+    let d = std::env::temp_dir().join(format!("kenning-test-bakefail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let db = d.join("x.db").to_string_lossy().to_string(); // db 自体は無い = last_ok 0
+    assert!(bake_failure_warning(&db).is_none());
+    std::fs::write(bake_fail_marker(&db), "since\t951868800\nlast\t951868800\nlast_ok\t0\nreason\told\n").unwrap();
+    record_bake_failure(&db, "rust-analyzer panicked: boom\nsecond line");
+    let f = read_bake_failure(&db).unwrap();
+    assert_eq!(f.since, 951_868_800, "連続失敗なら最初の時刻のまま");
+    assert!(f.last > f.since);
+    assert_eq!(f.reason, "rust-analyzer panicked: boom", "理由は 1 行");
+    let w = bake_failure_warning(&db).unwrap();
+    assert!(w.contains("bake failing since 2000-03-01") && w.contains("boom") && w.contains("never baked successfully; everything is at syn"), "{w}");
+    clear_bake_failure(&db);
+    assert!(bake_failure_warning(&db).is_none());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// 複数の crate root から届く file を名指しする (#19)。tests/common の定番形、`#[path]`、inline module の入れ子。
+#[test]
+fn files_shared_by_crates_finds_the_common_test_module() {
+    let d = std::env::temp_dir().join(format!("kenning-test-shared-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    for sub in ["src/inl", "src/x", "tests/common"] {
+        std::fs::create_dir_all(d.join(sub)).unwrap();
+    }
+    let w = |p: &str, s: &str| std::fs::write(d.join(p), s).unwrap();
+    w("Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.0.0\"\n");
+    w("src/lib.rs", "#[path = \"x/imp.rs\"]\nmod imp;\nmod inl {\n    mod deep;\n}\n");
+    w("src/x/imp.rs", "");
+    w("src/inl/deep.rs", "");
+    w("tests/a.rs", "mod common;\n");
+    w("tests/b.rs", "mod common;\n");
+    w("tests/solo.rs", "");
+    w("tests/common/mod.rs", "pub mod util;\n");
+    w("tests/common/util.rs", "");
+    let lib = module_files(&d.join("src/lib.rs"));
+    assert!(lib.contains(&d.join("src/x/imp.rs")) && lib.contains(&d.join("src/inl/deep.rs")), "#[path] と入れ子: {lib:?}");
+    let shared = files_shared_by_crates(&d);
+    let names: Vec<String> = shared.iter().map(|(f, rs)| format!("{} {}", f.strip_prefix(&d).unwrap().display(), rs.len())).collect();
+    assert_eq!(names, vec!["tests/common/mod.rs 2", "tests/common/util.rs 2"]);
+    let (report, summary) = shared_file_report(&d).unwrap();
+    assert!(report.contains("tests/common/mod.rs  ← tests/a.rs, tests/b.rs"), "{report}");
+    assert_eq!(summary, "2 file(s) shared by multiple crates: tests/common/mod.rs  ← tests/a.rs, tests/b.rs", "入口の mod.rs を先に");
+    std::fs::remove_file(d.join("tests/b.rs")).unwrap();
+    assert!(shared_file_report(&d).is_none(), "1 つの test だけなら共有ではない");
+    let _ = std::fs::remove_dir_all(&d);
+}

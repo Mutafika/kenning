@@ -188,6 +188,11 @@ pub(crate) fn parse_opts(args: &[String]) -> Opts {
             maybe_auto_update(&db, auto_root.as_deref()); // auto-update: 古ければ増分してから答える
         }
     }
+    // 直近の bake が失敗しているなら毎回言う (#18: 黙って未 bake の精度で答え続け、7 週間気づけなかった)。
+    // 自動 index / update のどの経路でも通る位置で。file を 1 つ読むだけ。
+    if let Some(w) = bake_failure_warning(&db) {
+        eprintln!("{w}");
+    }
     Opts { db, limit, pos }
 }
 

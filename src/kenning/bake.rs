@@ -256,6 +256,7 @@ pub fn run_bake(dir: &str) {
 
     let Some(ra) = find_ra() else {
         eprintln!("# rust-analyzer not found. `rustup component add rust-analyzer`, or point env KENNING_RA at it.");
+        record_bake_failure(&db, "rust-analyzer not found");
         std::process::exit(2);
     };
 
@@ -278,6 +279,7 @@ pub fn run_bake(dir: &str) {
     let n_src = rust_files(&bake_s).count(); // 「薄い SCIP」判定は bake 対象の規模と比べる
     let mut peak_mb = 0u64;
     let mut baked = false;
+    let mut last_reason = String::new();
     // repo が RUSTFLAGS で custom cfg を要求する形 (tokio の `--cfg tokio_unstable` など) は
     // Cargo.toml に現れないので当てられない。**repo 側の事情は repo を知っている人が渡す** —
     // 渡された分だけ RA に注入する (実測: tokio で確定 11,235 → 12,332、59.2% → 65.0%)。
@@ -324,6 +326,7 @@ pub fn run_bake(dir: &str) {
             Ok(st) => st,
             Err(e) => {
                 eprintln!("# bake failed: cannot start rust-analyzer ({ra}): {e}");
+                record_bake_failure(&db, &format!("cannot start rust-analyzer: {e}"));
                 cleanup();
                 std::process::exit(1);
             }
@@ -342,17 +345,28 @@ pub fn run_bake(dir: &str) {
                 continue;
             }
             eprintln!("# to see the root cause directly: (cd {bake_s} && {ra} scip .)");
+            record_bake_failure(&db, &format!("rust-analyzer did not finish in {timeout}s"));
             cleanup();
             std::process::exit(1);
         };
         if !status.success() || !std::path::Path::new(&scip_tmp).exists() {
             eprintln!("# bake failed (features={}, {:.0?}):", if all { "all" } else { "default" }, t_ra.elapsed());
             eprintln!("{}", ra_error_lines(&errs));
+            let mut reason = ra_failure_reason(&errs);
+            // RA は file 名を言わない (#19)。kenning が mod 宣言を辿って、複数 crate に属する file を名指しする。
+            if errs.contains("file emitted multiple times")
+                && let Some((report, summary)) = shared_file_report(&bake_dir)
+            {
+                eprintln!("{report}");
+                reason = format!("{reason} — {summary}");
+            }
+            last_reason = reason;
             if all {
                 let _ = std::fs::write(&default_marker, "");
                 continue;
             }
             eprintln!("# to see the root cause directly: (cd {bake_s} && {ra} scip .)");
+            record_bake_failure(&db, &last_reason);
             cleanup();
             std::process::exit(1);
         }
@@ -376,6 +390,7 @@ pub fn run_bake(dir: &str) {
     if !baked {
         eprintln!("# bake failed (both all and default)");
         eprintln!("# to see the root cause directly: (cd {bake_s} && {ra} scip .)");
+        record_bake_failure(&db, if last_reason.is_empty() { "rust-analyzer failed (features=all and default)" } else { &last_reason });
         cleanup();
         std::process::exit(1);
     }
@@ -384,6 +399,7 @@ pub fn run_bake(dir: &str) {
     // 成功した組だけを置き換える (.scip → 記録の順)
     if std::fs::rename(&scip_tmp, &scip_path).is_err() || std::fs::rename(&src_tmp, scip_src_path(&scip_path)).is_err() {
         eprintln!("# bake failed: cannot replace the .scip ({scip_path})");
+        record_bake_failure(&db, "cannot replace the .scip");
         cleanup();
         std::process::exit(1);
     }
@@ -418,6 +434,7 @@ pub fn run_bake(dir: &str) {
     if let Some(m) = milestone_at_start {
         let _ = std::fs::write(bake_milestone_marker(&db), m);
     }
+    clear_bake_failure(&db);
     eprintln!("# precise facts on: refs / callers now match RA precision (`kenning refs <name>`)");
 }
 

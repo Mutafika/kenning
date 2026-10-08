@@ -839,6 +839,21 @@ fn similar_names_prefer_word_starts_non_tests_and_short_names() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// bake の失敗が記録されていれば、普段の query が stderr の先頭で毎回言う (#18)。
+#[test]
+fn queries_warn_while_bake_is_failing() {
+    let (_dir, db) = indexed();
+    let marker = format!("{}.bake-fail", db.display());
+    std::fs::write(&marker, "since\t951868800\nlast\t951868800\nlast_ok\t0\nreason\trust-analyzer panicked: boom\n").unwrap();
+    let out = kenning().args(["callers", "target", "--db", db.to_str().unwrap()]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("⚠ bake failing since 2000-03-01 (rust-analyzer panicked: boom)"), "警告が出ない:\n{err}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("confirmed callers"), "stdout はデータのまま");
+    std::fs::remove_file(&marker).unwrap();
+    let out = kenning().args(["callers", "target", "--db", db.to_str().unwrap()]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("bake failing"), "記録が消えたら言わない");
+}
+
 /// macro 引数の中の呼び出し (`println!("{}", target())`) も call graph に入ること。
 /// ここが抜けていると「確実 + 候補 + 別 sym の合計 = 全 caller」という kenning の中心的な約束が破れ、
 /// 実際に使われている関数が `callers 0` に見える (この repo の append_src / role_name がそうだった)。
