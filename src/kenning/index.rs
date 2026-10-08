@@ -26,7 +26,7 @@ pub(crate) fn assert_no_faults(db: &Database, phase: &str) {
             (n > 0).then(|| format!("{}={n}", k.as_str()))
         })
         .collect();
-    panic!("{phase}: enchudb が {total} 件の write を拒否 ({}) → 容量不足", detail.join(", "));
+    panic!("{phase}: enchudb rejected {total} writes ({}) → out of capacity", detail.join(", "));
 }
 
 /// full index (明示 `kenning index` / bake 用: 常に焼く)。自動経路は [`ensure_index`]。
@@ -51,12 +51,12 @@ pub(crate) fn index_locked(dir: &str, path: &str, scip_path: Option<&str>, reuse
         // lock file を置けない (cache dir が read-only 等) なら db も置けないので実害は無いが、
         // 直列化なしで進む理由は言っておく。
         Err(e) => {
-            eprintln!("# ⚠ index lock を取れない ({e}) → 直列化なしで続行");
+            eprintln!("# ⚠ cannot take the index lock ({e}) → continuing without serialization");
             None
         }
     };
     if reuse_if_waited && lock.as_ref().is_some_and(|(_, waited)| *waited) && index_is_current(path, dir) {
-        eprintln!("# 待った index がこの repo の現行版 → 再利用 (焼き直し省略)");
+        eprintln!("# the index we waited for is current for this repo → reusing it (no rebuild)");
         return false;
     }
     // full 再 index は SCIP facts を落とす (syn 層だけの db になる)。以前 bake 済みだと
@@ -82,17 +82,17 @@ pub(crate) fn index_locked(dir: &str, path: &str, scip_path: Option<&str>, reuse
         match r {
             Ok(placed) => {
                 if placed && was_baked {
-                    eprintln!("# ⚠ 再 index で SCIP facts が落ちた (以前は bake 済み) → 精密モードは `kenning bake` で焼き直しを");
+                    eprintln!("# ⚠ re-index dropped the SCIP facts (was baked) → run `kenning bake` to restore precise mode");
                 }
                 return placed;
             }
             Err(e) if cap_mult < 64 && vocab_mult < 64 => {
                 let msg = msg_of(e);
                 let what = widen_after_failure(&msg, &mut cap_mult, &mut vocab_mult);
-                eprintln!("# index 失敗 ({msg}) → {what} で再試行");
+                eprintln!("# index failed ({msg}) → retrying with {what}");
             }
             Err(e) => {
-                eprintln!("# index 失敗: capacity 64x でも解消せず ({dir}): {}", msg_of(e));
+                eprintln!("# index failed: still failing at capacity 64x ({dir}): {}", msg_of(e));
                 wipe_db(&tmp); // 作りかけを残さない (本番 path は無傷のまま)
                 return false;
             }
@@ -144,7 +144,7 @@ impl IndexLock {
         match f.try_lock() {
             Ok(()) => Ok((IndexLock { _held: f }, false)),
             Err(std::fs::TryLockError::WouldBlock) => {
-                eprintln!("# 別 process が同じ index を作成中 → 完了を待つ ({db_path})");
+                eprintln!("# another process is building this index → waiting for it ({db_path})");
                 #[cfg(test)]
                 LOCK_WAITERS.lock().unwrap().push(db_path.to_string());
                 f.lock()?;
@@ -192,7 +192,7 @@ pub(crate) fn sweep_leftovers(path: &str) {
         let n = e.file_name();
         let n = n.to_string_lossy();
         if n.starts_with(&tmp_prefix) || n.starts_with(&old_prefix) {
-            eprintln!("# 前回の作りかけを回収: {}", e.path().display());
+            eprintln!("# cleaned up a leftover partial build: {}", e.path().display());
             wipe_db(&e.path().to_string_lossy());
         }
     }
@@ -208,7 +208,7 @@ pub(crate) fn swap_in(tmp: &str, path: &str) -> bool {
     let old = old_db_path(path);
     let _ = std::fs::rename(path, &old); // 初回は無いので Err (無視)
     if let Err(e) = std::fs::rename(tmp, path) {
-        eprintln!("# ⚠ index を配置できない ({tmp} → {path}): {e} → 旧 index を戻す");
+        eprintln!("# ⚠ cannot put the index in place ({tmp} → {path}): {e} → restoring the old index");
         let _ = std::fs::rename(&old, path);
         wipe_db(tmp);
         return false;
@@ -245,7 +245,7 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
     if !quiet() {
         eprintln!("=== kenning index: {} → {} ===", dir, path);
         if let Some(sp) = scip_path {
-            eprintln!("(SCIP 正確解決: {})", sp);
+            eprintln!("(SCIP precise resolution: {})", sp);
         }
     }
     let t_all = Instant::now();
@@ -547,10 +547,10 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
     }
     if diag {
         eprintln!(
-            "[DIAG] no-occ 内訳: doc欠落={} / doc有り={} (うち method={}, path/fn={}, 同一行に別 occ あり={}) | syn 回収={}",
+            "[DIAG] no-occ breakdown: no-doc={} / in-doc={} (method={}, path/fn={}, other occ on same line={}) | syn recovered={}",
             d_nodoc, d_indoc, d_indoc_method, d_indoc - d_indoc_method, d_sameline, syn_recovered
         );
-        eprintln!("[DIAG] doc有り no-occ サンプル:");
+        eprintln!("[DIAG] in-doc no-occ samples:");
         for s in &d_samples {
             eprintln!("{}", s);
         }
@@ -570,7 +570,7 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         );
         if acc.scip.is_some() {
             eprintln!(
-                "resolve[SCIP]: repo 内 {} 件中 {} 件確定 ({pct:.1}%) = SCIP確定 {} + syn回収 {} (cfg非活性/SCIP沈黙を best-effort) — 外部/std {} (うち SCIP識別 {}), 未解決 {}",
+                "resolve[SCIP]: {} in-repo calls, {} confirmed ({pct:.1}%) = SCIP {} + syn recovered {} (best-effort for inactive cfg / SCIP silence) — external/std {} (SCIP-identified {}), unresolved {}",
                 n_local,
                 resolved,
                 scip_ws,
@@ -581,7 +581,7 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
             );
         } else {
             eprintln!(
-                "resolve[syn]: repo 内 {} 件中 {} 件確定 ({pct:.1}%) — unique {} / qualified {} / ambiguous {} / 外部 {}",
+                "resolve[syn]: {} in-repo calls, {} confirmed ({pct:.1}%) — unique {} / qualified {} / ambiguous {} / external {}",
                 n_local,
                 resolved,
                 res_counts[R_UNIQUE as usize],
@@ -636,7 +636,7 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         }
         drop(extref_t);
         if !quiet() {
-            eprintln!("ref: {} workspace 参照 + {} 外部 crate 参照 (extref) を edge 化 ({:?})", n_ref, n_ext, t3.elapsed());
+            eprintln!("ref: {} workspace refs + {} external crate refs (extref) turned into edges ({:?})", n_ref, n_ext, t3.elapsed());
         }
     }
 
@@ -654,7 +654,7 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
             .unwrap();
     }
     if !quiet() {
-        eprintln!("impl: {} 個の impl Trait for Type edge", acc.impls.len());
+        eprintln!("impl: {} impl Trait for Type edges", acc.impls.len());
     }
     drop(impl_t);
 
@@ -699,15 +699,15 @@ pub(crate) fn run_index_inner(dir: &str, path: &str, tmp: &str, scip_path: Optio
         return false;
     }
     if quiet() {
-        eprintln!("# full index 完了: {n_files} files (+{n_text} text) / {n_sym} symbols / 解決率 {pct:.1}% ({:.2?})", t_all.elapsed());
+        eprintln!("# full index done: {n_files} files (+{n_text} text) / {n_sym} symbols / {pct:.1}% resolved ({:.2?})", t_all.elapsed());
     } else {
         eprintln!(
-            "(index 内訳: parse+挿入 {parse_el:?} / finish+drop {fin_el:?} / 配置 {:?} / 全体 {:?})",
+            "(index breakdown: parse+insert {parse_el:?} / finish+drop {fin_el:?} / place {:?} / total {:?})",
             t_swap.elapsed(),
             t_all.elapsed()
         );
         eprintln!("db real disk: {:.1} MB", real_bytes(Path::new(path)) as f64 / 1_048_576.0);
-        eprintln!("\n次: `kenning def <name>` / `callers <name>` / `search kind:fn vis:pub`");
+        eprintln!("\nnext: `kenning def <name>` / `callers <name>` / `search kind:fn vis:pub`");
     }
     true
 }

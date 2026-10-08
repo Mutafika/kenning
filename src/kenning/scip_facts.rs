@@ -77,7 +77,7 @@ impl Scip {
         let scip_root = scip_project_root(&idx).unwrap_or_else(|| root.to_string());
         let prefix = if scip_root == root { String::new() } else { rel_of(&scip_root, root) };
         if prefix.starts_with('/') {
-            eprintln!("# ⚠ .scip の project_root ({scip_root}) が index root ({root}) の外 → 精密 facts は join できない");
+            eprintln!("# ⚠ the .scip project_root ({scip_root}) is outside the index root ({root}) → precise facts cannot be joined");
         }
         let mut occ = Vec::new();
         let mut pos2idx = HashMap::new();
@@ -124,8 +124,8 @@ impl Scip {
         }
         if stale_docs > 0 {
             eprintln!(
-                "# .scip の {stale_docs} file は{} → その分は syn 層で解決 (位置がずれた答えは使わない)",
-                if recorded.is_none() { "内容の記録が無い旧版の bake" } else { " bake 後に変わった" }
+                "# {stale_docs} files in the .scip {} → resolved by the syn layer instead (answers with shifted positions are not used)",
+                if recorded.is_none() { "come from an old bake with no content record" } else { "changed after the bake" }
             );
         }
         Scip { occ, pos2idx, doc_paths, stale_docs, unverified: recorded.is_none(), stale_defs }

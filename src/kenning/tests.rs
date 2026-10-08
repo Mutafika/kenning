@@ -545,7 +545,7 @@ note: run with `RUST_BACKTRACE=1` to display a backtrace
         // マーカーが一つも無ければ従来通り末尾 5 行
         let errs = "a\nb\nc\nd\ne\nf\ng";
         assert_eq!(ra_error_lines(errs), "c\nd\ne\nf\ng");
-        assert!(ra_error_lines("").contains("stderr に何も出さなかった"));
+        assert!(ra_error_lines("").contains("printed nothing to stderr"));
     }
 
     #[test]
@@ -685,7 +685,7 @@ note: run with `RUST_BACKTRACE=1` to display a backtrace
         std::fs::create_dir_all(d.join("other/src")).unwrap();
         std::fs::write(d.join("other/Cargo.toml"), "[package]\nname = \"other\"\n").unwrap();
         let err = bake_target_of(&d.to_string_lossy(), &d).unwrap_err();
-        assert!(err.contains("2 個"), "{err}");
+        assert!(err.contains("2 independent cargo projects"), "{err}");
         assert!(err.contains("cd"), "どこへ cd すべきか出ていない: {err}");
         // cwd が片方の中なら曖昧さは無い
         let got = bake_target_of(&d.join("other/src").to_string_lossy(), &d).unwrap();
@@ -754,10 +754,10 @@ note: run with `RUST_BACKTRACE=1` to display a backtrace
     #[test]
     fn text_hit_count_reads_the_count_line_in_every_shape() {
         // 通常 / path: 絞り / limit 省略あり / 0 件 — bench の一致判定はこの数字に乗る
-        assert_eq!(super::text_hit_count("a:1\tx\n# 4 件 / 3 files\n"), 4);
-        assert_eq!(super::text_hit_count("# 3 件 / 2 files (path: docs/ の 2 files)\n"), 3);
-        assert_eq!(super::text_hit_count("# 68 件 / 12 files — 表示 50、`--limit 68` で全部\n"), 68);
-        assert_eq!(super::text_hit_count("# \"zz\" は index 済みファイルに無い (.rs + テキスト全般)\n"), 0);
+        assert_eq!(super::text_hit_count("a:1\tx\n# 4 hits / 3 files\n"), 4);
+        assert_eq!(super::text_hit_count("# 3 hits / 2 files (path: docs/, 2 files)\n"), 3);
+        assert_eq!(super::text_hit_count("# 68 hits / 12 files — showing 50, all with `--limit 68`\n"), 68);
+        assert_eq!(super::text_hit_count("# \"zz\" not found in indexed files (.rs + all text files)\n"), 0);
         assert_eq!(super::text_hit_count(""), 0);
     }
 

@@ -164,13 +164,13 @@ pub(crate) fn bake_target_of(dir: &str, root: &Path) -> Result<PathBuf, String> 
     // RA に任せると黙って 1 つ選ぶか落ちるので、こちらで数えて選択を促す。
     let projects = cargo_projects_under(root);
     match projects.len() {
-        0 => Err(format!("# bake 対象の cargo project が無い ({})。Cargo.toml のある場所で実行を。", root.display())),
+        0 => Err(format!("# no cargo project to bake ({}). Run it where a Cargo.toml is.", root.display())),
         1 => Ok(projects[0].clone()),
         n => {
             let list = projects.iter().take(8).map(|p| format!("#   {}", p.display())).collect::<Vec<_>>().join("\n");
             Err(format!(
-                "# repo に独立した cargo project が {n} 個あり、どれを焼くか決められない:\n{list}\n\
-                 # 焼きたい crate へ cd してから `kenning bake` を (rust-analyzer は 1 project しか読めない)。"
+                "# the repo has {n} independent cargo projects; cannot tell which one to bake:\n{list}\n\
+                 # cd into the crate you want and run `kenning bake` (rust-analyzer reads only one project)."
             ))
         }
     }

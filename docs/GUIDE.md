@@ -31,7 +31,7 @@ kenning find    <substr>            # symbol 名 + ファイル名 (basename) �
 kenning text    <term>... [-e] [--and] [--files] [path:S]  # 全文検索 + 文脈注釈 (.rs=関数 / .md=見出し階層 /
                                     #   .toml=[table])。複数語は既定 OR / `--and` で全語 AND (`grep X | grep Y`)、
                                     #   -e で正規表現 ((?-i) で大小区別)、`--files` で file 別件数だけ (`rg -c` = 広い語の
-                                    #   triage)、path: で dir 絞り。末尾に `# N 件 / M files`
+                                    #   triage)、path: で dir 絞り。末尾に `# N hits / M files`
 kenning callers <name> [container] [crate:X] [path:S]  # who-calls: 確実 ∪ 未確定候補を位置付き (同名の自由関数は path: で絞る)
 kenning callees <name> [container] [path:S]  # X が呼ぶ先 (outgoing)
 kenning edges                       # 全 cross-file call edge の集計 TSV (from TAB to TAB count)。依存グラフの素材

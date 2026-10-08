@@ -18,9 +18,9 @@ pub fn run_update(dir: &str, path: &str) {
         Ok(db) => db,
         Err(e) => {
             if std::path::Path::new(path).exists() {
-                eprintln!("# index を開けない ({e})。他プロセス使用中かも → 後で再試行を。");
+                eprintln!("# cannot open the index ({e}); another process may be using it → retry later");
             } else {
-                eprintln!("(index が無いので full index します)");
+                eprintln!("(no index yet → running a full index)");
                 ensure_index(dir, path, scip_sidecar_of(path).as_deref());
             }
             return;
@@ -28,7 +28,7 @@ pub fn run_update(dir: &str, path: &str) {
     };
     let open = t.elapsed();
     update_with_heal(db, dir, path, UpdateScan::Walk { trust_mtime: false }, "update"); // 明示 update = 全件 hash 照合 (mtime 巻き戻しの答え合わせ)
-    eprintln!("(update 内訳: rw open {open:?} / 走査+書込+drop {:?})", t.elapsed() - open);
+    eprintln!("(update breakdown: rw open {open:?} / scan+write+drop {:?})", t.elapsed() - open);
 }
 
 /// update を試み、失敗 (旧 schema の index 等で panic) したら full 再 index で自己修復。
@@ -38,7 +38,7 @@ pub fn run_update(dir: &str, path: &str) {
 pub(crate) fn update_with_heal(db: Database, dir: &str, path: &str, scan: UpdateScan, why: &str) {
     let r = catch_quiet(|| update_inner(db, dir, scan, why));
     match r {
-        Err(_) => heal_full_reindex(dir, path, "増分 update 失敗 (旧 schema の index?)"),
+        Err(_) => heal_full_reindex(dir, path, "incremental update failed (index from an older schema?)"),
         Ok(Some(stale)) => maybe_auto_bake(path, dir, stale),
         Ok(None) => {}
     }
@@ -61,8 +61,8 @@ pub(crate) fn scip_sidecar_of(db_path: &str) -> Option<String> {
 pub(crate) fn heal_full_reindex(dir: &str, path: &str, why: &str) {
     let scip = scip_sidecar_of(path);
     eprintln!(
-        "# {why} → full 再 index で自己修復{}",
-        if scip.is_some() { " (.scip 再利用で精度維持)" } else { "" }
+        "# {why} → self-healing with a full re-index{}",
+        if scip.is_some() { " (reusing .scip to keep precision)" } else { "" }
     );
     ensure_index(dir, path, scip.as_deref());
 }
@@ -81,7 +81,7 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
                 _ => 0,
             };
             if v != INDEX_VER {
-                panic!("index ver {v} != {INDEX_VER} (意味論変更) → full 再 index が必要");
+                panic!("index ver {v} != {INDEX_VER} (semantics changed) → full re-index required");
             }
             built_at = num(er.get("built_at"));
         }
@@ -158,8 +158,8 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
     // ここで素通しすると「全ファイルが消えた」と解釈して db を丸ごと空にしてしまう (復旧は full
     // 再 index)。差分を捨てて警告に留める方が安全 (#13)。
     if cur.is_empty() && !prev.is_empty() {
-        eprintln!("# ⚠ {dir} で index 対象ファイルが 0 件 (db には {} 件)。root がずれている疑いがあるため update を中止。", prev.len());
-        eprintln!("# root を指定して: kenning index <repo> / 全部 ignore していないか `git check-ignore -v <file>` を確認。");
+        eprintln!("# ⚠ no indexable files in {dir} (the db has {}). The root looks wrong, so the update was aborted.", prev.len());
+        eprintln!("# pass the root: kenning index <repo> / check nothing is ignored with `git check-ignore -v <file>`");
         return None;
     }
 
@@ -176,7 +176,7 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
                 }
             }
             (None, Some(src)) => to_add.push((p.clone(), src.clone())),
-            (None, None) => unreachable!("新規 path は必ず読む"),
+            (None, None) => unreachable!("new paths are always read"),
         }
     }
     let mut n_deleted = 0u64;
@@ -206,7 +206,7 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
                 ins.commit().unwrap();
             }
         if !quiet() {
-            eprintln!("変更なし ({} files 走査 / {n_read} 読込 {scan:?}、meta 再スタンプ {:?})。", cur.len(), t.elapsed() - scan);
+            eprintln!("no changes ({} files scanned / {n_read} read {scan:?}, meta restamped {:?})", cur.len(), t.elapsed() - scan);
         }
         return None;
     }
@@ -329,10 +329,10 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
 
     let n_changed = to_add.len() as u64;
     if quiet() {
-        eprintln!("# {why} → 自動 update: {n_changed} 再 index / {n_deleted} 削除 ({:.1?})", t.elapsed());
+        eprintln!("# {why} → auto-update: {n_changed} re-indexed / {n_deleted} deleted ({:.1?})", t.elapsed());
     } else {
         eprintln!(
-            "update: {} 再 index / {} 削除 / {} 未変更 ({:?}, {} parse-skip)",
+            "update: {} re-indexed / {} deleted / {} unchanged ({:?}, {} parse-skip)",
             n_changed,
             n_deleted,
             cur.len() as u64 - n_changed,
@@ -340,7 +340,7 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
             n_skip,
         );
         eprintln!(
-            "  新規 outgoing call {} / incoming 再解決 {} / affected 名前 {}",
+            "  new outgoing calls {} / incoming re-resolved {} / affected names {}",
             n_new_call,
             reresolved,
             affected.len(),
@@ -385,7 +385,7 @@ pub(crate) fn update_inner(db: Database, dir: &str, scan: UpdateScan, why: &str)
     assert_no_faults(&db, "update"); // 拒否された write があれば heal (full 再 index) へ
     drop(db); // standalone: drop で schema + data を永続化。
     if !quiet() {
-        eprintln!("\n次: `kenning def <name>` / `callers <name>` / `search kind:fn vis:pub`");
+        eprintln!("\nnext: `kenning def <name>` / `callers <name>` / `search kind:fn vis:pub`");
     }
     stale
 }
@@ -395,14 +395,14 @@ pub fn run_update_from_db(path: &str) {
     let root = match Database::open_readonly(path) {
         Ok(db) => read_meta(&db).map(|(r, _)| r),
         Err(e) => {
-            eprintln!("# index を開けない ({path}): {e}");
-            eprintln!("# 先に: kenning index <dir> {path}");
+            eprintln!("# cannot open the index ({path}): {e}");
+            eprintln!("# first run: kenning index <dir> {path}");
             return;
         }
     };
     match root {
         Some(r) if !r.is_empty() => run_update(&r, path),
-        _ => eprintln!("# この index に root 情報が無い (旧 index)。`kenning update <dir> {path}` で dir 指定を。"),
+        _ => eprintln!("# this index has no root (old index); pass the dir: `kenning update <dir> {path}`"),
     }
 }
 
@@ -443,13 +443,13 @@ pub(crate) fn scip_stale_files(db: &Database) -> Option<u32> {
 /// 理由は人間向けの一文 (警告にも heal のログにもそのまま使う)。
 pub(crate) fn probe_meta(db: &Database) -> Result<(String, u32, u32), String> {
     let Some((root, built_at)) = read_meta(db) else {
-        return Err("index に meta が無い (旧版)".into());
+        return Err("index has no meta (old version)".into());
     };
     if root.is_empty() || built_at == 0 {
-        return Err("index の root/built_at が空".into());
+        return Err("index root/built_at is empty".into());
     }
     if !Path::new(&root).is_dir() {
-        return Err(format!("index の root が無い ({root}、repo を移動/削除?)"));
+        return Err(format!("index root is missing ({root}; repo moved or deleted?)"));
     }
     let ver = db
         .get_table("meta")
@@ -574,17 +574,17 @@ pub(crate) fn warn_if_stale(db: &Database, db_path: &str) {
         return; // auto 経路が同一プロセスで確認/更新済みなら walk を繰り返さない
     }
     let Some((root, built_at)) = read_meta(db) else {
-        eprintln!("# ⚠ index に meta が無い (旧版) → 鮮度を確認できない。`kenning index <repo>` で焼き直しを。");
+        eprintln!("# ⚠ index has no meta (old version) → cannot check freshness; rebuild with `kenning index <repo>`");
         return;
     };
     if root.is_empty() || built_at == 0 {
-        eprintln!("# ⚠ index の root/built_at が空 → 鮮度を確認できない。`kenning index <repo>` で焼き直しを。");
+        eprintln!("# ⚠ index root/built_at is empty → cannot check freshness; rebuild with `kenning index <repo>`");
         return;
     }
     let (stale, seen) = walk_stats(&root, built_at);
     if seen == 0 {
-        eprintln!("# ⚠ {root} で index 対象ファイルが 0 件 → 鮮度を確認できない (repo を移動した / 全て ignore?)。");
+        eprintln!("# ⚠ no indexable files in {root} → cannot check freshness (repo moved / everything ignored?)");
     } else if stale > 0 {
-        eprintln!("# ⚠ index が古い ({} 日前): {root} で {stale} ファイルが index 後に更新。`kenning update {db_path}` で最新に。", age_days(built_at));
+        eprintln!("# ⚠ index is stale ({} days old): {stale} files in {root} changed since indexing; refresh with `kenning update {db_path}`", age_days(built_at));
     }
 }

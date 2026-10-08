@@ -77,13 +77,13 @@ impl Change {
     }
     fn detail(&self) -> String {
         match self {
-            Change::Broken { qual, remaining, .. } => format!("{qual} の定義が消えたが、呼び出しが {remaining} 件残る"),
+            Change::Broken { qual, remaining, .. } => format!("{qual} was removed, but {remaining} calls remain"),
             Change::Sig { qual, old, new, callers, .. } => format!("{qual}: {old} → {new}  (callers {callers})"),
-            Change::Dead { qual, added: false, .. } => format!("{qual} が live root から届かなくなった"),
-            Change::Dead { qual, added: true, .. } => format!("{qual} を足したが live root から届かない (繋ぎ忘れ?)"),
-            Change::Revived { qual, .. } => format!("{qual} がまた届くようになった"),
-            Change::Callers { qual, old, new: 0, dup: true, .. } => format!("{qual}: callers {old} → 0 (同名の定義が増えた — 呼び出しの解決が曖昧になった。重複定義?)"),
-            Change::Callers { qual, old, new: 0, .. } => format!("{qual}: callers {old} → 0 (確定の呼び元が無くなった)"),
+            Change::Dead { qual, added: false, .. } => format!("{qual} is no longer reachable from a live root"),
+            Change::Dead { qual, added: true, .. } => format!("{qual} was added but no live root reaches it (forgot to wire it up?)"),
+            Change::Revived { qual, .. } => format!("{qual} is reachable again"),
+            Change::Callers { qual, old, new: 0, dup: true, .. } => format!("{qual}: callers {old} → 0 (a same-named definition was added — call resolution became ambiguous. Duplicate definition?)"),
+            Change::Callers { qual, old, new: 0, .. } => format!("{qual}: callers {old} → 0 (no confirmed callers left)"),
             Change::Callers { qual, old, new, .. } => format!("{qual}: callers {old} → {new}"),
         }
     }
@@ -379,7 +379,7 @@ fn cached_tree_snapshot(db: &str, root: &str, sub: &str, key: &str, what: &str, 
     std::fs::create_dir_all(&tree).map_err(|e| e.to_string())?;
     let snap = if materialize(&tree) { snapshot_of_tree(&tree, root).map(|(s, _)| s) } else { None };
     let _ = std::fs::remove_dir_all(&tree);
-    let snap = snap.ok_or_else(|| format!("{what} の tree を書き出せない / index できない"))?;
+    let snap = snap.ok_or_else(|| format!("cannot write out / index the tree of {what}"))?;
     if std::fs::create_dir_all(&dir).is_ok() && write_snapshot(&cached, &snap, 0).is_ok() {
         prune_by_mtime(&dir, CHANGES_KEEP);
     }
@@ -389,7 +389,7 @@ fn cached_tree_snapshot(db: &str, root: &str, sub: &str, key: &str, what: &str, 
 /// `<ref>` 時点の tree の snapshot (commit hash で cache)。戻り値 = (snapshot, 解決した commit)。
 fn git_ref_snapshot(db: &str, root: &str, gitref: &str) -> Result<(Snapshot, String), String> {
     let commit = git(root, &["rev-parse", "--verify", "--quiet", &format!("{gitref}^{{commit}}")])
-        .ok_or_else(|| format!("\"{gitref}\" は token でも git ref でもない ({root} で rev-parse できない)"))?;
+        .ok_or_else(|| format!("\"{gitref}\" is neither a token nor a git ref (rev-parse fails in {root})"))?;
     let what = format!("{gitref} ({})", &commit[..commit.len().min(12)]);
     // git archive = tracked file だけ (ignore 済みの生成物は最初から入らない)。repo の状態には触らない。
     let snap = cached_tree_snapshot(db, root, "git", &commit, &what, |tree| {
@@ -460,13 +460,13 @@ pub(crate) fn pick_sinfo_snap<'a>(snaps: &'a [SinfoSnap], spec: &str) -> Option<
 /// (project には触らない)。cache の鍵は contentDigest。戻り値 = (snapshot, 見出し用の名前)。
 fn sinfo_snap_snapshot(db: &str, root: &str, spec: &str) -> Result<(Snapshot, String), String> {
     if !Path::new(root).join(".sinfo").is_dir() {
-        return Err(format!("{root} は sinfo の project ではない (.sinfo が無い)"));
+        return Err(format!("{root} is not a sinfo project (no .sinfo)"));
     }
     let out = std::process::Command::new("sf").args(["snap", "list", "--json", "-n", "200"]).current_dir(root).output()
-        .map_err(|e| format!("sf を起動できない: {e}"))?;
+        .map_err(|e| format!("cannot start sf: {e}"))?;
     let snaps = parse_sinfo_snaps(&String::from_utf8_lossy(&out.stdout));
     let snap = pick_sinfo_snap(&snaps, spec).ok_or_else(|| {
-        if spec.is_empty() { "snap が 1 つも無い".to_string() } else { format!("snap \"{spec}\" が見つからない (id / 短縮 id / label)") }
+        if spec.is_empty() { "no snaps at all".to_string() } else { format!("snap \"{spec}\" not found (id / short id / label)") }
     })?;
     let short = snap.id.strip_prefix("snap_").unwrap_or(&snap.id);
     let name = format!("snap {} ({})", snap.label, &short[..short.len().min(8)]);
@@ -520,18 +520,18 @@ pub fn cmd_changes(args: &[String]) {
         i += 1;
     }
     if since.is_some() && cursor.is_some() {
-        eprintln!("usage: kenning changes [--since <token> | --cursor <name>] [--json]  (どちらか一方)");
+        eprintln!("usage: kenning changes [--since <token> | --cursor <name>] [--json]  (one or the other)");
         std::process::exit(2);
     }
     if let Some(c) = cursor.as_deref().filter(|c| !valid_name(c)) {
-        eprintln!("# cursor 名は英数と - _ . だけ: \"{c}\"");
+        eprintln!("# a cursor name may contain only letters, digits and - _ .: \"{c}\"");
         std::process::exit(2);
     }
     let o = parse_opts(&rest);
     let Some(db) = open_ro(&o.db) else { std::process::exit(2) };
     let dir = changes_dir(&o.db);
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("# snapshot 置き場を作れない ({}): {e}", dir.display());
+        eprintln!("# cannot create the snapshot dir ({}): {e}", dir.display());
         std::process::exit(2);
     }
     // db を repo の中に置いた時 (`--db ./k.db`)、snapshot が text として index されると全 fn 名が
@@ -551,7 +551,7 @@ pub fn cmd_changes(args: &[String]) {
         }
         Some(t) if since.is_some() && !looks_like_token(t) => {
             if root.is_empty() {
-                eprintln!("# この index は root を知らない (旧版) → ref を解けない。kenning index で焼き直しを");
+                eprintln!("# this index does not know its root (old version) → cannot resolve the ref. Rebuild it with kenning index");
                 std::process::exit(2);
             }
             let r = match t.strip_prefix("snap:").or(if t == "snap" { Some("") } else { None }) {
@@ -575,7 +575,7 @@ pub fn cmd_changes(args: &[String]) {
     if let Some(Base::Tree(base, label)) = &base {
         let (now, sites) = if scip_stale_files(&db).is_some() {
             snapshot_of_tree(Path::new(&root), &root).unwrap_or_else(|| {
-                eprintln!("# 作業ツリーを syn 層で index できない");
+                eprintln!("# cannot index the working tree with the syn layer");
                 std::process::exit(2);
             })
         } else {
@@ -589,7 +589,7 @@ pub fn cmd_changes(args: &[String]) {
     let now_baked = baked_at_of(&db);
     let token = new_token();
     if let Err(e) = write_snapshot(&dir.join(format!("{token}.{SNAP_EXT}")), &now, now_baked) {
-        eprintln!("# snapshot を書けない: {e}");
+        eprintln!("# cannot write the snapshot: {e}");
         std::process::exit(2);
     }
     if let Some(f) = &cursor_file {
@@ -601,7 +601,7 @@ pub fn cmd_changes(args: &[String]) {
         if as_json {
             println!("{{\"kind\":\"token\",\"token\":{},\"since\":null}}", json_str(&token));
         } else {
-            println!("# baseline を作った ({} fn/method)。次回: kenning changes --since {token}", now.len());
+            println!("# baseline created ({} fn/method). Next time: kenning changes --since {token}", now.len());
             println!("# token: {token}");
         }
         return;
@@ -612,7 +612,7 @@ pub fn cmd_changes(args: &[String]) {
     if base_baked != now_baked {
         changes.retain(|c| !matches!(c, Change::Callers { .. }));
         if !as_json {
-            println!("# 起点から今までに bake が入った (精度が変わった) → callers の増減は省略。dead / revived も精度差を含み得る");
+            println!("# a bake happened since the baseline (precision changed) → callers changes omitted. dead / revived may also reflect the precision change");
         }
     }
     print_changes(&changes, base_token.as_deref().unwrap_or(""), Some(&token), o.limit, as_json, all);
@@ -626,7 +626,7 @@ enum Base {
 
 /// 起点の snapshot が読めない時。黙って baseline 扱いにしない (「差分なし」と読まれてしまう)。
 fn missing_snapshot(t: &str) -> Option<Base> {
-    eprintln!("# ⚠ snapshot {t} が無い (prune 済み・別 db の token・旧形式)。今の状態を新しい baseline にした");
+    eprintln!("# ⚠ snapshot {t} not found (pruned, a token from another db, or old format). The current state is the new baseline");
     None
 }
 
@@ -668,7 +668,7 @@ fn print_changes(changes: &[Change], since: &str, token: Option<&str>, limit: us
     }
     let hidden = changes.len() - shown.len();
     if hidden > 0 {
-        println!("# callers の増減 {hidden} 件は省略 (--all で表示)");
+        println!("# {hidden} callers changes omitted (--all to show)");
     }
     if let Some(t) = token {
         println!("# token: {t}");

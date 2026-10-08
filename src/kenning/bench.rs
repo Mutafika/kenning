@@ -129,9 +129,9 @@ pub(crate) fn bench_quality(sym_t: &Table, call_t: &Table, files: &[(String, Str
     }
     let sample: Vec<String> = pool.into_iter().take(n).collect();
 
-    println!("### quality — grep 相当ヒット vs 精密 callers (n={}, seed={})\n", sample.len(), seed);
-    println!("grep 相当 = `\\bNAME\\s*\\(` の全ヒット (def/コメント/文字列/別型の同名も混ざる)。");
-    println!("確実 = callee_sym 逆引き (誤りなし) / 候補 = 未解決の名前一致 (要確認)。\n");
+    println!("### quality — grep-style hits vs precise callers (n={}, seed={})\n", sample.len(), seed);
+    println!("grep-style = every `\\bNAME\\s*\\(` hit (mixes in defs / comments / strings / same-named items of other types).");
+    println!("confirmed = reverse lookup of callee_sym (never wrong) / unresolved candidates = unresolved name matches (need a look).\n");
 
     let (mut greps, mut sures, mut boths, mut noise) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut rows: Vec<(usize, String, usize, usize, usize)> = Vec::new();
@@ -148,14 +148,14 @@ pub(crate) fn bench_quality(sym_t: &Table, call_t: &Table, files: &[(String, Str
     }
     rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
-    println!("| symbol | grep hits | 確実 | 候補 | grep との差 (≈ノイズ) |");
+    println!("| symbol | grep hits | confirmed | candidates | gap vs grep (≈noise) |");
     println!("|---|---|---|---|---|");
     for (g, name, sure, cand, nz) in rows.iter().take(10) {
         println!("| {name} | {g} | {sure} | {cand} | {nz} |");
     }
-    println!("| … | (上位 10 件のみ表示) | | | |\n");
+    println!("| … | (top 10 only) | | | |\n");
     println!(
-        "**中央値**: grep {} 行 → 確実 {} + 候補 {} = 検討対象 {} 行、ノイズ率 {:.0}%\n",
+        "**median**: grep {} lines → confirmed {} + candidates {} = {} lines to check, noise {:.0}%\n",
         median_u(greps),
         median_u(sures.clone()),
         median_u(boths.iter().zip(&sures).map(|(b, s)| b - s).collect()),
@@ -242,9 +242,9 @@ pub(crate) fn cs_run_bytes(exe: &std::path::Path, db_path: &str, args: &[&str]) 
 /// 主張を逸話でなく分布にする。
 pub(crate) fn bench_beyond(db_path: &str, db: &Database, sym_t: &Table, call_t: &Table, files: &[(String, String)]) {
     let exe = std::env::current_exe().unwrap();
-    println!("### beyond-search — graph/構造クエリ (grep 経路モデル vs 実出力)\n");
-    println!("grep 経路は agent と同じ楽観モデル (= 下限)。impact の grep 経路 = 訪問シンボルごとに");
-    println!("grep+Read を繰り返す手動 BFS (実際のエージェントの再帰探索を模す)。\n");
+    println!("### beyond-search — graph / structure queries (grep-path model vs real output)\n");
+    println!("The grep path uses the same optimistic model as agent (= a lower bound). For impact it is a manual BFS");
+    println!("repeating grep+Read per visited symbol (mimics a real agent's recursive search).\n");
 
     let ranked = unique_def_ranked(sym_t, call_t);
 
@@ -279,14 +279,14 @@ pub(crate) fn bench_beyond(db_path: &str, db: &Database, sym_t: &Table, call_t: 
         rows.push((name.clone(), visited.len(), g_bytes, g_calls, cs, g_bytes as f64 / cs as f64));
     }
     if !rows.is_empty() {
-        println!("**impact** (推移的 callers、上位 5 問):\n");
-        println!("| question | 影響 syms | grep bytes | grep calls | cs bytes | 圧縮比 |");
+        println!("**impact** (transitive callers, top 5 questions):\n");
+        println!("| question | affected syms | grep bytes | grep calls | cs bytes | ratio |");
         println!("|---|---|---|---|---|---|");
         for (n, v, gb, gc, cb, r) in &rows {
             println!("| impact {n} | {v} | {gb} | {gc} | {cb} | {r:.0}x |");
         }
         println!(
-            "\n中央値: **{:.0}x**、tool 呼び出し {} 回 → 1 回\n",
+            "\nmedian: **{:.0}x**, tool calls {} → 1\n",
             median_f(rows.iter().map(|r| r.5).collect()),
             median_u(rows.iter().map(|r| r.3).collect())
         );
@@ -309,13 +309,13 @@ pub(crate) fn bench_beyond(db_path: &str, db: &Database, sym_t: &Table, call_t: 
             rows.push((t.clone(), *n_impls, gb, gc, gb as f64 / cs as f64));
         }
         if !rows.is_empty() {
-            println!("**impls** (trait→実装型、impl 数上位):\n");
-            println!("| question | impls | grep bytes | grep calls | 圧縮比 |");
+            println!("**impls** (trait → implementing types, most impls first):\n");
+            println!("| question | impls | grep bytes | grep calls | ratio |");
             println!("|---|---|---|---|---|");
             for (t, n, gb, gc, r) in &rows {
                 println!("| impls {t} | {n} | {gb} | {gc} | {r:.1}x |");
             }
-            println!("\n中央値: **{:.1}x**\n", median_f(rows.iter().map(|r| r.4).collect()));
+            println!("\nmedian: **{:.1}x**\n", median_f(rows.iter().map(|r| r.4).collect()));
         }
     }
 
@@ -327,14 +327,14 @@ pub(crate) fn bench_beyond(db_path: &str, db: &Database, sym_t: &Table, call_t: 
         let cs = cs_run_bytes(&exe, db_path, &["outline", path]);
         rows.push((path.clone(), src.len(), cs, src.len() as f64 / cs as f64));
     }
-    println!("**outline** (構造把握、最大 5 ファイル — 代替は Read 全文):\n");
-    println!("| file | Read bytes | outline bytes | 圧縮比 |");
+    println!("**outline** (file structure, 5 largest files — the alternative is reading the whole file):\n");
+    println!("| file | Read bytes | outline bytes | ratio |");
     println!("|---|---|---|---|");
     for (p, fb, ob, r) in &rows {
         let short = p.rsplit('/').next().unwrap_or(p);
         println!("| {short} | {fb} | {ob} | {r:.0}x |");
     }
-    println!("\n中央値: **{:.0}x**\n", median_f(rows.iter().map(|r| r.3).collect()));
+    println!("\nmedian: **{:.0}x**\n", median_f(rows.iter().map(|r| r.3).collect()));
 
     // ── def: hover 相当 (定義位置 + sig + doc) ──
     let mut rows: Vec<(String, usize, usize, usize, f64)> = Vec::new();
@@ -347,9 +347,9 @@ pub(crate) fn bench_beyond(db_path: &str, db: &Database, sym_t: &Table, call_t: 
         rows.push((name.clone(), gb, gc, cs, gb as f64 / cs as f64));
     }
     if !rows.is_empty() {
-        println!("**def** (定義+sig+doc、被呼上位 10 問 — 代替は `rg \"fn NAME\"` + 前後 Read):\n");
+        println!("**def** (definition + sig + doc, 10 most-called — the alternative is `rg \"fn NAME\"` + reading around it):\n");
         println!(
-            "中央値: grep {} B / {} 回 → def {} B / 1 回 = **{:.1}x**\n",
+            "median: grep {} B / {} calls → def {} B / 1 call = **{:.1}x**\n",
             median_u(rows.iter().map(|r| r.1).collect()),
             median_u(rows.iter().map(|r| r.2).collect()),
             median_u(rows.iter().map(|r| r.3).collect()),
@@ -366,7 +366,7 @@ pub(crate) fn bench_beyond(db_path: &str, db: &Database, sym_t: &Table, call_t: 
         .count()
         .unwrap();
     println!(
-        "**faceted** (`kind:method vis:pub test:0`): {} 件 {:?} — grep では表現不能 (比較なし、能力差)\n",
+        "**faceted** (`kind:method vis:pub test:0`): {} results {:?} — grep cannot express this (no comparison; a capability gap)\n",
         n,
         t.elapsed()
     );
@@ -382,11 +382,11 @@ pub(crate) fn bench_agent(db_path: &str, root: &str, sym_t: &Table, call_t: &Tab
     // grep 側に不当に不利になる。一意名なら `\bname\(` はまさに agent が打つ手 = 対等な比較。
     let questions: Vec<String> = unique_def_ranked(sym_t, call_t).into_iter().take(nq).map(|(_, n)| n).collect();
 
-    println!("### agent — 「誰が呼ぶ?」{} 問の tool 出力バイト比較\n", questions.len());
-    println!("質問 = 定義が一意な被呼上位シンボル (grep 側も `\\bname\\(` で正確に狙える公平条件)。");
-    println!("grep 経路 = rg 出力 + ヒット各ファイル 40 行 Read (楽観モデル=下限)。");
-    println!("kenning 経路 = `callers <name>` の実出力 (別プロセス実行の実測)。\n");
-    println!("| question | grep bytes | grep calls | cs bytes | cs calls | 圧縮比 |");
+    println!("### agent — \"who calls it?\": tool output bytes over {} questions\n", questions.len());
+    println!("Questions = most-called symbols with a unique definition (fair to grep: `\\bname\\(` targets them exactly).");
+    println!("grep path = rg output + a 40-line Read per hit file (optimistic model = lower bound).");
+    println!("kenning path = the real output of `callers <name>` (measured as a separate process).\n");
+    println!("| question | grep bytes | grep calls | cs bytes | cs calls | ratio |");
     println!("|---|---|---|---|---|---|");
 
     let exe = std::env::current_exe().unwrap();
@@ -467,24 +467,24 @@ pub(crate) fn bench_agent(db_path: &str, root: &str, sym_t: &Table, call_t: &Tab
         );
     }
     println!(
-        "\n**中央値**: 圧縮比 **{:.1}x**、grep 経路の tool 呼び出し {} 回 → 1 回\n",
+        "\n**median**: ratio **{:.1}x**, grep-path tool calls {} → 1\n",
         median_f(ratios),
         median_u(gcalls)
     );
     if has_rg {
         println!(
-            "**単発 wall-clock 中央値**: rg {:.1}ms vs kenning {:.1}ms (両者プロセス起動込み。\nkenning は鮮度チェック省略時 = デフォルトでは +stat-walk ~10ms。速さは互角 — 差は出力の精密さと bytes)\n",
+            "**single-run wall-clock median**: rg {:.1}ms vs kenning {:.1}ms (both include process start.\nkenning without the freshness check; by default add ~10ms of stat-walk. Speed is even — the difference is precision and bytes)\n",
             median_f(rg_ms),
             median_f(cs_ms.clone())
         );
     }
     if has_sg && !sg_rows.is_empty() {
-        println!("### agent — vs ast-grep (構造検索アプリ、同じ質問)\n");
-        println!("ast-grep は tree-sitter の構造一致: def/コメント/文字列のノイズ **0** (grep より 1 段精密)。");
-        println!("ただし呼び出し 3 形 (`name()` / `$R.name()` / `$P::name()`) の列挙をユーザーが背負い、");
-        println!("**名前解決は無い** — `$R.name()` は全ての型の同名 method に一致し、どの定義の caller かは");
-        println!("答えられない (= kenning の「候補」相当の粒度)。walk 型なので repo サイズに比例して遅い。\n");
-        println!("| question | ast-grep 一致 | bytes | ms (3 パターン計) | cs 確実+候補 | cs bytes | cs ms |");
+        println!("### agent — vs ast-grep (structural search tool, same questions)\n");
+        println!("ast-grep matches tree-sitter structure: **0** noise from defs / comments / strings (one step more precise than grep).");
+        println!("But the user has to list the 3 call shapes (`name()` / `$R.name()` / `$P::name()`), and");
+        println!("**there is no name resolution** — `$R.name()` matches same-named methods on every type, so it cannot say");
+        println!("which definition is called (= kenning's \"unresolved candidates\" granularity). It walks files, so it slows down with repo size.\n");
+        println!("| question | ast-grep matches | bytes | ms (3 patterns) | cs confirmed+candidates | cs bytes | cs ms |");
         println!("|---|---|---|---|---|---|---|");
         let n = sg_rows.len().min(cs_ms.len());
         for (i, (q, hits, bytes, ms, sure, cand, csb)) in sg_rows.iter().take(n).enumerate() {
@@ -494,7 +494,7 @@ pub(crate) fn bench_agent(db_path: &str, root: &str, sym_t: &Table, call_t: &Tab
             );
         }
         println!(
-            "\n**中央値**: ast-grep {:.0}ms / {}B vs kenning {:.1}ms / {}B — 構造一致としては同数を拾うが、\n「どの定義か」の確定・impact/path/faceted は ast-grep には無い\n",
+            "\n**median**: ast-grep {:.0}ms / {}B vs kenning {:.1}ms / {}B — both find the same structural matches, but\nast-grep cannot confirm \"which definition\", and has no impact / path / faceted\n",
             median_f(sg_rows.iter().map(|r| r.3).collect()),
             median_u(sg_rows.iter().map(|r| r.2).collect()),
             median_f(cs_ms),
@@ -530,11 +530,11 @@ pub(crate) fn bench_text(db_path: &str, root: &str, files: &[(String, String)], 
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1))); // 頻度降順 → 語昇順 (決定的)
     let terms: Vec<&str> = ranked.into_iter().take(nq).map(|(_, t)| t).collect();
 
-    println!("### text — 全文検索 vs rg (同じ語、同じ repo)\n");
-    println!("問い = 「この語はどこ?」。rg 経路 = `rg -i -n <term>` (kenning text は大小無視なので -i)。");
-    println!("kenning 経路 = `text <term> --limit 100000` の実出力。**ヒット数の一致**が主指標 —");
-    println!("バイトは kenning が増える (行ごとに関数名 / 見出し階層を付けるため)。それが payload。\n");
-    println!("| term | rg hits | rg ms | rg bytes | text hits | text ms | text bytes | 一致 |");
+    println!("### text — full-text search vs rg (same terms, same repo)\n");
+    println!("Question = \"where is this term?\". rg path = `rg -i -n <term>` (-i because kenning text ignores case).");
+    println!("kenning path = the real output of `text <term> --limit 100000`. The main metric is **matching hit counts** —");
+    println!("kenning prints more bytes (each line carries its function name / heading path). That is the payload.\n");
+    println!("| term | rg hits | rg ms | rg bytes | text hits | text ms | text bytes | match |");
     println!("|---|---|---|---|---|---|---|---|");
 
     let exe = std::env::current_exe().unwrap();
@@ -578,20 +578,20 @@ pub(crate) fn bench_text(db_path: &str, root: &str, files: &[(String, String)], 
     }
     let mut diff = String::new();
     if fewer > 0 {
-        diff.push_str(&format!(" 少ない {fewer} 問 = 生成 lock (`Cargo.lock`) / >1MiB / binary の非索引分。"));
+        diff.push_str(&format!(" {fewer} fewer = generated lock (`Cargo.lock`) / >1MiB / binary files, not indexed."));
     }
     if more > 0 {
-        diff.push_str(&format!(" 多い {more} 問 = NUL を含む file (rg は binary 判定で打ち切り、kenning は最後まで読む)。"));
+        diff.push_str(&format!(" {more} more = files containing NUL (rg stops, treating them as binary; kenning reads to the end)."));
     }
     println!(
-        "\n**一致**: {}/{} 問でヒット数が同一。{}**wall 中央値**: rg {:.1}ms vs text {:.1}ms",
+        "\n**match**: same hit count on {}/{} terms. {}**wall median**: rg {:.1}ms vs text {:.1}ms",
         agree,
         terms.len(),
-        if diff.is_empty() { String::new() } else { format!("差の内訳:{diff}") },
+        if diff.is_empty() { String::new() } else { format!("Differences:{diff} ") },
         median_f(rg_ms),
         median_f(cs_ms)
     );
-    println!("(両者プロセス起動込み。text は `#` の件数行と文脈注釈を含んだ上でこの wall)\n");
+    println!("(both include process start; text's wall includes its `#` count line and context annotations)\n");
 }
 
 pub(crate) fn bench_micro(db_path: &str, sym_t: &Table, call_t: &Table, files: &[(String, String)]) {
@@ -609,7 +609,7 @@ pub(crate) fn bench_micro(db_path: &str, sym_t: &Table, call_t: &Table, files: &
     timed("pub fn", || {
         sym_t.where_eq("kind", K_FN).where_eq("vis", V_PUB).count().unwrap()
     });
-    timed("pub async fn 非test", || {
+    timed("pub async fn non-test", || {
         sym_t.where_eq("kind", K_FN).where_eq("vis", V_PUB)
             .where_eq("is_async", 1u32).where_eq("is_test", 0u32).count().unwrap()
     });
@@ -619,11 +619,11 @@ pub(crate) fn bench_micro(db_path: &str, sym_t: &Table, call_t: &Table, files: &
         .max_by_key(|n| call_t.where_eq("callee", n.as_str()).count().unwrap())
     {
         timed(&format!("def {name}"), || sym_t.where_eq("name", name.as_str()).count().unwrap());
-        timed(&format!("callers {name} (名前一致)"), || {
+        timed(&format!("callers {name} (name match)"), || {
             call_t.where_eq("callee", name.as_str()).count().unwrap()
         });
         if let Some(d) = sym_t.where_eq("name", name.as_str()).find().unwrap().first().copied() {
-            timed(&format!("callers {name} (確実 逆引き)"), || {
+            timed(&format!("callers {name} (confirmed reverse lookup)"), || {
                 call_t.where_eq("callee_sym", Value::Ref(d)).count().unwrap()
             });
         }
@@ -665,13 +665,13 @@ pub fn cmd_bench(args: &[String]) {
     // db の実 disk と vocab 索引の分 (#15 の回帰防止: entity 数比例の予約に戻ると索引が 2/3 を占める)。
     let mb = |p: &Path| real_bytes(p) as f64 / 1_048_576.0;
     println!(
-        "corpus `{}` — {} files / {} call-sites (うち repo 内 {}) / repo 内確定率 {:.1}% / {} / db 実 {:.1} MB (vocab 索引 {:.1} MB)\n",
+        "corpus `{}` — {} files / {} call-sites ({} in repo) / in-repo confirmed rate {:.1}% / {} / db on disk {:.1} MB (vocab index {:.1} MB)\n",
         root,
         files.len(),
         rs.total,
         rs.local(),
         rs.local_pct(),
-        if baked { "**baked (SCIP)**" } else { "syn-only (未 bake)" },
+        if baked { "**baked (SCIP)**" } else { "syn-only (not baked)" },
         mb(Path::new(&o.db)),
         mb(&Path::new(&o.db).join(VOCAB_INDEX_SEG))
     );
@@ -696,7 +696,7 @@ pub fn cmd_bench(args: &[String]) {
         if baked {
             bench_infer(&root, &o.db, &db);
         } else {
-            println!("infer: この index は未 bake — 正解 (rust-analyzer) が無いので測れない。`kenning bake` の後で");
+            println!("infer: this index is not baked — no ground truth (rust-analyzer) to measure against. Run after `kenning bake`");
         }
     }
 }
@@ -745,7 +745,7 @@ pub(crate) fn scip_package(sym: &str) -> &str {
 /// bake 後に内容が変わった file は正解が無いので数えない (bake 直後ほど母数が多い)。
 fn bench_infer(root: &str, db_path: &str, baked_db: &Database) {
     let Some(scip_path) = scip_sidecar_of(db_path) else {
-        println!("infer: .scip が無い — `kenning bake` の後で");
+        println!("infer: no .scip — run after `kenning bake`");
         return;
     };
     let tmp = std::env::temp_dir().join(format!("kenning-bench-infer-{}", std::process::id()));
@@ -756,7 +756,7 @@ fn bench_infer(root: &str, db_path: &str, baked_db: &Database) {
         .status().is_ok_and(|s| s.success());
     let syn_db = if ok { Database::open_readonly(&tmp.to_string_lossy()).ok() } else { None };
     let Some(syn_db) = syn_db else {
-        println!("infer: syn 層の index を作れない");
+        println!("infer: cannot build the syn-layer index");
         return;
     };
     // 正解は .scip から直接読む (bake 済み db は増分 update で syn 層の答えが混ざるので使わない)。
@@ -798,7 +798,7 @@ fn bench_infer(root: &str, db_path: &str, baked_db: &Database) {
                 Some(None) => None, // target 間の衝突 = 判定不能
                 // repo の crate の symbol なのに定義が読めない = 定義側の file が bake 後に変わった → 判定不能
                 None if local_crates.contains(&scip_package(s).replace('-', "_")) => None,
-                None => Some("repo の外 (std / 依存)".to_string()),
+                None => Some("outside the repo (std / deps)".to_string()),
             },
             _ => None, // RA が沈黙 / 同じ行に同名が複数
         };
@@ -815,18 +815,18 @@ fn bench_infer(root: &str, db_path: &str, baked_db: &Database) {
     }
     let n_method = syn.values().flatten().filter(|(_, r)| *r == R_METHOD).count();
     let (rs_syn, rs_ra) = (ResolveStats::of(&syn_db.get_table("call").unwrap()), ResolveStats::of(&baked_db.get_table("call").unwrap()));
-    println!("## ⑥ 型推定の答え合わせ (syn 層の確定 vs rust-analyzer)\n");
+    println!("## ⑥ type inference check (syn-layer confirmed vs rust-analyzer)\n");
     println!(
-        "repo 内確定率: **syn 層だけ {:.1}%** (確定 {} / repo 内 {}) vs bake {:.1}% — RA 無しで届いている割合 {:.0}%\n",
+        "in-repo confirmed rate: **syn layer alone {:.1}%** (confirmed {} / in repo {}) vs bake {:.1}% — reached without RA: {:.0}%\n",
         rs_syn.local_pct(), rs_syn.confirmed(), rs_syn.local(), rs_ra.local_pct(),
         if rs_ra.confirmed() > 0 { rs_syn.confirmed() as f64 * 100.0 / rs_ra.confirmed() as f64 } else { 0.0 }
     );
-    println!("| res | syn 層で確定 | RA と一致 | **不一致 (誤確定)** | RA 未確定 |");
+    println!("| res | confirmed by syn | agrees with RA | **disagrees (wrong)** | RA unresolved |");
     println!("|---|---|---|---|---|");
     for (r, [n, ok, bad, unk]) in &by_res {
         println!("| {} | {n} | {ok} | **{bad}** | {unk} |", RES_NAMES.get(*r as usize).unwrap_or(&"?"));
     }
-    println!("\n受け手の型が分からず候補どまり (method-name): {n_method}\n");
+    println!("\nleft as candidates, receiver type unknown (method-name): {n_method}\n");
     for w in &wrong {
         println!("- {w}");
     }

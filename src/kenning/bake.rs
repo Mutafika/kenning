@@ -28,12 +28,12 @@ impl BakeLock {
             Err(_) => {
                 let pid = std::fs::read_to_string(&p).unwrap_or_default().trim().to_string();
                 if reclaim && !pid_alive(&pid) {
-                    eprintln!("# stale な bake.lock (pid {pid} は死亡) を自動回収");
+                    eprintln!("# reclaimed stale bake.lock (pid {pid} is dead)");
                     let _ = std::fs::remove_file(&p);
                     return Self::try_acquire(cache, false); // 回収→再取得は 1 回だけ (race したら諦める)
                 }
-                eprintln!("# 別の bake が進行中 (pid {pid})。バースト積層防止のため直列化してる。");
-                eprintln!("# 異常終了の残骸なら: rm {}", p.display());
+                eprintln!("# another bake is running (pid {pid}); bakes are serialized to avoid pile-ups.");
+                eprintln!("# if it is left over from a crash: rm {}", p.display());
                 None
             }
         }
@@ -152,7 +152,7 @@ pub(crate) fn ra_error_lines(errs: &str) -> String {
     let mut tail: Vec<&str> = lines.iter().rev().take(5).copied().collect();
     tail.reverse();
     if tail.is_empty() {
-        "(rust-analyzer は stderr に何も出さなかった)".to_string()
+        "(rust-analyzer printed nothing to stderr)".to_string()
     } else {
         tail.join("\n")
     }
@@ -194,12 +194,12 @@ pub(crate) fn run_with_timeout(mut cmd: std::process::Command, err_path: &str, t
 
 pub fn run_bake(dir: &str) {
     let Some(root) = repo_root_of(dir) else {
-        eprintln!("# repo root が見つからない ({dir})。repo 内で実行を。");
+        eprintln!("# no repo root found ({dir}); run inside a repo.");
         std::process::exit(2);
     };
     let root_s = root.to_string_lossy().to_string();
     let Some(db) = default_db_for(&root_s) else {
-        eprintln!("# db パスを導出できない。");
+        eprintln!("# cannot derive the db path.");
         std::process::exit(2);
     };
     let cache = std::path::Path::new(&db).parent().map(|p| p.to_path_buf()).unwrap_or_else(std::env::temp_dir);
@@ -220,9 +220,9 @@ pub fn run_bake(dir: &str) {
             .filter(|p| !p.starts_with(&bake_dir))
             .map(|p| rel_of(&p.to_string_lossy(), &root_s))
             .collect();
-        eprintln!("# bake 対象: {bake_s} (repo root ではなく cwd の cargo workspace)");
+        eprintln!("# bake target: {bake_s} (the cargo workspace at cwd, not the repo root)");
         if !others.is_empty() {
-            eprintln!("# ⚠ workspace 外の cargo project {} 個 ({}) は精密 facts の対象外 (syn 層のまま)。", others.len(), others.join(", "));
+            eprintln!("# ⚠ {} cargo project(s) outside the workspace ({}) get no precise facts (syn layer only).", others.len(), others.join(", "));
         }
     }
 
@@ -240,12 +240,12 @@ pub fn run_bake(dir: &str) {
         .unwrap_or(6144);
     match avail_mem_mb() {
         Some(avail) if avail < needed_mb && std::env::var_os("KENNING_BAKE_FORCE").is_none() => {
-            eprintln!("# 空きメモリ不足: 空き {avail}MB < 必要見込み {needed_mb}MB → 焚かない。");
-            eprintln!("# 空けてから再実行 or KENNING_BAKE_FORCE=1 (自己責任) or 強いマシンで焼いた .scip を `index --scip` で。");
+            eprintln!("# not enough free memory: {avail}MB free < ~{needed_mb}MB needed → not baking.");
+            eprintln!("# free some memory and retry, or KENNING_BAKE_FORCE=1 (at your own risk), or bake on a bigger machine and load the .scip with `index --scip`.");
             std::process::exit(3);
         }
-        Some(avail) => eprintln!("# gate ok: 空き {avail}MB ≧ 必要見込み {needed_mb}MB"),
-        None => eprintln!("# ⚠ 空きメモリを測れない → ゲートなしで続行"),
+        Some(avail) => eprintln!("# gate ok: {avail}MB free ≥ ~{needed_mb}MB needed"),
+        None => eprintln!("# ⚠ cannot measure free memory → continuing without the gate"),
     }
 
     // ── 直列化 lock ──
@@ -255,7 +255,7 @@ pub fn run_bake(dir: &str) {
     let milestone_at_start = milestone_id(&root_s, &db);
 
     let Some(ra) = find_ra() else {
-        eprintln!("# rust-analyzer が見つからない。`rustup component add rust-analyzer` か env KENNING_RA で指定を。");
+        eprintln!("# rust-analyzer not found. `rustup component add rust-analyzer`, or point env KENNING_RA at it.");
         std::process::exit(2);
     };
 
@@ -272,7 +272,7 @@ pub fn run_bake(dir: &str) {
     let timeout = std::env::var("KENNING_BAKE_TIMEOUT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(BAKE_TIMEOUT_SECS);
     let mut use_all = std::env::var_os("KENNING_BAKE_DEFAULT_FEATURES").is_none();
     if use_all && std::path::Path::new(&default_marker).exists() {
-        eprintln!("# 前回 features=all が失敗 / timeout → default features で焼く (all を試し直すなら rm {default_marker})");
+        eprintln!("# features=all failed / timed out last time → baking with default features (to retry all: rm {default_marker})");
         use_all = false;
     }
     let n_src = rust_files(&bake_s).count(); // 「薄い SCIP」判定は bake 対象の規模と比べる
@@ -283,7 +283,7 @@ pub fn run_bake(dir: &str) {
     // 渡された分だけ RA に注入する (実測: tokio で確定 11,235 → 12,332、59.2% → 65.0%)。
     let rustflags = std::env::var("KENNING_BAKE_RUSTFLAGS").unwrap_or_default();
     if !rustflags.is_empty() {
-        eprintln!("# bake: RUSTFLAGS={rustflags} を RA に注入 (KENNING_BAKE_RUSTFLAGS)");
+        eprintln!("# bake: passing RUSTFLAGS={rustflags} to RA (KENNING_BAKE_RUSTFLAGS)");
     }
     // RA が読む前の内容を記録 (この後で編集された file は、再利用時に SCIP を使わない)。
     // .scip も記録も一時 file に書き、成功してから .scip → 記録の順に置き換える。途中で読まれても
@@ -303,7 +303,7 @@ pub fn run_bake(dir: &str) {
             std::fs::write(&cfg_path, ra_config(all, &rustflags)).unwrap();
         }
         eprintln!(
-            "# bake: rust-analyzer scip {} (features={}) — peak ~{:.1}GB / 数十秒〜数分 (上限 {timeout}s)、常駐なし",
+            "# bake: rust-analyzer scip {} (features={}) — peak ~{:.1}GB / tens of seconds to minutes (limit {timeout}s), nothing resident",
             bake_s, if all { "all" } else { "default" }, needed_mb as f64 / 1024.0
         );
         let _ = std::fs::remove_file(&stats_path);
@@ -323,7 +323,7 @@ pub fn run_bake(dir: &str) {
         let status = match run_with_timeout(cmd, &err_path, Duration::from_secs(timeout)) {
             Ok(st) => st,
             Err(e) => {
-                eprintln!("# bake 失敗: rust-analyzer を起動できない ({ra}): {e}");
+                eprintln!("# bake failed: cannot start rust-analyzer ({ra}): {e}");
                 cleanup();
                 std::process::exit(1);
             }
@@ -333,26 +333,26 @@ pub fn run_bake(dir: &str) {
         peak_mb = std::fs::read_to_string(&stats_path).ok().and_then(|s| parse_peak_mb(&s)).or_else(children_peak_mb).unwrap_or(0);
         let Some(status) = status else {
             eprintln!(
-                "# ⚠ rust-analyzer が {timeout}s で終わらない (features={}) → 止めた。optional dep の build script が重いか、proc-macro server の応答待ちで固まった疑い",
+                "# ⚠ rust-analyzer did not finish in {timeout}s (features={}) → stopped it. Likely a heavy build script in an optional dep, or stuck waiting on the proc-macro server",
                 if all { "all" } else { "default" }
             );
             if all {
                 let _ = std::fs::write(&default_marker, "");
-                eprintln!("# default features で焼き直す (次回からも default。KENNING_BAKE_TIMEOUT=<秒> で上限変更)");
+                eprintln!("# rebaking with default features (default from now on; KENNING_BAKE_TIMEOUT=<secs> changes the limit)");
                 continue;
             }
-            eprintln!("# 真因を直に見るなら: (cd {bake_s} && {ra} scip .)");
+            eprintln!("# to see the root cause directly: (cd {bake_s} && {ra} scip .)");
             cleanup();
             std::process::exit(1);
         };
         if !status.success() || !std::path::Path::new(&scip_tmp).exists() {
-            eprintln!("# bake 失敗 (features={}, {:.0?}):", if all { "all" } else { "default" }, t_ra.elapsed());
+            eprintln!("# bake failed (features={}, {:.0?}):", if all { "all" } else { "default" }, t_ra.elapsed());
             eprintln!("{}", ra_error_lines(&errs));
             if all {
                 let _ = std::fs::write(&default_marker, "");
                 continue;
             }
-            eprintln!("# 真因を直に見るなら: (cd {bake_s} && {ra} scip .)");
+            eprintln!("# to see the root cause directly: (cd {bake_s} && {ra} scip .)");
             cleanup();
             std::process::exit(1);
         }
@@ -366,16 +366,16 @@ pub fn run_bake(dir: &str) {
             .map(|i| i.documents.len())
             .unwrap_or(0);
         if all && n_docs * 2 < n_src {
-            eprintln!("# ⚠ features=all の SCIP が薄い (doc {n_docs} / src {n_src}) → default features で焼き直し");
+            eprintln!("# ⚠ features=all SCIP is thin (doc {n_docs} / src {n_src}) → rebaking with default features");
             continue;
         }
-        eprintln!("# bake 完了: {} docs / peak {}MB / {:.0?}", n_docs, peak_mb, t_ra.elapsed());
+        eprintln!("# bake done: {} docs / peak {}MB / {:.0?}", n_docs, peak_mb, t_ra.elapsed());
         baked = true;
         break;
     }
     if !baked {
-        eprintln!("# bake 失敗 (all/default 両方)");
-        eprintln!("# 真因を直に見るなら: (cd {bake_s} && {ra} scip .)");
+        eprintln!("# bake failed (both all and default)");
+        eprintln!("# to see the root cause directly: (cd {bake_s} && {ra} scip .)");
         cleanup();
         std::process::exit(1);
     }
@@ -383,7 +383,7 @@ pub fn run_bake(dir: &str) {
     let _ = std::fs::remove_file(&stats_path);
     // 成功した組だけを置き換える (.scip → 記録の順)
     if std::fs::rename(&scip_tmp, &scip_path).is_err() || std::fs::rename(&src_tmp, scip_src_path(&scip_path)).is_err() {
-        eprintln!("# bake 失敗: .scip を置き換えられない ({scip_path})");
+        eprintln!("# bake failed: cannot replace the .scip ({scip_path})");
         cleanup();
         std::process::exit(1);
     }
@@ -418,7 +418,7 @@ pub fn run_bake(dir: &str) {
     if let Some(m) = milestone_at_start {
         let _ = std::fs::write(bake_milestone_marker(&db), m);
     }
-    eprintln!("# 精密 facts 有効: refs / callers が RA 同等精度に (`kenning refs <name>`)");
+    eprintln!("# precise facts on: refs / callers now match RA precision (`kenning refs <name>`)");
 }
 
 // ── 自動 bake: 精密 facts の鮮度を常駐なしで保つ ──
@@ -500,7 +500,7 @@ fn load_per_cpu() -> Option<f64> {
 
 /// 増分 update が「SCIP facts が古い」と判定した時に呼ぶ。告知 1 行 + 条件が揃えば裏で bake。
 pub(crate) fn maybe_auto_bake(db: &str, dir: &str, stale: u32) {
-    auto_bake_with(db, dir, format!("# SCIP facts が古くなってきた (bake 後 {stale} ファイル変更)"));
+    auto_bake_with(db, dir, format!("# SCIP facts are getting stale ({stale} files changed since bake)"));
 }
 
 /// 1 process で判定・告知は 1 回だけ (節目の検知と閾値の検知が同じ query で重なっても 2 行出さない)。
@@ -515,16 +515,16 @@ fn auto_bake_with(db: &str, dir: &str, head: String) {
     let off = auto_bake_off();
     let busy_pid = if off { None } else { bake_lock_holder(db) };
     match auto_bake_gate(off, since_last, busy_pid.is_some(), if off { None } else { load_per_cpu() }) {
-        AutoBake::Off => eprintln!("{head} → `kenning bake` 推奨 (自動 bake は無効: KENNING_AUTO_BAKE=0)"),
-        AutoBake::Throttled(rest) => eprintln!("{head} → 自動 bake は起動済み / 間隔待ち (あと {} 分、ログ {log})", rest.div_ceil(60)),
+        AutoBake::Off => eprintln!("{head} → run `kenning bake` (auto-bake is off: KENNING_AUTO_BAKE=0)"),
+        AutoBake::Throttled(rest) => eprintln!("{head} → auto-bake already started / waiting for the interval ({} min left, log {log})", rest.div_ceil(60)),
         // 起動しない = log を作らない = 30 分の時計を進めない → 空いたら次の query ですぐ焼く (列は作らない)。
-        AutoBake::LockBusy => eprintln!("{head} → 別の bake が進行中 (pid {}) → 空いたら次の query で起動", busy_pid.unwrap_or_default()),
-        AutoBake::Busy(l) => eprintln!("{head} → 負荷が高い (load/CPU {l:.2}) ので自動 bake は見送り。`kenning bake` 推奨"),
+        AutoBake::LockBusy => eprintln!("{head} → another bake is running (pid {}) → will start on a later query once it is free", busy_pid.unwrap_or_default()),
+        AutoBake::Busy(l) => eprintln!("{head} → load is high (load/CPU {l:.2}), skipping auto-bake. Run `kenning bake`"),
         AutoBake::Go => {
             let target = std::fs::read_to_string(bake_dir_marker(db)).ok().map(|s| s.trim().to_string()).filter(|s| Path::new(s).is_dir()).unwrap_or_else(|| dir.to_string());
             match spawn_auto_bake(&target, &log) {
-                Ok(()) => eprintln!("{head} → 裏で bake を起動 (nice、ログ {log}。無効化は KENNING_AUTO_BAKE=0)"),
-                Err(e) => eprintln!("{head} → 自動 bake を起動できない ({e})。`kenning bake` 推奨"),
+                Ok(()) => eprintln!("{head} → started a background bake (nice, log {log}; disable with KENNING_AUTO_BAKE=0)"),
+                Err(e) => eprintln!("{head} → cannot start auto-bake ({e}). Run `kenning bake`"),
             }
         }
     }
@@ -626,7 +626,7 @@ pub(crate) fn maybe_milestone_bake(db: &str, root: &str, upd_since_bake: u32) {
     let marker = bake_milestone_marker(db);
     match std::fs::read_to_string(&marker) {
         Ok(prev) if prev.trim() == now => {}
-        Ok(_) => auto_bake_with(db, root, format!("# vup / commit が bake 以降に進んだ (bake 後 {upd_since_bake} ファイル変更)")),
+        Ok(_) => auto_bake_with(db, root, format!("# vup / commit moved on since the bake ({upd_since_bake} files changed since bake)")),
         Err(_) => {
             let _ = std::fs::write(&marker, now);
         }

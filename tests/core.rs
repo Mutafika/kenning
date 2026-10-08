@@ -150,10 +150,10 @@ fn callers_confirmed_set_is_exact() {
     let (_dir, db) = indexed();
     let out = query(&["callers", "target"], &db);
     // mid() calls target() twice, caller() (other file) once — all bare unique-name.
-    assert!(out.contains("3 確実 callers"), "expected 3 confirmed:\n{out}");
+    assert!(out.contains("3 confirmed callers"), "expected 3 confirmed:\n{out}");
     assert_eq!(out.matches("in mid").count(), 2, "mid calls target twice:\n{out}");
     assert!(out.contains("in caller"), "cross-file caller must be confirmed:\n{out}");
-    assert!(out.contains("候補未確定 0"), "no candidates expected:\n{out}");
+    assert!(out.contains("0 unresolved candidates"), "no candidates expected:\n{out}");
 }
 
 #[test]
@@ -162,7 +162,7 @@ fn callers_has_no_false_positive_across_name_collision() {
     // callers — the method call must not be misattributed to it.
     let (_dir, db) = indexed();
     let out = query(&["callers", "dup"], &db);
-    assert!(out.contains("2 型が定義"), "dup should have two same-named defs:\n{out}");
+    assert!(out.contains("2 same-named definitions"), "dup should have two same-named defs:\n{out}");
     let method = out.lines().find(|l| l.contains("C::dup")).expect("C::dup row");
     let free = out
         .lines()
@@ -270,7 +270,7 @@ fn incremental_update_picks_up_markdown_edit() {
     std::fs::write(dir.join("NOTES.md"), "# Notes\nbefore\n").unwrap();
     let db = dir.join("k.db");
     index(&dir, &db);
-    assert!(query(&["text", "zzafter"], &db).contains("index 済みファイルに無い"));
+    assert!(query(&["text", "zzafter"], &db).contains("not found in indexed files"));
 
     std::fs::write(dir.join("NOTES.md"), "# Notes\n## Later\nzzafter\n").unwrap();
     let upd = kenning()
@@ -370,13 +370,13 @@ fn cache_ls_and_prune_drop_index_whose_repo_is_gone() {
 
     std::fs::remove_dir_all(&repo).unwrap();
     let dry = run(&["cache", "prune", "--dry-run"], &home);
-    assert!(dry.contains("削除予定 (root missing"), "{dry}");
+    assert!(dry.contains("would delete (root missing"), "{dry}");
     assert_eq!(std::fs::read_dir(&cache).unwrap().filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x == "db")).count(), 1, "dry-run で消えた");
     let pr = run(&["cache", "prune"], &home);
-    assert!(pr.contains("# 1 index") && pr.contains("を回収 (残 0)"), "{pr}");
+    assert!(pr.contains("# reclaimed 1 index") && pr.contains("(0 kept)"), "{pr}");
     let left: Vec<String> = std::fs::read_dir(&cache).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     assert!(left.is_empty(), "sidecar が残った: {left:?}");
-    assert!(run(&["cache"], &home).contains("# cache に index が無い"));
+    assert!(run(&["cache"], &home).contains("# no index in the cache"));
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -409,7 +409,7 @@ fn across_lists_every_repo_in_deterministic_order() {
     }
 
     let out = run(&["across", "target"], &home);
-    assert!(out.contains("# across \"target\" — 2 repo index を走査:"), "{out}");
+    assert!(out.contains("# across \"target\" — scanning 2 repo indexes:"), "{out}");
     let (ia, ib) = (out.find("aaa_repo:"), out.find("zzz_repo:"));
     assert!(ia.is_some() && ib.is_some(), "両 repo が載る: {out}");
     assert!(ia < ib, "db パス順で決定的 (並列でも入力順に戻す): {out}");
@@ -427,15 +427,15 @@ fn read_disambiguates_same_named_symbols() {
     let db = dir.join("k.db");
     index(&dir, &db);
     let out = query(&["read", "dup"], &db);
-    assert!(out.contains("2 定義") && out.contains("--all"), "曖昧時の案内:\n{out}");
+    assert!(out.contains("2 same-named definitions") && out.contains("--all"), "曖昧時の案内:\n{out}");
     let out = query(&["read", "dup", "C"], &db);
     assert!(out.contains("pub fn dup(&self) {}") && !out.contains("pub fn dup() {}"), "container 絞り:\n{out}");
     let out = query(&["read", "dup", "--all"], &db);
     assert!(out.contains("pub fn dup(&self) {}") && out.contains("pub fn dup() {}"), "--all で両方:\n{out}");
     let out = query(&["read", "dup", "crate:fix"], &db);
-    assert!(out.contains("2 定義"), "crate は両方に当たるので曖昧のまま:\n{out}");
+    assert!(out.contains("2 same-named definitions"), "crate は両方に当たるので曖昧のまま:\n{out}");
     let out = query(&["read", "dup", "crate:nope"], &db);
-    assert!(out.contains("定義が index に無い"), "crate 不一致:\n{out}");
+    assert!(out.contains("is not defined in the index"), "crate 不一致:\n{out}");
     let out = query(&["read", "dup", "path:lib.rs", "--all"], &db);
     assert!(out.contains("pub fn dup() {}"), "path 絞り:\n{out}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -467,7 +467,7 @@ fn read_markdown_section_by_heading_and_outline_lists_headings() {
     let out = query(&["read", "DESIGN.md#storage"], &db);
     assert!(out.contains("Design > Storage") && out.contains("uses zzmarker here") && !out.contains("## Next"), "見出し配下:\n{out}");
     let out = query(&["read", "DESIGN.md#nope"], &db);
-    assert!(out.contains("一致する見出しが") && out.contains("Design > Storage"), "無い時は目次:\n{out}");
+    assert!(out.contains("no heading matching") && out.contains("Design > Storage"), "無い時は目次:\n{out}");
     let out = query(&["outline", "DESIGN.md"], &db);
     assert!(out.contains("3 sections") && out.contains("DESIGN.md:3\tDesign > Storage"), "outline md:\n{out}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -487,7 +487,7 @@ fn text_supports_or_terms_and_regex() {
     let out = query(&["text", "-e", "zz(marker|nothing)", "qq[a-z]+er"], &db);
     assert!(out.contains("DESIGN.md:2") && out.contains("conf.toml:2"), "regex:\n{out}");
     let out = query(&["text", "-e", "zz("], &db);
-    assert!(out.contains("正規表現が不正"), "不正 regex の案内:\n{out}");
+    assert!(out.contains("invalid regex"), "不正 regex の案内:\n{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -504,20 +504,20 @@ fn text_path_facet_count_line_and_outline_dir() {
     index(&dir, &db);
 
     let out = query(&["text", "zzterm"], &db);
-    assert!(out.contains("# 4 件 / 3 files"), "件数行:\n{out}");
+    assert!(out.contains("# 4 hits / 3 files"), "件数行:\n{out}");
     let out = query(&["text", "zzterm", "path:docs/"], &db);
     assert!(out.contains("A.md:2") && out.contains("B.md:2") && !out.contains("other.rs"), "path: 絞り:\n{out}");
-    assert!(out.contains("# 3 件 / 2 files (path: docs/ の 2 files)"), "絞った件数行:\n{out}");
+    assert!(out.contains("# 3 hits / 2 files (path: docs/, 2 files)"), "絞った件数行:\n{out}");
     let out = query(&["text", "zzterm", "path:docs/", "--limit", "1"], &db);
-    assert!(out.contains("`--limit 3` で全部"), "省略の案内:\n{out}");
+    assert!(out.contains("all with `--limit 3`"), "省略の案内:\n{out}");
     // -e は大小無視だが (?-i) で区別できる
-    assert!(query(&["text", "-e", "(?-i)ZZTERM"], &db).contains("index 済みファイルに無い"));
-    assert!(query(&["text", "-e", "ZZTERM"], &db).contains("# 4 件"));
+    assert!(query(&["text", "-e", "(?-i)ZZTERM"], &db).contains("not found in indexed files"));
+    assert!(query(&["text", "-e", "ZZTERM"], &db).contains("# 4 hits"));
 
     // read <path> (行も見出しも無し) は outline へ。「定義が無い」+ 近い symbol 名は返さない
     let out = query(&["read", "src/lib.rs"], &db);
     assert!(out.contains("src/lib.rs : ") && out.contains("\tpub fn target"), "read <path>:\n{out}");
-    assert!(!out.contains("定義が index に無い"), "{out}");
+    assert!(!out.contains("is not defined in the index"), "{out}");
 
     // outline <dir>: 相対 dir は path 中の /<dir>/ 一致
     let out = query(&["outline", "src"], &db);
@@ -547,7 +547,7 @@ fn auto_paths_keep_stderr_terse_and_version_prints() {
     assert!(o.contains("src/lib.rs:3\t"), "{o}");
     let lines: Vec<&str> = e.lines().collect();
     assert_eq!(lines.len(), 2, "初回 auto index の stderr は 2 行:\n{e}");
-    assert!(lines[1].starts_with("# full index 完了: "), "{e}");
+    assert!(lines[1].starts_with("# full index done: "), "{e}");
     let (_, e) = run(&["def", "target"]);
     assert!(e.is_empty(), "最新なら stderr は空:\n{e}");
 
@@ -555,7 +555,7 @@ fn auto_paths_keep_stderr_terse_and_version_prints() {
     std::fs::write(repo.join("src/other.rs"), "pub fn caller() {\n    target();\n    target();\n}\n").unwrap();
     let (_, e) = run(&["def", "target"]);
     assert_eq!(e.lines().count(), 1, "編集後の auto update は 1 行:\n{e}");
-    assert!(e.contains("→ 自動 update: 1 再 index"), "{e}");
+    assert!(e.contains("→ auto-update: 1 re-indexed"), "{e}");
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&repo);
 }
@@ -572,7 +572,7 @@ fn outline_dot_finds_by_file_name_and_typo_rescue_is_uniform() {
 
     // `outline .` = cwd の地図。表示名は解決後の絶対 dir (どこを数えたか曖昧にしない)
     let out = query_in(&["outline", "."], &db, Some(&dir));
-    assert!(out.contains(" files (詳細は outline <path>)"), "outline .:\n{out}");
+    assert!(out.contains(" files (details: outline <path>)"), "outline .:\n{out}");
     assert!(out.contains("src/lib.rs\t") && out.contains("src/other.rs\t"), "outline . の中身:\n{out}");
     assert!(!out.contains("# . :"), "表示名は解決後の絶対 dir:\n{out}");
 
@@ -585,13 +585,13 @@ fn outline_dot_finds_by_file_name_and_typo_rescue_is_uniform() {
 
     // def / path も callers と同じ近い名前を出す
     let out = query(&["def", "targe"], &db);
-    assert!(out.contains("# 0 symbols") && out.contains("\"targe\" は無い。近い名前:") && out.contains("target"), "def の救済:\n{out}");
+    assert!(out.contains("# 0 symbols") && out.contains("no \"targe\". Similar names:") && out.contains("target"), "def の救済:\n{out}");
     let out = query(&["path", "top", "targe"], &db);
-    assert!(out.contains("# 定義が index に無い: targe"), "path は欠けた名前を名指し:\n{out}");
-    assert!(out.contains("近い名前:") && out.contains("target"), "path の救済:\n{out}");
+    assert!(out.contains("# not defined in the index: targe"), "path は欠けた名前を名指し:\n{out}");
+    assert!(out.contains("Similar names:") && out.contains("target"), "path の救済:\n{out}");
     // 在る名前が他 facet で 0 件になった時は「無い」と言わない
     let out = query(&["search", "name:target", "kind:struct"], &db);
-    assert!(out.contains("# 0 symbols") && !out.contains("は無い。近い名前"), "facet 0 件で嘘を言わない:\n{out}");
+    assert!(out.contains("# 0 symbols") && !out.contains("Similar names"), "facet 0 件で嘘を言わない:\n{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -620,19 +620,19 @@ fn text_and_mode_and_files_mode() {
     index(&dir, &db);
 
     let or = query(&["text", "zzalpha", "zzbeta"], &db);
-    assert!(or.contains("# 4 件 / 2 files"), "OR は 4 行 / 2 files:\n{or}");
+    assert!(or.contains("# 4 hits / 2 files"), "OR は 4 行 / 2 files:\n{or}");
 
     let and = query(&["text", "--and", "zzalpha", "zzbeta"], &db);
     assert!(and.contains("both.md:2"), "同じ行に両語のある行は残る:\n{and}");
     assert!(!and.contains("split.md"), "行 AND を満たさない file は出ない:\n{and}");
-    assert!(and.contains("# 1 件 / 1 files"), "件数は行 AND 基準:\n{and}");
+    assert!(and.contains("# 1 hits / 1 files"), "件数は行 AND 基準:\n{and}");
 
     let files = query(&["text", "--files", "zzalpha"], &db);
-    assert!(files.contains("both.md\t2 件"), "件数降順の file 表:\n{files}");
-    assert!(files.contains("split.md\t1 件"), "{files}");
+    assert!(files.contains("both.md\t2 hits"), "件数降順の file 表:\n{files}");
+    assert!(files.contains("split.md\t1 hits"), "{files}");
     let (b, s) = (files.find("both.md").unwrap(), files.find("split.md").unwrap());
     assert!(b < s, "件数の多い file が先:\n{files}");
-    assert!(files.contains("# 3 件 / 2 files"), "{files}");
+    assert!(files.contains("# 3 hits / 2 files"), "{files}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -641,7 +641,7 @@ fn text_and_mode_and_files_mode() {
 fn unknown_flag_is_reported_not_silently_searched() {
     let (_dir, db) = indexed();
     let err = query_err(&["text", "--file", "target"], &db);
-    assert!(err.contains("未知 flag") && err.contains("--file"), "警告が出ない:\n{err}");
+    assert!(err.contains("unknown flag") && err.contains("--file"), "警告が出ない:\n{err}");
     let out = query(&["text", "--file", "target"], &db);
     assert!(!out.contains("--file"), "flag を語として検索している:\n{out}");
     assert!(out.contains("lib.rs"), "残りの語での検索は続く:\n{out}");
@@ -663,13 +663,13 @@ fn search_filters_by_path() {
 fn impls_distinguishes_unknown_name_from_type_without_trait_impl() {
     let (_dir, db) = indexed();
     let out = query(&["impls", "C"], &db); // C は inherent impl (C::dup) だけ持つ型
-    assert!(out.contains("定義済みだが trait 実装が無い"), "型は在ると言うべき:\n{out}");
+    assert!(out.contains("is defined but has no trait impls"), "型は在ると言うべき:\n{out}");
     assert!(out.contains("search container:C"), "次の一手を出す:\n{out}");
     let out = query(&["impls", "Cc"], &db);
-    assert!(out.contains("定義が index に無い"), "名前が無い側:\n{out}");
-    assert!(out.contains("近い名前"), "typo 救済に繋ぐ:\n{out}");
+    assert!(out.contains("is not defined in the index"), "名前が無い側:\n{out}");
+    assert!(out.contains("Similar names"), "typo 救済に繋ぐ:\n{out}");
     let out = query(&["impls", "T"], &db); // trait T は A/B が実装
-    assert!(out.contains("実装する型") && out.contains("A") && out.contains("B"), "正常系:\n{out}");
+    assert!(out.contains("types implementing") && out.contains("A") && out.contains("B"), "正常系:\n{out}");
 }
 
 /// SCIP 無しの index で `refs` が 0 を返す時、それが「未参照」ではなく「未計測」だと言う。
@@ -677,7 +677,7 @@ fn impls_distinguishes_unknown_name_from_type_without_trait_impl() {
 fn refs_without_scip_says_it_is_not_a_zero_reference_answer() {
     let (_dir, db) = indexed(); // syn 層のみ = ref table は空
     let out = query(&["refs", "target"], &db);
-    assert!(out.contains("refs は常に 0"), "0 を答えとして返さない:\n{out}");
+    assert!(out.contains("refs is always 0"), "0 を答えとして返さない:\n{out}");
     assert!(out.contains("kenning bake") && out.contains("callers target"), "次の一手:\n{out}");
 }
 
@@ -702,7 +702,7 @@ fn read_line_range_lists_what_the_range_covers() {
     // lib.rs の target/mid/top は連続して定義されている → 範囲は複数 item を跨ぐ
     let out = query(&["read", "src/lib.rs:3-11"], &db);
     let head = out.lines().next().unwrap();
-    assert!(head.contains("src/lib.rs:3") && head.contains("9 行 (3-11)"), "見出し行:\n{out}");
+    assert!(head.contains("src/lib.rs:3") && head.contains("9 lines (3-11)"), "見出し行:\n{out}");
     for f in ["target", "mid", "top"] {
         assert!(head.contains(f), "跨ぐ定義 {f} が列挙されていない:\n{head}");
     }
@@ -715,7 +715,7 @@ fn read_line_range_lists_what_the_range_covers() {
 
     // file の外は「0 行」ではなく明示する
     let out = query(&["read", "src/lib.rs:9000-9010"], &db);
-    assert!(out.contains("file の外"), "{out}");
+    assert!(out.contains("outside the file"), "{out}");
 
     // 既存の単一行形は変わらない (回帰)
     let out = query(&["read", "src/lib.rs:6"], &db);
@@ -742,13 +742,13 @@ fn qualified_name_from_output_is_accepted_as_input() {
         vec!["refs", "C::dup"],
     ] {
         let out = query(&cmd, &db);
-        assert!(!out.contains("定義が index に無い"), "{cmd:?} が修飾名を受けない:\n{out}");
+        assert!(!out.contains("is not defined in the index"), "{cmd:?} が修飾名を受けない:\n{out}");
         assert!(!out.contains("0 symbols"), "{cmd:?} が修飾名を受けない:\n{out}");
     }
 
     // 同名の別 symbol (free fn dup) を巻き込まない
     let out = query(&["callers", "C::dup"], &db);
-    assert!(out.contains("C::dup") && out.contains("1 確実"), "method 側だけを見る:\n{out}");
+    assert!(out.contains("C::dup") && out.contains("1 confirmed"), "method 側だけを見る:\n{out}");
 
     // 明示 container が優先 (矛盾する指定なら 0 件で正しい)
     let out = query(&["read", "C::dup", "C"], &db);
@@ -766,11 +766,11 @@ fn callees_and_def_honor_narrowing() {
     index(&dir, &db);
 
     let out = query(&["callees", "dup"], &db);
-    assert!(out.contains("同名 3 定義"), "同名を分けて出すと言う:\n{out}");
+    assert!(out.contains("3 same-named definitions"), "同名を分けて出すと言う:\n{out}");
     let out = query(&["callees", "dup", "path:other.rs"], &db);
-    assert!(out.contains("helper") && !out.contains("lib.rs") && !out.contains("同名"), "path 絞り:\n{out}");
+    assert!(out.contains("helper") && !out.contains("lib.rs") && !out.contains("same-named"), "path 絞り:\n{out}");
     let out = query(&["callees", "dup", "crate:nope"], &db);
-    assert!(out.contains("定義が index に無い (crate=nope)"), "絞った結果が 0 なら絞り込みごと言う:\n{out}");
+    assert!(out.contains("is not defined in the index (crate=nope)"), "絞った結果が 0 なら絞り込みごと言う:\n{out}");
 
     let out = query(&["def", "dup", "path:other.rs"], &db);
     assert!(out.contains("1 symbols") && out.contains("other.rs") && !out.contains("lib.rs"), "def の path 絞り:\n{out}");
@@ -823,7 +823,7 @@ fn search_filters_by_incoming_call_counts() {
     let unused = query(&["search", "kind:fn", "callers:0", "namecalls:0", "test:0", "--limit", "50"], &db);
     assert!(!unused.contains("\ttarget") && !unused.contains(" target "), "呼ばれている関数が未使用に出る:\n{unused}");
     assert!(unused.contains("ambig_user"), "誰も呼ばない関数が出ない:\n{unused}");
-    assert!(unused.contains("呼ばれていない = この index の中での話"), "解釈の注意書きが要る:\n{unused}");
+    assert!(unused.contains("uncalled = within this index only"), "解釈の注意書きが要る:\n{unused}");
 
     // callers:1 は確実 caller がちょうど 1 本の定義 (mid は top から 1 本)
     let one = query(&["search", "name:mid", "callers:1"], &db);
@@ -860,7 +860,7 @@ fn consume(_x: u8) {}
     index(&dir, &db);
 
     let out = query(&["callers", "helper"], &db);
-    assert!(out.contains("0 確実 callers"), "値渡しを確実に昇格させてはいけない:\n{out}");
+    assert!(out.contains("0 confirmed callers"), "値渡しを確実に昇格させてはいけない:\n{out}");
     assert!(out.contains("[value-ref]") && out.contains("in hof_user"), "値渡しが候補に出ない:\n{out}");
 
     // 「誰からも呼ばれていない」からは外れる = 消す判断を誤らせない
@@ -965,7 +965,7 @@ mod t {
 
     let out = query(&["impact", "leaf"], &db);
     assert!(out.contains("middle") && out.contains("topmost"), "値参照の先が影響範囲に出ない:\n{out}");
-    assert!(out.contains("値渡し参照"), "値参照経由だと明示する:\n{out}");
+    assert!(out.contains("pass-by-value refs"), "値参照経由だと明示する:\n{out}");
 
     let strict = query(&["impact", "leaf", "--confirmed-only"], &db);
     assert!(strict.contains("0 sym"), "--confirmed-only は確定 edge だけ:\n{strict}");
@@ -973,7 +973,7 @@ mod t {
     let t = query(&["tests", "leaf"], &db);
     assert!(t.contains("reaches_leaf"), "値参照越しのテストが見つからない:\n{t}");
     let t2 = query(&["tests", "leaf", "--confirmed-only"], &db);
-    assert!(t2.contains("届くテストなし"), "--confirmed-only:\n{t2}");
+    assert!(t2.contains("no tests reach"), "--confirmed-only:\n{t2}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -998,7 +998,7 @@ mod t {
     let db = dir.join("k.db");
     index(&dir, &db);
     let out = query(&["callers", "only_here"], &db);
-    assert!(out.contains("2 確実 callers"), "super:: / crate:: が確定していない:\n{out}");
+    assert!(out.contains("2 confirmed callers"), "super:: / crate:: が確定していない:\n{out}");
     let t = query(&["tests", "only_here"], &db);
     assert!(t.contains("via_super") && t.contains("via_crate"), "テスト特定に届かない:\n{t}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -1010,7 +1010,7 @@ mod t {
 fn stats_states_whether_the_index_is_baked() {
     let (_dir, db) = indexed(); // syn 層のみ
     let out = query(&["stats"], &db);
-    assert!(out.contains("bake: 無し"), "bake の有無が出ない:\n{out}");
+    assert!(out.contains("bake: none"), "bake の有無が出ない:\n{out}");
     assert!(out.contains("kenning bake"), "次の一手が無い:\n{out}");
 }
 
@@ -1021,13 +1021,13 @@ fn stats_states_whether_the_index_is_baked() {
 fn callers_explains_trait_impl_dead_ends() {
     let (_dir, db) = indexed(); // fixture: `impl T for A { fn m(&self) {} }`
     let out = query(&["callers", "A::m"], &db);
-    assert!(out.contains("trait 実装"), "trait 経由である説明が無い:\n{out}");
-    assert!(out.contains("0 件 ≠ 未使用"), "0 の意味を言っていない:\n{out}");
+    assert!(out.contains("trait impl"), "trait 経由である説明が無い:\n{out}");
+    assert!(out.contains("0 ≠ unused"), "0 の意味を言っていない:\n{out}");
     assert!(out.contains("impls T"), "兄弟実装への導線が無い:\n{out}");
 
     // inherent impl の method では出ない (誤った説明を足さない)
     let plain = query(&["callers", "C::dup"], &db);
-    assert!(!plain.contains("trait 実装"), "inherent impl に trait の説明が出ている:\n{plain}");
+    assert!(!plain.contains("trait impl"), "inherent impl に trait の説明が出ている:\n{plain}");
 }
 
 /// item 直下のマクロ (`criterion_group!(benches, bench_tie, …)`) の中の参照も拾うこと。
@@ -1051,7 +1051,7 @@ group!(all, registered_a, registered_b,);
 
     let out = query(&["callers", "registered_a"], &db);
     assert!(out.contains("value-ref"), "item 直下マクロの参照が拾えていない:\n{out}");
-    assert!(out.contains("item 直下"), "caller 無しの行に説明が無い:\n{out}");
+    assert!(out.contains("item level"), "caller 無しの行に説明が無い:\n{out}");
 
     let unused = query(&["search", "kind:fn", "callers:0", "namecalls:0", "--limit", "50"], &db);
     for f in ["registered_a", "registered_b"] {
@@ -1091,7 +1091,7 @@ reg! {
     assert!(!out.contains("named_in_code"), "コード上の出現を見落としている:\n{out}");
     assert!(out.contains("only_in_comment"), "コメントを使用と数えている:\n{out}");
     assert!(out.contains("truly_unused"), "本当に未使用の定義まで落としている:\n{out}");
-    assert!(out.contains("字句照合で"), "除外したことを言っていない:\n{out}");
+    assert!(out.contains("lexical check dropped"), "除外したことを言っていない:\n{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1186,7 +1186,7 @@ dsl_block! {
 
     let out = query(&["callers", "helper_used_in_dsl"], &db);
     assert!(out.contains("[macro-token]"), "DSL マクロ内の呼び出しが候補に出ない:\n{out}");
-    assert!(out.contains("0 確実 callers"), "当て推量を確定に昇格させてはいけない:\n{out}");
+    assert!(out.contains("0 confirmed callers"), "当て推量を確定に昇格させてはいけない:\n{out}");
 
     // 字句照合を切っても未使用にならない = call graph 側で解決できている
     let strict = query(&["search", "reachable:0", "--no-lexical"], &db);
@@ -1234,7 +1234,7 @@ fn crate_name_qualifier_resolves_like_a_local_call() {
     let db = d.join("k.db");
     index(&d, &db);
     let out = query(&["callers", "target"], &db);
-    let confirmed = out.split("候補").next().unwrap_or("");
+    let confirmed = out.split("unresolved candidates").next().unwrap_or("");
     assert_eq!(
         confirmed.matches("in via_crate").count(),
         2,
@@ -1258,10 +1258,10 @@ fn stats_separates_external_calls_from_the_resolve_rate() {
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
     assert!(ext >= 2, "Vec::new / .len() が外部として数えられていない: {out}");
-    let line = out.lines().find(|l| l.contains("repo 内")).unwrap_or_else(|| panic!("repo 内の行が無い: {out}"));
-    assert!(line.contains("外部/std") && line.contains("確定率"), "内訳行の形が違う: {line}");
+    let line = out.lines().find(|l| l.contains("in-repo call sites")).unwrap_or_else(|| panic!("repo 内の行が無い: {out}"));
+    assert!(line.contains("external/std") && line.contains("% confirmed"), "内訳行の形が違う: {line}");
     // 外部を除いた分母は全 call-site より必ず小さい (= 分母から外れている証拠)
-    let local: usize = line.split("repo 内 ").nth(1).and_then(|s| s.split(' ').next()).and_then(|s| s.parse().ok()).unwrap();
+    let local: usize = line.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap();
     let total: usize = out.split(" / ").nth(2).and_then(|s| s.split(' ').next()).and_then(|s| s.parse().ok()).unwrap();
     assert!(local + ext == total, "repo 内 {local} + 外部 {ext} が call-site 総数 {total} に一致しない");
 }
@@ -1285,7 +1285,7 @@ fn only_self_receiver_method_calls_are_confirmed() {
     let db = d.join("k.db");
     index(&d, &db);
     let out = query(&["callers", "ping"], &db);
-    let (confirmed, candidates) = out.split_once("候補").unwrap_or((out.as_str(), ""));
+    let (confirmed, candidates) = out.split_once("unresolved candidates").unwrap_or((out.as_str(), ""));
     assert!(confirmed.contains("in D::go"), "self.ping() は確定するはず:\n{out}");
     assert!(!confirmed.contains("in outside"), "受け手不明の d.ping() を確定してはいけない:\n{out}");
     assert!(candidates.contains("in outside"), "確定しない呼び出しは候補に残すはず:\n{out}");
@@ -1324,7 +1324,7 @@ fn callers_narrows_same_named_free_fns_by_path() {
     let db = d.join("k.db");
     index(&d, &db);
     let summary = query(&["callers", "target"], &db);
-    assert!(summary.contains("2 型が定義"), "同名 2 定義の要約表のはず:\n{summary}");
+    assert!(summary.contains("2 same-named definitions"), "同名 2 定義の要約表のはず:\n{summary}");
     assert!(summary.contains("path:"), "自由関数の絞り方に path: を出すはず:\n{summary}");
     let narrowed = query(&["callers", "target", "path:other.rs"], &db);
     assert!(narrowed.contains("in use_local"), "path: で絞った定義の caller が出るはず:\n{narrowed}");
@@ -1349,9 +1349,9 @@ fn module_qualified_calls_use_file_location() {
     let db = d.join("k.db");
     index(&d, &db);
     let later = query(&["callers", "later"], &db);
-    assert!(later.contains("1 確実 callers"), "子 module の実体に確定しない:\n{later}");
+    assert!(later.contains("1 confirmed callers"), "子 module の実体に確定しない:\n{later}");
     let y = query(&["callers", "yield_now", "path:src/task/mod.rs"], &db);
-    assert!(y.contains("0 確実 callers"), "同名 module が 2 つあるのに確定した:\n{y}");
+    assert!(y.contains("0 confirmed callers"), "同名 module が 2 つあるのに確定した:\n{y}");
 }
 
 /// 別の同名 sym に確定した呼び出しも、行き先の定義ごとの件数を出す (件数だけだと agent は grep で
@@ -1363,7 +1363,7 @@ fn callers_lists_where_other_same_named_calls_resolved() {
     let db = d.join("k.db");
     index(&d, &db);
     let out = query(&["callers", "C::dup"], &db);
-    assert!(out.contains("件は別の同名 sym に確定"), "別の同名に確定した分の内訳が無い:\n{out}");
+    assert!(out.contains("resolved to another same-named symbol"), "別の同名に確定した分の内訳が無い:\n{out}");
     let row = out.lines().find(|l| l.contains("lib.rs:") && l.trim_start().starts_with(|c: char| c.is_ascii_digit()) && l.contains("dup")).unwrap_or_else(|| panic!("行き先の定義の行が無い:\n{out}"));
     assert!(!row.contains("C::dup"), "行き先は free fn の dup のはず: {row}");
 }
@@ -1390,9 +1390,9 @@ fn cond_defs_are_confirmed_unless_an_external_cfg_alternative_exists() {
     let db = d.join("k.db");
     index(&d, &db);
     let spawn = query(&["callers", "JoinSet::spawn"], &db);
-    assert!(spawn.contains("1 確実 callers"), "入れ替わる相手の無い条件付きの定義に確定しない:\n{spawn}");
+    assert!(spawn.contains("1 confirmed callers"), "入れ替わる相手の無い条件付きの定義に確定しない:\n{spawn}");
     let notify = query(&["callers", "Condvar::notify_all"], &db);
-    assert!(notify.contains("0 確実 callers"), "std と入れ替わり得る定義に確定した:\n{notify}");
+    assert!(notify.contains("0 confirmed callers"), "std と入れ替わり得る定義に確定した:\n{notify}");
 }
 
 // ── changes: 前回 snapshot からの意味的な差分 ──
@@ -1417,7 +1417,7 @@ fn changes_fixture() -> (PathBuf, PathBuf) {
     let db = dir.join("k.db");
     index(&dir, &db);
     let first = query(&["changes", "--cursor", "c"], &db);
-    assert!(first.contains("baseline を作った"), "初回は baseline を作るはず:\n{first}");
+    assert!(first.contains("baseline created"), "初回は baseline を作るはず:\n{first}");
     (dir, db)
 }
 
@@ -1445,7 +1445,7 @@ fn changes_reports_signature_change_with_caller_count() {
 fn changes_reports_removed_definition_with_remaining_calls() {
     let (dir, db) = changes_fixture();
     let out = edit_and_changes(&dir, &db, &CHG_BASE.replace("fn leaf() {}\n", ""), "c");
-    assert!(out.contains("other.rs:6\tbroken\tleaf の定義が消えたが、呼び出しが 1 件残る"), "壊れた参照が出ない:\n{out}");
+    assert!(out.contains("other.rs:6\tbroken\tleaf was removed, but 1 calls remain"), "壊れた参照が出ない:\n{out}");
 }
 
 /// 唯一の呼び元を切ると鎖ごと dead、戻すと revived。足しただけで誰も呼ばない物は「繋ぎ忘れ」。
@@ -1454,21 +1454,21 @@ fn changes_tracks_dead_revived_and_unwired_additions() {
     let (dir, db) = changes_fixture();
     let cut = CHG_BASE.replace("    helper(1);\n", "");
     let out = edit_and_changes(&dir, &db, &cut, "c");
-    assert!(out.contains("\tdead\thelper が live root から届かなくなった"), "鎖の頭が dead にならない:\n{out}");
-    assert!(out.contains("\tdead\tleaf が live root から届かなくなった"), "鎖の下流が dead にならない:\n{out}");
+    assert!(out.contains("\tdead\thelper is no longer reachable from a live root"), "鎖の頭が dead にならない:\n{out}");
+    assert!(out.contains("\tdead\tleaf is no longer reachable from a live root"), "鎖の下流が dead にならない:\n{out}");
     // 0 になった物は既定で出す (重複定義に呼び出しを奪われた等の兆候)
-    assert!(out.contains("\tcallers\thelper: callers 1 → 0 (確定の呼び元が無くなった)"), "0 になった callers が出ない:\n{out}");
+    assert!(out.contains("\tcallers\thelper: callers 1 → 0 (no confirmed callers left)"), "0 になった callers が出ない:\n{out}");
 
     let out = edit_and_changes(&dir, &db, CHG_BASE, "c");
     assert!(out.contains("\trevived\thelper") && out.contains("\trevived\tleaf"), "戻したのに revived が出ない:\n{out}");
     // 増えただけの物は件数だけ (--all で行も)
     let since = out.lines().find_map(|l| l.strip_prefix("# changes since ")).unwrap().split(':').next().unwrap().to_string();
-    assert!(out.contains("# callers の増減 ") && !out.contains("\tcallers\thelper: callers 0 → 1"), "増えただけの callers が既定で出た:\n{out}");
+    assert!(out.contains(" callers changes omitted") && !out.contains("\tcallers\thelper: callers 0 → 1"), "増えただけの callers が既定で出た:\n{out}");
     let all = query(&["changes", "--since", &since, "--all"], &db);
     assert!(all.contains("\tcallers\thelper: callers 0 → 1"), "--all で呼び元数の増加が出ない:\n{all}");
 
     let out = edit_and_changes(&dir, &db, &format!("{CHG_BASE}\nfn orphan() {{}}\n"), "c");
-    assert!(out.contains("\tdead\torphan を足したが live root から届かない"), "繋ぎ忘れが出ない:\n{out}");
+    assert!(out.contains("\tdead\torphan was added but no live root reaches it"), "繋ぎ忘れが出ない:\n{out}");
 }
 
 /// cursor は呼び手ごとに独立 (別 session が進めても自分の起点は動かない)。--since は token 直指定。
@@ -1504,8 +1504,8 @@ fn changes_unknown_token_warns_instead_of_reporting_no_changes() {
     let (_dir, db) = changes_fixture();
     let out = kenning().args(["changes", "--since", "0000000000000000beef", "--db", db.to_str().unwrap()]).env("KENNING_NO_STALE", "1").output().unwrap();
     let (so, se) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(se.contains("snapshot 0000000000000000beef が無い"), "警告が出ない:\n{se}");
-    assert!(so.contains("baseline を作った") && !so.contains("changes since"), "差分なしと誤読される出力:\n{so}");
+    assert!(se.contains("snapshot 0000000000000000beef not found"), "警告が出ない:\n{se}");
+    assert!(so.contains("baseline created") && !so.contains("changes since"), "差分なしと誤読される出力:\n{so}");
 }
 
 /// 放置された cursor (終わった session の hook が作った物) は TTL で捨てられ、snapshot を pin し続けない。
@@ -1546,11 +1546,11 @@ fn changes_since_git_ref_diffs_uncommitted_work_without_state() {
     update(&dir, &db);
     let out = query(&["changes", "--since", "HEAD"], &db);
     assert!(out.contains("\tsig\thelper: fn helper(x: u32) → fn helper(x: i64)"), "sig が出ない:\n{out}");
-    assert!(out.contains("\tbroken\tleaf の定義が消えた"), "broken が出ない:\n{out}");
+    assert!(out.contains("\tbroken\tleaf was removed"), "broken が出ない:\n{out}");
     assert!(out.contains(&format!("{}/src/other.rs:", dir.display())), "位置が作業ツリーの path でない:\n{out}");
 
     let bad = kenning().args(["changes", "--since", "no-such-ref", "--db", db.to_str().unwrap()]).env("KENNING_NO_STALE", "1").output().unwrap();
-    assert!(!bad.status.success() && String::from_utf8_lossy(&bad.stderr).contains("git ref でもない"), "解けない ref を黙って通した: {bad:?}");
+    assert!(!bad.status.success() && String::from_utf8_lossy(&bad.stderr).contains("nor a git ref"), "解けない ref を黙って通した: {bad:?}");
 }
 
 /// 同名の free fn が複数 file にある時 (tests/*.rs の `tmp()` など)、file が 1 つ増えただけで
@@ -1580,7 +1580,7 @@ fn changes_ignores_snapshots_of_an_older_format() {
     let body = std::fs::read_to_string(&snap).unwrap();
     std::fs::write(&snap, body.lines().skip(1).collect::<Vec<_>>().join("\n")).unwrap(); // header 無し = 旧形式
     let out = kenning().args(["changes", "--cursor", "c", "--db", db.to_str().unwrap()]).env("KENNING_NO_STALE", "1").output().unwrap();
-    assert!(String::from_utf8_lossy(&out.stderr).contains("旧形式"), "旧形式を黙って読んだ: {out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("old format"), "旧形式を黙って読んだ: {out:?}");
 }
 
 /// 同名の定義を別 file に足すと (DRY 違反の重複)、元の定義の呼び出しが曖昧になって確定を失う。
@@ -1599,7 +1599,7 @@ fn changes_flags_a_duplicate_definition_that_steals_resolution() {
     update(&dir, &db);
     let out = query(&["changes", "--cursor", "c"], &db);
     assert!(out.contains("a.rs:1\tcallers\tenc: callers 1 → 0"), "重複で確定を失ったのが出ない:\n{out}");
-    assert!(out.contains("同名の定義が増えた"), "原因 (同名の定義の追加) が出ない:\n{out}");
+    assert!(out.contains("a same-named definition was added"), "原因 (同名の定義の追加) が出ない:\n{out}");
 }
 
 /// 起点と今の間に bake が入ると確定の精度が違う → 確定 callers 数の差はコードの変化ではないので出さない。
@@ -1614,7 +1614,7 @@ fn changes_suppresses_caller_diffs_across_a_bake() {
     assert!(body.lines().nth(1) == Some("# baked_at 0"), "2 行目に bake 時刻が無い:\n{body}");
     std::fs::write(&snap, body.replacen("# baked_at 0", "# baked_at 1700000000", 1)).unwrap();
     let out = edit_and_changes(&dir, &db, &CHG_BASE.replace("    helper(1);\n", ""), "c");
-    assert!(out.contains("bake が入った"), "精度が変わった注記が無い:\n{out}");
+    assert!(out.contains("a bake happened"), "精度が変わった注記が無い:\n{out}");
     assert!(!out.contains("\tcallers\t"), "精度差を含む callers を出した:\n{out}");
     assert!(out.contains("\tdead\thelper"), "callers 以外は出るはず:\n{out}");
 }
@@ -1654,7 +1654,7 @@ fn pick<T: Default>() -> T { T::default() }
     let db = d.join("k.db");
     index(&d, &db);
     let out = query(&["callers", "get", "Db"], &db);
-    let (confirmed, rest) = out.split_once("候補").unwrap_or((out.as_str(), ""));
+    let (confirmed, rest) = out.split_once("unresolved candidates").unwrap_or((out.as_str(), ""));
     for f in ["by_param", "by_let_type", "by_struct_lit", "by_ctor", "by_try_ctor", "inner_scope"] {
         assert!(confirmed.contains(&format!("in {f}\t")), "{f} の db.get() が確定しない:\n{out}");
     }
@@ -1703,16 +1703,16 @@ pub trait BufExt {
     let db = d.join("k.db");
     index(&d, &db);
     let out = query(&["callers", "Sleep::reset"], &db);
-    let (confirmed, rest) = out.split_once("候補").unwrap_or((out.as_str(), ""));
+    let (confirmed, rest) = out.split_once("unresolved candidates").unwrap_or((out.as_str(), ""));
     for f in ["by_mod_fn", "by_reexport", "by_boxed", "by_arc_chain"] {
         assert!(confirmed.contains(&format!("in {f}\t")), "{f} の reset() が確定しない:\n{out}");
     }
     assert!(!confirmed.contains("in external_fn"), "外から use した関数の戻り値で確定した:\n{out}");
     assert!(rest.contains("in external_fn"), "確定しない呼び出しは候補に残るはず:\n{out}");
     let consume = query(&["callers", "BufExt::consume"], &db);
-    assert!(!consume.split_once("候補").map_or(consume.as_str(), |x| x.0).contains("in BufExt::via_pin"), "trait の中の Pin::new(self) を trait 自身の method に確定した:\n{consume}");
+    assert!(!consume.split_once("unresolved candidates").map_or(consume.as_str(), |x| x.0).contains("in BufExt::via_pin"), "trait の中の Pin::new(self) を trait 自身の method に確定した:\n{consume}");
     let set = query(&["callers", "Sleep::set"], &db);
-    assert!(!set.split_once("候補").map_or(set.as_str(), |x| x.0).contains("in pin_own_name"), "Pin::set に先に当たる s.set() を確定した:\n{set}");
+    assert!(!set.split_once("unresolved candidates").map_or(set.as_str(), |x| x.0).contains("in pin_own_name"), "Pin::set に先に当たる s.set() を確定した:\n{set}");
 }
 
 /// 出どころが repo の外 (`walkdir::DirEntry` / `use std::io::Error`) の型名は、同名の自前の型と
@@ -1740,13 +1740,13 @@ pub fn own_renamed(db: &MyDb) { db.get(); }
     let db = d.join("k.db");
     index(&d, &db);
     let ft = query(&["callers", "file_type"], &db);
-    let (confirmed, _) = ft.split_once("候補").unwrap_or((ft.as_str(), ""));
+    let (confirmed, _) = ft.split_once("unresolved candidates").unwrap_or((ft.as_str(), ""));
     assert!(confirmed.contains("in own_param"), "自前の DirEntry は確定するはず:\n{ft}");
     assert!(!confirmed.contains("in ext_param") && !confirmed.contains("in ext_fs"), "外部の DirEntry を自前に誤確定:\n{ft}");
     let new = query(&["callers", "new", "Error"], &db);
-    assert!(!new.split_once("候補").map(|x| x.0).unwrap_or(&new).contains("in std_error"), "std の Error::new を自前に誤確定:\n{new}");
+    assert!(!new.split_once("unresolved candidates").map(|x| x.0).unwrap_or(&new).contains("in std_error"), "std の Error::new を自前に誤確定:\n{new}");
     let get = query(&["callers", "get", "Db"], &db);
-    assert!(get.split_once("候補").map(|x| x.0).unwrap_or(&get).contains("in own_renamed"), "use crate:: で別名にした自前の型は確定するはず:\n{get}");
+    assert!(get.split_once("unresolved candidates").map(|x| x.0).unwrap_or(&get).contains("in own_renamed"), "use crate:: で別名にした自前の型は確定するはず:\n{get}");
 }
 
 /// 修飾なしの `f()` が repo の fn でない形: 束縛したクロージャ / 関数の中で外から `use` した fn /
@@ -1770,7 +1770,7 @@ pub fn real_call() { let _ = select(2); symlink(); }
     index(&d, &db);
     let confirmed = |name: &str| {
         let out = query(&["callers", name], &db);
-        out.split_once("候補").map(|x| x.0.to_string()).unwrap_or(out)
+        out.split_once("unresolved candidates").map(|x| x.0.to_string()).unwrap_or(out)
     };
     let sel = confirmed("select");
     assert!(sel.contains("in real_call") && !sel.contains("in uses_closure"), "クロージャ呼びを select に誤確定:\n{sel}");
@@ -1808,7 +1808,7 @@ fn method_calls_through_fields_and_return_types_are_confirmed() {
     let db = d.join("k.db");
     index(&d, &db);
     let out = query(&["callers", "get", "Db"], &db);
-    let (confirmed, _) = out.split_once("候補").unwrap_or((out.as_str(), ""));
+    let (confirmed, _) = out.split_once("unresolved candidates").unwrap_or((out.as_str(), ""));
     for f in ["by_field", "by_ret", "by_let_ret", "by_try"] {
         assert!(confirmed.contains(&format!("in Svc::{f}\t")), "{f} の連鎖が確定しない:\n{out}");
     }
@@ -1828,8 +1828,8 @@ fn chain_resolution_follows_field_type_changes_incrementally() {
     update(&d, &db);
     let on_db = query(&["callers", "get", "Db"], &db);
     let on_other = query(&["callers", "get", "Other"], &db);
-    assert!(!on_db.split_once("候補").map(|x| x.0).unwrap_or(&on_db).contains("in Svc::by_field\t"), "型を変えたのに古い解決が残る:\n{on_db}");
-    assert!(on_other.split_once("候補").map(|x| x.0).unwrap_or(&on_other).contains("in Svc::by_field\t"), "新しい型に付け替わらない:\n{on_other}");
+    assert!(!on_db.split_once("unresolved candidates").map(|x| x.0).unwrap_or(&on_db).contains("in Svc::by_field\t"), "型を変えたのに古い解決が残る:\n{on_db}");
+    assert!(on_other.split_once("unresolved candidates").map(|x| x.0).unwrap_or(&on_other).contains("in Svc::by_field\t"), "新しい型に付け替わらない:\n{on_other}");
 }
 
 /// 受け手が型引数 (`S: Store`、where 句も) / `dyn Store` / `impl Store` なら、`s.put()` は trait で宣言された
@@ -1854,7 +1854,7 @@ pub fn two_bounds<S: Store + Other>(s: S) { s.put(); }
     let db = d.join("k.db");
     index(&d, &db);
     let out = query(&["callers", "put", "Store"], &db);
-    let (confirmed, _) = out.split_once("候補").unwrap_or((out.as_str(), ""));
+    let (confirmed, _) = out.split_once("unresolved candidates").unwrap_or((out.as_str(), ""));
     for f in ["by_generic", "by_where", "by_dyn", "by_impl", "with_marker"] {
         assert!(confirmed.contains(&format!("in {f}\t")), "{f} の s.put() が Store::put に確定しない:\n{out}");
     }
@@ -1878,10 +1878,10 @@ pub fn by_deref(c: &&Cmd) { (**c).run(); }
     let db = d.join("k.db");
     index(&d, &db);
     let out = query(&["callers", "run", "Cmd"], &db);
-    let (confirmed, _) = out.split_once("候補").unwrap_or((out.as_str(), ""));
+    let (confirmed, _) = out.split_once("unresolved candidates").unwrap_or((out.as_str(), ""));
     assert!(confirmed.contains("in in_fn\t"), "クロージャ引数の型で確定しない:\n{out}");
     assert!(confirmed.contains("in by_deref\t"), "参照外しで確定しない:\n{out}");
-    assert!(confirmed.contains("in (item 直下)"), "マクロ引数のクロージャ (連鎖 arg().run()) で確定しない:\n{out}");
+    assert!(confirmed.contains("in (item level)"), "マクロ引数のクロージャ (連鎖 arg().run()) で確定しない:\n{out}");
 }
 
 /// `impl Tr for &M` の中の `(*self).f()` は Self (= &M) ではなく M の f — 自分自身に確定しない。
@@ -1899,9 +1899,9 @@ fn deref_of_self_in_pointer_impls_is_not_the_same_type() {
     let out = query(&["callers", "f"], &db);
     for line in out.lines().filter(|l| l.contains("in ")) {
         let caller_line: u32 = line.split(':').nth(1).and_then(|s| s.split('\t').next()).and_then(|n| n.parse().ok()).unwrap_or(0);
-        assert!(!(line.contains("確実") && caller_line == 2), "(*self).f() を自分に確定:\n{out}");
+        assert!(!(line.contains("confirmed") && caller_line == 2), "(*self).f() を自分に確定:\n{out}");
     }
-    let confirmed = out.split("候補").next().unwrap_or("");
+    let confirmed = out.split("unresolved candidates").next().unwrap_or("");
     assert!(!confirmed.contains("other.rs:2\tin"), "(*self).f() を &M の f 自身に確定:\n{out}");
     assert!(!confirmed.contains("other.rs:3\tin"), "(**self).f() を Box の f 自身に確定:\n{out}");
 }
@@ -1932,7 +1932,7 @@ pub fn caller() { hidden(); twin(); }
     assert!(query(&["def", "hidden"], &db).contains("other.rs:3"), "マクロ内の fn が見えない");
     assert!(query(&["def", "in_impl"], &db).contains("H::in_impl"), "impl 内マクロの method が見えない");
     let twin = query(&["callers", "twin"], &db);
-    assert!(twin.contains("2 型が定義 (同名)"), "マクロ内の twin が見えない:\n{twin}");
+    assert!(twin.contains("2 same-named definitions"), "マクロ内の twin が見えない:\n{twin}");
     assert!(query(&["callers", "twin", "path:other.rs"], &db).contains("in caller"), "同じ file (マクロ内) の twin に確定しない:\n{twin}");
     assert!(!query(&["callers", "twin", "path:twin.rs"], &db).contains("in caller"), "別 file の twin に誤確定:\n{twin}");
 }
@@ -1961,7 +1961,7 @@ pub fn local_path_call(a: &A) { A::go(a); }
     index(&d, &db);
     let confirmed = |args: &[&str]| {
         let out = query(args, &db);
-        out.split("候補").next().unwrap_or("").to_string()
+        out.split("unresolved candidates").next().unwrap_or("").to_string()
     };
     assert!(confirmed(&["callers", "go", "A"]).contains("in concrete\t"), "具体的な impl は impl の method に確定するはず");
     assert!(confirmed(&["callers", "go", "W"]).contains("in generic_arg\t"), "W<T> への impl は具体的な型の impl (impl の method に確定するはず)");
@@ -1979,7 +1979,7 @@ fn a_local_module_named_std_does_not_make_std_local() {
     let db = d.join("k.db");
     index(&d, &db);
     let out = query(&["callers", "now", "Instant"], &db);
-    assert!(!out.split("候補").next().unwrap_or("").contains("in f\t"), "std の Instant::now を自前に確定:\n{out}");
+    assert!(!out.split("unresolved candidates").next().unwrap_or("").contains("in f\t"), "std の Instant::now を自前に確定:\n{out}");
 }
 
 /// 別 crate の fn は use しなければ修飾なしでは呼べない / tests・benches 直下の file は互いに別 crate /
@@ -2007,7 +2007,7 @@ pub fn by_vec() { let mut v: Vec<u8> = Vec::new(); v.extend(); }
     std::fs::write(d.join("benches/b.rs"), "fn main() { helper(); }\n").unwrap();
     let db = d.join("k.db");
     index(&d, &db);
-    let confirmed = |args: &[&str]| query(args, &db).split("候補").next().unwrap_or("").to_string();
+    let confirmed = |args: &[&str]| query(args, &db).split("unresolved candidates").next().unwrap_or("").to_string();
     assert!(!confirmed(&["callers", "kill", "StdChild"]).contains("in StdChild::kill"), "外の型への impl の self.kill() を自分に確定");
     assert!(!confirmed(&["callers", "consume", "Buf"]).contains("in by_bound"), "同名 method の trait が 2 つあるのに確定");
     assert!(!confirmed(&["callers", "extend"]).contains("in by_vec"), "use していない Vec (std) の extend を自前に確定");
@@ -2055,7 +2055,7 @@ pub fn calls_plat() { plat(); }
     std::fs::write(d.join("src/other/both.rs"), "pub struct Real;\nimpl Real { pub fn work(&self) {} }\npub fn use_real(r: &Real) { r.work(); }\n").unwrap();
     let db = d.join("k.db");
     index(&d, &db);
-    let confirmed = |args: &[&str]| query(args, &db).split("候補").next().unwrap_or("").to_string();
+    let confirmed = |args: &[&str]| query(args, &db).split("unresolved candidates").next().unwrap_or("").to_string();
     let run = confirmed(&["callers", "run", "Cmd"]);
     assert!(run.contains("in std_macro\t"), "std の println! の中の c.run() は確定するはず:\n{run}");
     assert!(!run.contains("in Cmd::go\t"), "自作マクロの中の self.run() を確定:\n{run}");
@@ -2064,7 +2064,7 @@ pub fn calls_plat() { plat(); }
     assert!(confirmed(&["callers", "work", "Real"]).contains("in use_real\t"), "両方の枝で宣言された module の中身まで除外した");
     // 属性の cfg の双子は同名 2 つ = どちらにも確定しない (どちらが活性かは build 次第)
     let plat = query(&["callers", "plat"], &db);
-    assert!(plat.contains("名前一致 1 件中 0 件を確定"), "cfg の双子の片方に確定:\n{plat}");
+    assert!(plat.contains("0 of 1 call sites with this name confirmed"), "cfg の双子の片方に確定:\n{plat}");
 }
 
 /// `#[path]` で別 file を指す同名の `mod imp;` は、cfg_not 側 (代用品) だけ除外する。`#[cfg(..)] mod x;` の中の
@@ -2093,7 +2093,7 @@ pub fn use_fast(f: &fast::Fast) { f.run(); }
     std::fs::write(d.join("src/other/fast.rs"), "pub struct Fast;\nimpl Fast { pub fn run(&self) {} pub fn inner(&self) { self.run(); } }\n").unwrap();
     let db = d.join("k.db");
     index(&d, &db);
-    let confirmed = |args: &[&str]| query(args, &db).split("候補").next().unwrap_or("").to_string();
+    let confirmed = |args: &[&str]| query(args, &db).split("unresolved candidates").next().unwrap_or("").to_string();
     assert!(confirmed(&["callers", "get", "Native"]).contains("in use_native\t"), "#[path] の native 側は確定するはず");
     assert!(!confirmed(&["callers", "get", "Shim"]).contains("in use_shim\t"), "cfg_not 側 (#[path] = shim.rs) に確定");
     let run = confirmed(&["callers", "run", "Fast"]);
@@ -2113,7 +2113,7 @@ fn excluded_candidates_do_not_make_the_rest_unique() {
     let db = d.join("k.db");
     index(&d, &db);
     let out = query(&["callers", "helper"], &db);
-    assert!(out.contains("名前一致 1 件中 0 件を確定"), "外した候補があるのに残りの helper に確定:\n{out}");
+    assert!(out.contains("0 of 1 call sites with this name confirmed"), "外した候補があるのに残りの helper に確定:\n{out}");
 }
 
 /// 関数の中で定義した fn (index していない) を、同名の外の fn に確定しない。tests/ 直下の file は自分の
@@ -2128,7 +2128,7 @@ fn nested_fns_and_integration_tests_do_not_borrow_outer_names() {
     let db = d.join("k.db");
     index(&d, &db);
     let out = query(&["callers", "iter"], &db);
-    let confirmed = out.split("候補").next().unwrap_or("");
+    let confirmed = out.split("unresolved candidates").next().unwrap_or("");
     assert!(!confirmed.contains("in outer\t"), "関数の中の fn iter を外の iter に確定:\n{out}");
     assert!(confirmed.contains("tests/t.rs"), "名前で use した tests からは確定するはず:\n{out}");
     assert!(!confirmed.contains("tests/u.rs"), "グロブ use の tests から確定:\n{out}");
@@ -2170,7 +2170,7 @@ impl Cell { pub fn new(x: u8) -> Self { let _ = x; Cell } }
     );
     let db = d.join("k.db");
     index(&d, &db);
-    let confirmed = |args: &[&str]| query(args, &db).split("候補").next().unwrap_or("").to_string();
+    let confirmed = |args: &[&str]| query(args, &db).split("unresolved candidates").next().unwrap_or("").to_string();
     assert!(!confirmed(&["callers", "get_mut", "S"]).contains("in S::poll\t"), "Pin<&mut Self> の self.get_mut() を S::get_mut に確定");
     assert!(confirmed(&["callers", "go", "Inner"]).contains("in S::poll\t"), "self.inner.go() は field 越しに確定するはず");
     assert!(!confirmed(&["callers", "read", "Fd"]).contains("in by_ref\t"), "&Fd への impl があるのに Fd::read に確定");
@@ -2206,7 +2206,7 @@ pub fn local_shadow() { let hlp = || (); hlp(); }
     assert!(h.contains("in by_fn_alias") && h.contains("in by_mod_alias"), "別名で呼んだ helper が漏れた:\n{h}");
     assert!(!h.contains("in local_shadow"), "同名の束縛 (クロージャ) を別名の関数と取り違えた:\n{h}");
     let o = query(&["callers", "open", "Store"], &db);
-    assert!(o.split("候補").next().unwrap_or("").contains("in by_type_alias"), "別名の型の関連関数は確定するはず:\n{o}");
+    assert!(o.split("unresolved candidates").next().unwrap_or("").contains("in by_type_alias"), "別名の型の関連関数は確定するはず:\n{o}");
 }
 
 /// `tests` / `impact` は確定 edge で届かない分を「候補経由」[c1] として同じ出力に並べる。trait 経由
@@ -2246,15 +2246,15 @@ fn direct() { inner(); }
     assert!(row("direct").contains("[d1]"), "確定で届くテストは [d]:\n{out}");
     assert!(row("through_trait").contains("[c1]"), "trait 経由で届くテストは [c1] に出るはず:\n{out}");
     assert!(row("only_drops").is_empty(), "drop(x) を Drop::drop の呼び出し候補にした:\n{out}");
-    assert!(out.contains("候補経由"), "候補経由の件数行が無い:\n{out}");
+    assert!(out.contains("via candidates"), "候補経由の件数行が無い:\n{out}");
     let imp = query(&["impact", "inner"], &db);
-    assert!(imp.contains("候補経由") && imp.contains("through_trait"), "impact にも候補経由の層が出るはず:\n{imp}");
+    assert!(imp.contains("via candidates") && imp.contains("through_trait"), "impact にも候補経由の層が出るはず:\n{imp}");
     // callers と同じ絞り込み (path: / crate:) が効く。同名の自由関数を tests / impact で選べないと grep に戻る。
     assert!(query(&["tests", "inner", "path:src/other.rs"], &db).contains("[d1]"), "tests が path: で絞れない");
     assert!(query(&["impact", "inner", "path:nope.rs"], &db).contains("path~nope.rs"), "impact の絞り込み注記が無い");
     // 切れた一覧は「そのまま打てる件数」を出す。`--limit 0` = 上限なし (0 件ではない)。
     let cut = query(&["tests", "inner", "--limit", "1"], &db);
-    assert!(cut.contains("`--limit 0`") && cut.contains("切れている"), "切れた時の案内が無い:\n{cut}");
+    assert!(cut.contains("`--limit 0`") && cut.contains("cut at"), "切れた時の案内が無い:\n{cut}");
     assert_eq!(query(&["tests", "inner", "--limit", "0"], &db).lines().filter(|l| l.starts_with("  [")).count(), 2, "--limit 0 で全部出るはず");
 }
 
@@ -2289,7 +2289,7 @@ pub fn glob(o: Other) { use Other::*; match o { Wrap(t) => t.park() } }
     );
     let db = d.join("k.db");
     index(&d, &db);
-    let confirmed = |args: &[&str]| query(args, &db).split("候補").next().unwrap_or("").to_string();
+    let confirmed = |args: &[&str]| query(args, &db).split("unresolved candidates").next().unwrap_or("").to_string();
     let io = confirmed(&["callers", "park", "Io"]);
     assert!(io.contains("in Stack::park\t"), "E::V(x) の x を variant の field 型で確定するはず:\n{io}");
     assert!(io.contains("in Wrap::go\t"), "self.0 を tuple struct の field 型で確定するはず:\n{io}");
@@ -2322,7 +2322,7 @@ pub fn entry(t: &Top) { t.park(); }
     let (head, tail) = out.split_once("hops").unwrap_or((&out, ""));
     assert!(head.contains("Top::park"), "最短経路は最初の park まで:\n{out}");
     assert!(tail.contains("Mid::park") && tail.contains("Leaf::park") && tail.contains("Other::park"), "同名の委譲の続きが無い:\n{out}");
-    assert!(tail.contains("続き"), "続きの件数行が無い:\n{out}");
+    assert!(tail.contains("continued"), "続きの件数行が無い:\n{out}");
 }
 
 /// #15: vocab の hash 索引は予約全域に slot が散るので、予約 ≒ disk 消費。entity 数 × 16 で予約すると小さな
@@ -2332,7 +2332,7 @@ fn vocab_index_is_sized_from_the_string_estimate_not_entity_count() {
     let (_dir, db) = indexed();
     let out = query(&["stats"], &db);
     let line = out.lines().find(|l| l.starts_with("disk:")).unwrap_or_else(|| panic!("stats に disk 行が無い:\n{out}"));
-    let mb: f64 = line.split("vocab 索引 ").nth(1).and_then(|s| s.split(' ').next()).and_then(|s| s.parse().ok()).unwrap_or(f64::MAX);
+    let mb: f64 = line.split("vocab index ").nth(1).and_then(|s| s.split(' ').next()).and_then(|s| s.parse().ok()).unwrap_or(f64::MAX);
     assert!(mb < 4.0, "小さな fixture の vocab 索引が {mb} MB (entity 数 × 16 の予約に戻っていないか): {line}");
 }
 
@@ -2363,7 +2363,7 @@ pub fn dup() { DUP.add(); }
     let db = d.join("k.db");
     index(&d, &db);
     let sem = query(&["callers", "add", "Sem"], &db);
-    let confirmed = sem.split("候補").next().unwrap_or("");
+    let confirmed = sem.split("unresolved candidates").next().unwrap_or("");
     assert!(confirmed.contains("in top\t") && confirmed.contains("in inner\t"), "static の型で確定するはず:\n{sem}");
     assert!(!confirmed.contains("in shadow\t"), "引数が static を隠しているのに static の型で確定:\n{sem}");
     assert!(!confirmed.contains("in dup\t"), "同名の static が 2 つあるのに確定:\n{sem}");
@@ -2404,9 +2404,9 @@ fn crate_boundaries_limit_module_roots_and_type_visibility() {
     let db = d.join("k.db");
     index(&d, &db);
     let lock = query(&["callers", "lock", "Mutex"], &db);
-    assert!(!lock.split("候補").next().unwrap_or("").contains("in ext\t"), "別 crate の module 名 parking_lot を内側と数えて誤確定:\n{lock}");
+    assert!(!lock.split("unresolved candidates").next().unwrap_or("").contains("in ext\t"), "別 crate の module 名 parking_lot を内側と数えて誤確定:\n{lock}");
     let add = query(&["callers", "add", "Sem", "path:a/src/s.rs"], &db);
-    assert!(add.split("候補").next().unwrap_or("").contains("in vis\t"), "別 crate から書けるのは pub の Sem だけ — 確定するはず:\n{add}");
+    assert!(add.split("unresolved candidates").next().unwrap_or("").contains("in vis\t"), "別 crate から書けるのは pub の Sem だけ — 確定するはず:\n{add}");
 }
 
 /// #5 / #6 / #7 / #8: `unsafe:` / `self:` facet、到達性 facet (`reaches:` / `reachable-from:`)、`uncovered`。
@@ -2463,10 +2463,10 @@ fn t() { tested_root(); via_dyn(&S); }
     assert!(has(&to, "safe_wrapper") && has(&to, "tested_root") && has(&to, "untested_unsafe"), "reaches: {to:?}");
     // #8 uncovered: テストから届かない unsafe = untested_unsafe だけ (raw / safe_wrapper はテストから届く)
     let out = query(&["uncovered", "unsafe:1"], &db);
-    let strong = out.split("# 候補 edge").next().unwrap_or("");
+    let strong = out.split("# reached only via candidate edges").next().unwrap_or("");
     assert!(strong.contains("fn untested_unsafe") && !strong.contains("fn safe_wrapper") && !strong.contains("fn raw "), "uncovered unsafe:1:\n{out}");
     // dyn 経由 (宣言に確定 → 実装) でしか届かない lonely は「候補経由でのみ」側
     let all = query(&["uncovered"], &db);
-    let (strong, rest) = all.split_once("# 候補 edge").unwrap_or((&all, ""));
+    let (strong, rest) = all.split_once("# reached only via candidate edges").unwrap_or((&all, ""));
     assert!(!strong.contains("fn lonely") && rest.contains("fn lonely"), "trait 経由でのみ届く物は候補側:\n{all}");
 }

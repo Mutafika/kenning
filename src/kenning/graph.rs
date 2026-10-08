@@ -32,14 +32,14 @@ pub fn cmd_across(args: &[String]) {
         .unwrap_or_default();
     dbs.sort();
     if dbs.is_empty() {
-        println!("# cache に index が無い (~/.cache/kenning)。各 repo で一度 kenning を叩くと増える。");
+        println!("# no index in the cache (~/.cache/kenning). Running kenning once in a repo creates one.");
         return;
     }
 
     // pass1: repo ごとの定義 / 確実 callers / 名前一致。定義の SCIP symbol を集める (pass2 の鍵)。
     let mut symbols: Vec<String> = Vec::new(); // 定義側のグローバル一意 symbol
     let mut opened = 0usize;
-    println!("# across \"{name}\" — {} repo index を走査:", dbs.len());
+    println!("# across \"{name}\" — scanning {} repo indexes:", dbs.len());
     // db は互いに独立 (open は syscall 支配) なので thread で撒く。出力は入力順に戻すので決定的。
     let pass1: Vec<(String, Vec<String>, bool)> = par_dbs(&dbs, |dbp| {
         use std::fmt::Write as _;
@@ -71,7 +71,7 @@ pub fn cmd_across(args: &[String]) {
                 syms.push(s);
             }
         }
-        let _ = writeln!(out, "{repo}: 定義 {} / 確実 callers {} / 名前一致 call {}", defs.len(), precise, name_calls);
+        let _ = writeln!(out, "{repo}: definitions {} / confirmed callers {} / name-matching calls {}", defs.len(), precise, name_calls);
         for &d in defs.iter().take(3) {
             let _ = writeln!(out, "  {}", fmt_sym(&sym_t, &paths, d));
         }
@@ -124,15 +124,15 @@ pub fn cmd_across(args: &[String]) {
             }
         }
         if n_x > 0 {
-            println!("# repo 跨ぎ精密参照 (extref×SCIP symbol): {n_x} 件");
+            println!("# precise cross-repo refs (extref×SCIP symbol): {n_x}");
             if n_x > shown {
-                println!("  … (+{} 件省略)", n_x - shown);
+                println!("  … (+{} omitted)", n_x - shown);
             }
         } else {
-            println!("# repo 跨ぎ精密参照: 0 件 (利用側 repo が bake 済みの時だけ出る)");
+            println!("# precise cross-repo refs: 0 (shown only when the using repo is baked)");
         }
     }
-    eprintln!("# ({opened}/{} db を走査。各 repo の鮮度は個別 query 時に自動 update)", dbs.len());
+    eprintln!("# (scanned {opened}/{} dbs. Each repo is auto-updated when queried directly)", dbs.len());
 }
 
 /// cache 内の db を thread で撒いて処理し、**入力順**で結果を返す。
@@ -183,7 +183,7 @@ pub fn cmd_refs(args: &[String]) {
     let paths = file_paths(&file_t);
 
     if ref_t.all().count().unwrap() == 0 {
-        println!("# ref table が空 = SCIP 無しで index された → refs は常に 0。`kenning bake` で精密化、今すぐなら `callers {name}` / `find {name}`。");
+        println!("# the ref table is empty = indexed without SCIP → refs is always 0. `kenning bake` for precision; for now use `callers {name}` / `find {name}`.");
         return;
     }
     // SCIP は bake 時点のスナップショット。古いまま「0 refs」を返すと **静かな偽陰性** になるので、
@@ -192,7 +192,7 @@ pub fn cmd_refs(args: &[String]) {
 
     let defs = defs_of(&sym_t, name, container);
     if defs.is_empty() {
-        println!("# \"{name}\" の定義が index に無い。");
+        println!("# \"{name}\" is not defined in the index.");
         suggest_similar(&sym_t, &paths, name);
         return;
     }
@@ -204,13 +204,13 @@ pub fn cmd_refs(args: &[String]) {
             .map(|&d| (ref_t.where_eq("symbol_sym", Value::Ref(d)).count().unwrap(), d))
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.0));
-        println!("# \"{name}\" は {} 型が定義。定義ごとの参照数:", defs.len());
+        println!("# \"{name}\" is defined by {} types. Refs per definition:", defs.len());
         for (n, d) in rows.iter().take(o.limit) {
             let er = sym_t.entity(*d);
             let ct = txt(er.get("container"));
             println!("  {n:>5}  {}::{name}  ({})", if ct.is_empty() { "·".into() } else { ct }, txt(er.get("crate_")));
         }
-        println!("# 絞る: `refs {name} <container>`");
+        println!("# narrow: `refs {name} <container>`");
         return;
     }
 
@@ -236,10 +236,10 @@ pub fn cmd_refs(args: &[String]) {
         }
     }
     // refs は SCIP 確定のみ = 精密だが cfg 非活性/未解析域は落ちる。superset が要るなら find/grep。
-    println!("# SCIP 確定参照のみ (誤りなし)。cfg 非活性/未解析域は含まない → superset は `find {name}` / grep。");
+    println!("# confirmed SCIP refs only (never wrong). Inactive cfg / unanalyzed code is not included → superset: `find {name}` / grep.");
     match (stale, total_refs) {
-        (Some(u), _) => println!("# ⚠ SCIP は bake 後 {u} ファイル変更で古い → 欠落/0 件は偽陰性の可能性。`kenning bake` で焼き直すか `callers {name}` (syn 層は常に最新) で確認を。"),
-        (None, 0) => println!("# 0 件 = 本当に未参照 か SCIP 未カバー (macro/cfg)。`callers {name}` で候補も含めて確認を。"),
+        (Some(u), _) => println!("# ⚠ SCIP is stale ({u} files changed since the bake) → missing / 0 results may be false negatives. Re-run `kenning bake` or check `callers {name}` (the syn layer is always current)."),
+        (None, 0) => println!("# 0 results = truly unreferenced, or not covered by SCIP (macro/cfg). Check `callers {name}`, which includes candidates."),
         _ => {}
     }
 }
@@ -340,12 +340,12 @@ pub(crate) fn suggest_similar(sym_t: &Table, paths: &HashMap<EntityId, String>, 
         }
     }
     if best.is_empty() {
-        println!("# 近い名前なし。`find <部分文字列>` で探せる。");
+        println!("# no similar names. Search with `find <substring>`.");
         return;
     }
     let mut ranked: Vec<(u32, String, EntityId)> = best.into_iter().map(|(n, (s, e))| (s, n, e)).collect();
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1))); // score 降順 → 名前昇順
-    println!("# \"{name}\" は無い。近い名前:");
+    println!("# no \"{name}\". Similar names:");
     for (_, n, e) in ranked.iter().take(8) {
         let er = sym_t.entity(*e);
         let ct = txt(er.get("container"));
@@ -628,8 +628,8 @@ pub(crate) fn print_wide(sym_t: &Table, wide: &[(EntityId, usize)]) {
         return;
     }
     let list: Vec<String> = wide.iter().take(5).map(|&(e, n)| format!("{} ({n})", sym_qual(sym_t, e))).collect();
-    let more = if wide.len() > 5 { format!(" 他 {}", wide.len() - 5) } else { String::new() };
-    println!("# 候補 caller が {CAND_FANOUT_MAX} 超で辿っていない: {}{more} — 同名定義が多い名前。要るなら `callers <その修飾名>` の⚠", list.join(", "));
+    let more = if wide.len() > 5 { format!(" and {} more", wide.len() - 5) } else { String::new() };
+    println!("# not followed (more than {CAND_FANOUT_MAX} candidate callers): {}{more} — names with many same-named definitions. If needed, see the ⚠ of `callers <qualified name>`", list.join(", "));
 }
 
 /// `defs` から確定 edge で (推移的に) 届く sym (起点は含まない)。`search reachable-from:X` の集合。
@@ -703,7 +703,7 @@ pub(crate) fn run_impact(db_path: &str, name: &str, narrow: &Narrow, limit: usiz
 
     let defs = narrow.defs(&sym_t, &paths, name);
     if defs.is_empty() {
-        println!("# \"{name}\" の定義が index に無い{}。", narrow.describe());
+        println!("# \"{name}\" is not defined in the index{}.", narrow.describe());
         suggest_similar(&sym_t, &paths, name);
         return;
     }
@@ -713,25 +713,25 @@ pub(crate) fn run_impact(db_path: &str, name: &str, narrow: &Narrow, limit: usiz
     }
     let total: usize = by_depth.iter().map(|v| v.len()).sum();
     for (i, layer) in by_depth.iter().enumerate() {
-        println!("  depth {} ({} sym){}:", i + 1, layer.len(), if i == 0 { " = 直接 callers" } else { "" });
+        println!("  depth {} ({} sym){}:", i + 1, layer.len(), if i == 0 { " = direct callers" } else { "" });
         print_sym_layer(&sym_t, &paths, layer, limit, "    ");
     }
     let (cand, wide) = if follow_value { cand_only(&call_t, &sym_t, &defs, &by_depth) } else { Default::default() };
     let cand: Vec<EntityId> = cand.into_iter().map(|(e, _)| e).collect();
     if !cand.is_empty() {
-        println!("  候補経由 ({} sym = 名前一致どまりの edge を {CAND_HOPS_MAX} 本まで通って届く。要確認):", cand.len());
+        println!("  via candidates ({} sym = reached through up to {CAND_HOPS_MAX} name-match-only edges. Needs a look):", cand.len());
         print_sym_layer(&sym_t, &paths, &cand, limit, "    ");
     }
     let via = match (follow_value, via_value) {
-        (false, _) => " (確定 edge のみ = 影響の下界。候補/未解決 edge は未算入 → `callers` で確認)".to_string(),
-        (true, 0) => " (確定 edge のみ)".to_string(),
-        (true, n) => format!(" (うち {n} sym は値渡し参照 `map(f)` 経由 = 確定 edge ではない。確定だけなら `--confirmed-only`)"),
+        (false, _) => " (confirmed edges only = lower bound of the impact. Candidate/unresolved edges not counted → check with `callers`)".to_string(),
+        (true, 0) => " (confirmed edges only)".to_string(),
+        (true, n) => format!(" ({n} sym of these via pass-by-value refs `map(f)` = not confirmed edges. Confirmed only: `--confirmed-only`)"),
     };
     if follow_value {
-        println!("# 推移的 callers: {total} sym{via} + 候補経由 {} sym — 両方で名前一致の呼び出しを {CAND_HOPS_MAX} 段まで辿った (grep で足さなくていい)", cand.len());
+        println!("# transitive callers: {total} sym{via} + {} sym via candidates — together they follow name-matching calls up to {CAND_HOPS_MAX} hops (no need to add grep results)", cand.len());
         print_wide(&sym_t, &wide);
     } else {
-        println!("# 推移的 callers: {total} sym{via}");
+        println!("# transitive callers: {total} sym{via}");
     }
 }
 
@@ -767,7 +767,7 @@ pub(crate) fn run_tests(db_path: &str, name: &str, narrow: &Narrow, limit: usize
 
     let defs = narrow.defs(&sym_t, &paths, name);
     if defs.is_empty() {
-        println!("# \"{name}\" の定義が index に無い{}。", narrow.describe());
+        println!("# \"{name}\" is not defined in the index{}.", narrow.describe());
         suggest_similar(&sym_t, &paths, name);
         return;
     }
@@ -804,23 +804,23 @@ pub(crate) fn run_tests(db_path: &str, name: &str, narrow: &Narrow, limit: usize
         println!("  {}", omitted(rows.len(), limit));
     }
     if rows.is_empty() {
-        let how = if follow_value { "確定 edge + 値渡し参照 + 候補 edge" } else { "確定 edge のみ。候補 edge は `--confirmed-only` 無しで" };
-        println!("# {name} に届くテストなし ({how})");
+        let how = if follow_value { "confirmed edges + pass-by-value refs + candidate edges" } else { "confirmed edges only. Drop `--confirmed-only` for candidate edges" };
+        println!("# no tests reach {name} ({how})");
         print_wide(&sym_t, &wide);
         return;
     }
     let how = match (follow_value, via_value) {
-        (false, _) => "確定 edge のみ = 下界".to_string(),
-        (true, 0) => "確定 edge のみ".to_string(),
-        (true, n) => format!("経路に値渡し参照 {n} sym を含む。確定だけなら `--confirmed-only`"),
+        (false, _) => "confirmed edges only = lower bound".to_string(),
+        (true, 0) => "confirmed edges only".to_string(),
+        (true, n) => format!("paths include {n} sym via pass-by-value refs. Confirmed only: `--confirmed-only`"),
     };
-    println!("# {name} に届くテスト: [dN] 確定 {} 件 ({how})", tests.len());
+    println!("# tests that reach {name}: [dN] {} confirmed ({how})", tests.len());
     if rows.len() > limit {
-        println!("# ⚠ 上の一覧は {limit} 件で切れている — 答えにするなら `--limit 0` で全 {} 件を出す", rows.len());
+        println!("# ⚠ the list above is cut at {limit} — for a complete answer, `--limit 0` shows all {}", rows.len());
     }
     if follow_value {
         println!(
-            "# [cN] 候補経由 {} 件 = 名前一致どまりの edge (trait 経由 / 受け手の型不明) を N 本通って届く。届くテストの答え = [d] と [c] の全部 (静的に届き得るのはこれで全部。[c] を外すと trait 経由のテストを落とす)",
+            "# [cN] {} via candidates = reached through N name-match-only edges (via a trait / unknown receiver type). The tests that reach it = all of [d] and [c] (that is everything statically reachable; dropping [c] misses tests that go through a trait)",
             cand.len()
         );
         print_wide(&sym_t, &wide);
@@ -830,7 +830,7 @@ pub(crate) fn run_tests(db_path: &str, name: &str, narrow: &Narrow, limit: usize
     if names.len() <= TESTS_HINT_MAX {
         let mut ns = names;
         ns.sort();
-        println!("# 実行: cargo test -- {}", ns.join(" "));
+        println!("# run: cargo test -- {}", ns.join(" "));
     }
 }
 
@@ -862,16 +862,16 @@ pub fn cmd_uncovered(args: &[String]) {
         }
     }
     let filt = if applied.is_empty() { String::new() } else { format!("  [{}]", applied.join(" ")) };
-    println!("# uncovered: {} sym — どのテストからも静的に届かない (候補 edge も数えて){filt}", strong.len());
+    println!("# uncovered: {} sym — no test reaches them statically (candidate edges included){filt}", strong.len());
     print_sym_layer(&sym_t, &paths, &strong, o.limit, "");
     if !cand_only.is_empty() {
-        println!("# 候補 edge 経由でのみ届く: {} sym (確定 edge だけでは届かない — `tests <name>` の [c1] で経路を確認)", cand_only.len());
+        println!("# reached only via candidate edges: {} sym (not via confirmed edges alone — check the path with [c1] of `tests <name>`)", cand_only.len());
         print_sym_layer(&sym_t, &paths, &cand_only, o.limit, "  ");
     }
     if trait_impls > 0 {
-        println!("# 判定外: trait 実装の method {trait_impls} sym (暗黙 / 動的に呼ばれ得るので届いたかを決められない。見るなら `search traitimpl:1 ...`)");
+        println!("# not judged: {trait_impls} trait-impl methods (may be called implicitly / dynamically, so reachability cannot be decided. To see them: `search traitimpl:1 ...`)");
     }
-    println!("# テスト = #[test] / #[tokio::test] 等。pub API は外の crate のテストから呼ばれ得る (この repo の中での話)");
+    println!("# tests = #[test] / #[tokio::test] etc. A pub API may be called by tests in other crates (this covers this repo only)");
 }
 
 /// 全テストからの前方到達: (確定 edge だけで届く sym, 候補 edge も数えて届く sym)。
@@ -967,7 +967,7 @@ pub(crate) fn run_path(db_path: &str, from: &str, to: &str) {
     if srcs.is_empty() || tgts.is_empty() {
         // どちらが無いのかを名指しし、callers と同じ typo 救済を出す (`(ok / X)` は読めなかった)。
         let missing: Vec<&str> = [(srcs.is_empty(), from), (tgts.is_empty(), to)].iter().filter(|(e, _)| *e).map(|(_, n)| *n).collect();
-        println!("# 定義が index に無い: {}", missing.join(", "));
+        println!("# not defined in the index: {}", missing.join(", "));
         for m in &missing {
             suggest_similar(&sym_t, &paths, m);
         }
@@ -993,7 +993,7 @@ pub(crate) fn run_path(db_path: &str, from: &str, to: &str) {
         }
     }
     let Some(t) = hit else {
-        println!("# {from} → {to}: 確定 edge で経路なし (候補/未解決 edge 経由なら在るかも)");
+        println!("# {from} → {to}: no path over confirmed edges (one may exist via candidate/unresolved edges)");
         return;
     };
     // t から parent を遡って経路復元 → 反転。
@@ -1009,7 +1009,7 @@ pub(crate) fn run_path(db_path: &str, from: &str, to: &str) {
         let path = paths.get(&ref_of(er.get("file"))).map(String::as_str).unwrap_or("?");
         println!("  {}{}\t{}:{}", if i == 0 { "" } else { "→ " }, sym_qual(&sym_t, e), path, num(er.get("line")));
     }
-    println!("# {} hops (確定 edge のみ・最短)", chain.len() - 1);
+    println!("# {} hops (confirmed edges only, shortest)", chain.len() - 1);
     // 終点の名前が同名の定義を複数持つ (`park`) と、最短経路は最初の 1 つで止まる。実際にはそこから同名の
     // 定義へ委譲が続くこと (`Context::park` → `Driver::park` → `TimeDriver::park` → …) が多いので、終点から
     // 確定 edge で届く同名の定義を木で続けて出す (enum で振り分ける先は枝分かれ)。
@@ -1025,9 +1025,9 @@ pub(crate) fn run_path(db_path: &str, from: &str, to: &str) {
             }
             let more = rows.len().saturating_sub(PATH_TAIL_MAX);
             println!(
-                "# 続き: 終点から同名 `{to}` の定義へ {} 個委譲が続く (確定 edge、字下げ = 段、同じ字下げの並び = 振り分け先){}",
+                "# continued: from the end, {} delegations to same-named `{to}` definitions follow (confirmed edges; indent = depth, same indent = dispatch targets){}",
                 rows.len(),
-                if more > 0 { format!("。+{more} 省略") } else { String::new() }
+                if more > 0 { format!(". +{more} omitted") } else { String::new() }
             );
         }
     }
@@ -1054,7 +1054,7 @@ fn same_name_tree(call_t: &Table, tgts: &HashSet<EntityId>, s: EntityId, depth: 
 /// eid 0 = caller 無し = **関数の外 (item 直下のマクロ引数など)**。空欄で出すと読めないので明示する。
 pub(crate) fn sym_qual(sym_t: &Table, eid: EntityId) -> String {
     if eid == 0 {
-        return "(item 直下)".to_string();
+        return "(item level)".to_string();
     }
     let er = sym_t.entity(eid);
     let ct = txt(er.get("container"));

@@ -32,9 +32,9 @@ impl CacheStatus {
         match self {
             CacheStatus::Ok => "ok",
             CacheStatus::RootMissing => "root missing",
-            CacheStatus::NoMeta => "旧版 (meta 無し)",
-            CacheStatus::LegacyFile => "旧 format (v9 単一ファイル)",
-            CacheStatus::Unreadable => "開けない (要手動確認)",
+            CacheStatus::NoMeta => "old version (no meta)",
+            CacheStatus::LegacyFile => "old format (v9 single file)",
+            CacheStatus::Unreadable => "unreadable (check manually)",
         }
     }
 }
@@ -114,7 +114,7 @@ pub(crate) fn cache_prunable(e: &CacheEntry, older_than: Option<u32>) -> Option<
         CacheStatus::Unreadable => None,
         CacheStatus::Ok => older_than
             .filter(|d| age_days(e.built_at) >= *d)
-            .map(|d| format!("{} 日前 (>= {d})", age_days(e.built_at))),
+            .map(|d| format!("{} days ago (>= {d})", age_days(e.built_at))),
     }
 }
 
@@ -126,7 +126,7 @@ pub(crate) fn mb(bytes: u64) -> String {
 pub(crate) fn cache_ls(cache: &Path) {
     let entries = cache_entries(cache);
     if entries.is_empty() {
-        println!("# cache に index が無い ({})。各 repo で一度 kenning を叩くと増える。", cache.display());
+        println!("# no index in the cache ({}). Running kenning once in a repo creates one.", cache.display());
         return;
     }
     let total: u64 = entries.iter().map(|e| e.bytes).sum();
@@ -137,7 +137,7 @@ pub(crate) fn cache_ls(cache: &Path) {
         println!("{}\t{}\t{}\t{}\t{}", e.db.display(), mb(e.bytes), age, root, e.status.label());
     }
     println!(
-        "# {} index / {} (実消費)。掃除できる: {prunable} (root 消失 / 旧版 / 旧 format)。`kenning cache prune [--older-than 日数] [--dry-run]`",
+        "# {} index / {} (actual disk). Prunable: {prunable} (root gone / old version / old format). `kenning cache prune [--older-than DAYS] [--dry-run]`",
         entries.len(),
         mb(total)
     );
@@ -153,7 +153,7 @@ pub(crate) fn cache_prune(cache: &Path, older_than: Option<u32>, dry_run: bool) 
         let Some(why) = cache_prunable(e, older_than) else { continue };
         n += 1;
         freed += e.bytes;
-        let verb = if dry_run { "削除予定" } else { "削除" };
+        let verb = if dry_run { "would delete" } else { "deleted" };
         println!("{}\t{verb} ({why}, {})", e.db.display(), mb(e.bytes));
         if !dry_run {
             // 旧 format は repo が生きている = 次に触った時に heal で焼き直される。bake 済みの
@@ -166,16 +166,16 @@ pub(crate) fn cache_prune(cache: &Path, older_than: Option<u32>, dry_run: bool) 
                 }
                 let r = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
                 if let Err(err) = r {
-                    eprintln!("# ⚠ 消せない {}: {err}", p.display());
+                    eprintln!("# ⚠ cannot delete {}: {err}", p.display());
                 }
             }
         }
     }
     let kept = entries.len() - n;
     if dry_run {
-        println!("# {n} index / {} を回収予定 (残 {kept})。実行は --dry-run を外す。", mb(freed));
+        println!("# would reclaim {n} index / {} ({kept} kept). Drop --dry-run to do it.", mb(freed));
     } else {
-        println!("# {n} index / {} を回収 (残 {kept})。", mb(freed));
+        println!("# reclaimed {n} index / {} ({kept} kept).", mb(freed));
     }
     n
 }
@@ -194,20 +194,20 @@ pub fn cmd_cache(args: &[String]) {
                 i += 1;
                 older_than = args.get(i).and_then(|v| v.parse().ok());
                 if older_than.is_none() {
-                    eprintln!("usage: --older-than <日数>");
+                    eprintln!("usage: --older-than <days>");
                     std::process::exit(2);
                 }
             }
             "--dry-run" => dry_run = true,
             other => {
-                eprintln!("usage: kenning cache [ls|prune] [--older-than <日数>] [--dry-run] (不明: {other})");
+                eprintln!("usage: kenning cache [ls|prune] [--older-than <days>] [--dry-run] (unknown: {other})");
                 std::process::exit(2);
             }
         }
         i += 1;
     }
     let Some(cache) = cache_dir() else {
-        eprintln!("# HOME が無いので ~/.cache/kenning を特定できない。");
+        eprintln!("# HOME is not set, so ~/.cache/kenning cannot be located.");
         std::process::exit(2);
     };
     match sub {

@@ -10,8 +10,8 @@ pub(crate) fn open_ro(db_path: &str) -> Option<Database> {
             Some(db)
         }
         Err(e) => {
-            eprintln!("# index を開けない ({db_path}): {e}");
-            eprintln!("# 先に: kenning index <dir> {db_path}");
+            eprintln!("# cannot open the index ({db_path}): {e}");
+            eprintln!("# first run: kenning index <dir> {db_path}");
             None
         }
     }
@@ -127,7 +127,7 @@ pub(crate) fn print_syms(sym_t: &Table, paths: &HashMap<EntityId, String>, eids:
 /// 表示を `limit` で切った時の 1 行。**そのまま打てる件数**を出す (「--limit で全部」だけだと agent が切れた
 /// 一覧をそのまま答えにする — 実 agent の A/B で Haiku が 84 件中 50 件で答えた)。
 pub(crate) fn omitted(total: usize, limit: usize) -> String {
-    format!("… (+{} 件省略 — 全 {total} 件は `--limit {total}` か `--limit 0`)", total.saturating_sub(limit))
+    format!("… (+{} omitted — all {total} with `--limit {total}` or `--limit 0`)", total.saturating_sub(limit))
 }
 
 /// `--db <path>` / `--limit <n>` を抜き取り、残りを位置引数として返す。
@@ -151,7 +151,7 @@ pub(crate) fn parse_opts(args: &[String]) -> Opts {
             // `-x` を黙って位置引数 (= 検索語 / 名前) にすると、typo した flag が「効いたように見えて
             // 効いていない」結果を返す (search は未知 facet を警告するのにここだけ素通りだった)。
             other if other.starts_with('-') && other.len() > 1 && !other[1..].starts_with(|c: char| c.is_ascii_digit()) => {
-                eprintln!("# 無視: 未知 flag \"{other}\" (共通 --db/--limit、text -e/--and/--files、read --all)。語として検索するなら `text -e` で正規表現に");
+                eprintln!("# ignored: unknown flag \"{other}\" (common: --db/--limit; text -e/--and/--files; read --all). To search for it as a term, use a regex with `text -e`");
             }
             other => pos.push(other.to_string()),
         }
@@ -163,12 +163,12 @@ pub(crate) fn parse_opts(args: &[String]) -> Opts {
         Some(d) => (d, None),
         None => {
             let Some(root) = repo_root_of(".") else {
-                eprintln!("# repo root が見つからない (cwd に .git / Cargo.toml の祖先なし)。");
-                eprintln!("# repo 内で実行するか、--db <path> / env KENNING_DB で指定を。");
+                eprintln!("# repo root not found (no .git / Cargo.toml above cwd).");
+                eprintln!("# run inside a repo, or pass --db <path> / env KENNING_DB.");
                 std::process::exit(2);
             };
             let Some(d) = auto_db_path(&root) else {
-                eprintln!("# ~/.cache/kenning を用意できない。--db <path> で指定を。");
+                eprintln!("# cannot create ~/.cache/kenning. Pass --db <path>.");
                 std::process::exit(2);
             };
             (d, Some(root))
@@ -179,7 +179,7 @@ pub(crate) fn parse_opts(args: &[String]) -> Opts {
         // auto-index: 導出 db が無ければこの場で作る (root 既知の時のみ。明示 db は誤爆防止で作らない)。
         if !std::path::Path::new(&db).exists() {
             if let Some(root) = &auto_root {
-                eprintln!("# index が無い → 自動 full index: {} → {}", root.display(), db);
+                eprintln!("# no index → auto full index: {} → {}", root.display(), db);
                 // bake 済み .scip が隣に残っていれば (cache prune は意図的に残す) 精度を引き継ぐ。
                 ensure_index(&root.to_string_lossy(), &db, scip_sidecar_of(&db).as_deref());
                 STALE_CHECKED.store(true, Ordering::Relaxed); // 今作ったばかり = 最新
@@ -216,9 +216,9 @@ pub(crate) fn maybe_auto_update(db_path: &str, auto_root: Option<&Path>) {
             // 破損・書きかけも同じ扱いで良い。明示 db は他 repo のものを潰しかねないので警告のみ。
             Err(e) => {
                 match auto_root {
-                    Some(r) => heal_full_reindex(&r.to_string_lossy(), db_path, &format!("index を開けない ({e})")),
+                    Some(r) => heal_full_reindex(&r.to_string_lossy(), db_path, &format!("cannot open the index ({e})")),
                     // 黙って返ると「鮮度を確認した上で最新」と区別が付かない (#13)。
-                    None => eprintln!("# ⚠ index を開けないので鮮度を確認できない ({db_path}: {e}) → 古い結果の可能性。"),
+                    None => eprintln!("# ⚠ cannot open the index, so freshness is unchecked ({db_path}: {e}) → results may be stale."),
                 }
                 return;
             }
@@ -230,7 +230,7 @@ pub(crate) fn maybe_auto_update(db_path: &str, auto_root: Option<&Path>) {
         Err(why) => {
             match auto_root {
                 Some(r) => heal_full_reindex(&r.to_string_lossy(), db_path, &why),
-                None => eprintln!("# ⚠ {why} → 鮮度を確認できない。`kenning index <repo>` で焼き直しを。"),
+                None => eprintln!("# ⚠ {why} → freshness unchecked. Rebuild with `kenning index <repo>`."),
             }
             return;
         }
@@ -238,7 +238,7 @@ pub(crate) fn maybe_auto_update(db_path: &str, auto_root: Option<&Path>) {
     if ver != INDEX_VER {
         // 版違い: ファイル無変更でも full 再 index (増分は旧値と新値が混ざる)。open せず直接 heal —
         // update 経路に流すと「増分 update 失敗 (旧 schema?)」の紛らわしい 2 行目が出る。
-        heal_full_reindex(&root, db_path, &format!("index の版が古い (v{ver} → v{INDEX_VER})"));
+        heal_full_reindex(&root, db_path, &format!("index format is outdated (v{ver} → v{INDEX_VER})"));
         return;
     }
     // vup / commit (節目) が bake 以降に進んでいれば焼き直す。ファイル無変更の query でも見る必要がある
@@ -253,20 +253,20 @@ pub(crate) fn maybe_auto_update(db_path: &str, auto_root: Option<&Path>) {
     // 削除だけの変更も walk で拾う)。dir 表の無い旧 index は INDEX_VER 違いで上の heal に落ちている。
     let (why_old, scan) = match known.as_ref().map(|k| fs_gate(k, built_at)) {
         Some(Gate::Fresh) if young => return,
-        Some(Gate::Fresh) => ("index が古い (mtime 上は最新だが念のため hash 照合)".to_string(), UpdateScan::Walk { trust_mtime: false }),
-        Some(Gate::Stale(files)) if young => (format!("{} file が編集済み", files.len()), UpdateScan::Stale(files)),
-        Some(Gate::Stale(_)) => ("index が古い (念のため全件 hash 照合)".to_string(), UpdateScan::Walk { trust_mtime: false }),
-        Some(Gate::DirsChanged) | None => ("dir に増減あり".to_string(), UpdateScan::Walk { trust_mtime: young }),
+        Some(Gate::Fresh) => ("index is old (mtimes look current; verifying hashes to be safe)".to_string(), UpdateScan::Walk { trust_mtime: false }),
+        Some(Gate::Stale(files)) if young => (format!("{} file(s) edited", files.len()), UpdateScan::Stale(files)),
+        Some(Gate::Stale(_)) => ("index is old (verifying all hashes to be safe)".to_string(), UpdateScan::Walk { trust_mtime: false }),
+        Some(Gate::DirsChanged) | None => ("directories changed".to_string(), UpdateScan::Walk { trust_mtime: young }),
     };
     match Database::open(db_path) {
         Ok(db) => {
             if !quiet() {
-                eprintln!("# {why_old} → 自動増分 update ({root})");
+                eprintln!("# {why_old} → incremental auto-update ({root})");
             }
             update_with_heal(db, &root, db_path, scan, &why_old); // 旧 schema なら full 再 index で自己修復
         }
         Err(e) => {
-            eprintln!("# ⚠ index が {} 日前だが lock を取れない ({e}) → 古い結果で回答。後で `kenning update` を。", age_days(built_at));
+            eprintln!("# ⚠ index is {} day(s) old but the lock is unavailable ({e}) → answering from the stale index. Run `kenning update` later.", age_days(built_at));
         }
     }
 }
@@ -304,7 +304,7 @@ pub fn cmd_read(args: &[String]) {
     let rest: Vec<String> = args.iter().filter(|a| *a != "--all").cloned().collect();
     let o = parse_opts(&rest);
     let Some(first) = o.pos.first() else {
-        eprintln!("usage: kenning read <name> [container] [crate:X] [path:S] [--all] | read <path>:<line> | read <path>:<from>-<to> | read <file>#<見出し>  [--db P]");
+        eprintln!("usage: kenning read <name> [container] [crate:X] [path:S] [--all] | read <path>:<line> | read <path>:<from>-<to> | read <file>#<heading>  [--db P]");
         return;
     };
     if let Some((p, a, b)) = split_path_range(first) {
@@ -324,7 +324,7 @@ pub fn cmd_read(args: &[String]) {
     // `read <path>` (行も見出しも無し) = file 全体は Read tool の仕事。「定義が無い」+ 近い symbol 名を
     // 返すと嘘になるので、outline を出して `:<line>` / `#<見出し>` へ誘導する。
     if looks_like_path(first) {
-        eprintln!("# {first} は file → outline を出す (本体は read <path>:<line> / read <file>#<見出し>、全文は Read)");
+        eprintln!("# {first} is a file → showing its outline (bodies: read <path>:<line> / read <file>#<heading>; whole file: Read)");
         run_outline(&o.db, first, o.limit);
         return;
     }
@@ -349,7 +349,7 @@ impl<'a> Narrow<'a> {
                 Some(("path", v)) => n.path_f = Some(v),
                 Some(("container", v)) => n.container = Some(v),
                 _ if n.container.is_none() => n.container = Some(a.as_str()),
-                _ => eprintln!("# 無視: {a} (container は 1 つ、絞るなら crate: / path:)"),
+                _ => eprintln!("# ignored: {a} (only one container; narrow further with crate: / path:)"),
             }
         }
         n
@@ -423,7 +423,7 @@ pub(crate) fn print_sym_body(sym_t: &Table, paths: &HashMap<EntityId, String>, e
     let end = (num(er.get("end_line")) as usize).max(start);
     println!("{}", fmt_sym(sym_t, paths, eid));
     let Ok(src) = std::fs::read_to_string(&path) else {
-        println!("# source を読めない: {path} (index 時と cwd が違う? full path で index を)");
+        println!("# cannot read source: {path} (cwd differs from index time? index with a full path)");
         return;
     };
     let lines: Vec<&str> = src.lines().collect();
@@ -440,7 +440,7 @@ pub(crate) fn print_lines(path: &str, lines: &[&str], s: usize, e: usize) {
     }
     if shown_end < e {
         // 続きも kenning で読める (範囲 read があるので Read tool に投げ直さなくていい)。
-        println!("# … 長大なので {READ_MAX_LINES} 行で打ち切り (+{} 行)。続き: `read {path}:{}-{e}`", e - shown_end, shown_end + 1);
+        println!("# … long item, cut at {READ_MAX_LINES} lines (+{} more). Continue: `read {path}:{}-{e}`", e - shown_end, shown_end + 1);
     }
 }
 
@@ -460,12 +460,12 @@ pub(crate) fn run_read_range(db_path: &str, path_arg: &str, from: usize, to: usi
     let path = paths[&fe].clone();
     let lang = num(file_t.entity(fe).get("lang"));
     let Ok(src) = std::fs::read_to_string(&path) else {
-        println!("# source を読めない: {path}");
+        println!("# cannot read source: {path}");
         return;
     };
     let lines: Vec<&str> = src.lines().collect();
     if from > lines.len() {
-        println!("# {path}:{from}-{to} は file の外 ({} 行しかない)", lines.len());
+        println!("# {path}:{from}-{to} is outside the file (only {} lines)", lines.len());
         return;
     }
     let to = to.min(lines.len());
@@ -501,7 +501,7 @@ pub(crate) fn run_read_range(db_path: &str, path_arg: &str, from: usize, to: usi
         k if k <= 6 => format!(" — {}", covered.join(", ")),
         k => format!(" — {}, …+{}", covered[..6].join(", "), k - 6),
     };
-    println!("{path}:{from}	{n} 行 ({from}-{to}){what}");
+    println!("{path}:{from}	{n} lines ({from}-{to}){what}");
     print_lines(&path, &lines, from, to);
 }
 
@@ -537,7 +537,7 @@ pub(crate) fn run_read_at(db_path: &str, path_arg: &str, line: usize) {
         }
     }
     let Ok(src) = std::fs::read_to_string(&path) else {
-        println!("# source を読めない: {path}");
+        println!("# cannot read source: {path}");
         return;
     };
     let lines: Vec<&str> = src.lines().collect();
@@ -551,7 +551,7 @@ pub(crate) fn run_read_at(db_path: &str, path_arg: &str, line: usize) {
             return;
         }
     }
-    println!("# {path}:{line} を囲む定義が無い → 前後 20 行");
+    println!("# no enclosing definition at {path}:{line} → showing ±20 lines");
     print_lines(&path, &lines, line.saturating_sub(20).max(1), line + 20);
 }
 
@@ -567,12 +567,12 @@ pub(crate) fn run_read_section(db_path: &str, path_arg: &str, heading: &str) {
     let path = paths[&fe].clone();
     let lang = num(file_t.entity(fe).get("lang"));
     let Ok(src) = std::fs::read_to_string(&path) else {
-        println!("# source を読めない: {path}");
+        println!("# cannot read source: {path}");
         return;
     };
     let containers = text_containers(lang, &src);
     if containers.is_empty() {
-        println!("# {path} には見出し構造が無い (md の #, toml の [table], yaml のキーのみ対応)。`read {path_arg}:<line>` で位置指定を。");
+        println!("# {path} has no headings (supported: md #, toml [table], yaml keys). Use `read {path_arg}:<line>`.");
         return;
     }
     // 一致は「その見出し自身の題」で見る (階層全体だと親の題が子にも含まれて全部当たる)。
@@ -580,7 +580,7 @@ pub(crate) fn run_read_section(db_path: &str, path_arg: &str, heading: &str) {
     let hits: Vec<usize> = (0..containers.len()).filter(|&i| section_title(&containers[i].1, lang).to_lowercase().contains(&h)).collect();
     match hits.as_slice() {
         [] => {
-            println!("# \"{heading}\" に一致する見出しが {path} に無い。ある見出し:");
+            println!("# no heading matching \"{heading}\" in {path}. Headings:");
             for (l, c) in containers.iter().take(50) {
                 println!("{path}:{l}\t{c}");
             }
@@ -592,7 +592,7 @@ pub(crate) fn run_read_section(db_path: &str, path_arg: &str, heading: &str) {
             print_lines(&path, &lines, s, e);
         }
         many => {
-            println!("# \"{heading}\" は {} 箇所。絞るか `read {path_arg}:<line>` で:", many.len());
+            println!("# \"{heading}\" matches {} headings. Narrow it or use `read {path_arg}:<line>`:", many.len());
             for &i in many {
                 println!("{path}:{}\t{}", containers[i].0, containers[i].1);
             }
@@ -632,13 +632,13 @@ pub(crate) fn run_read(db_path: &str, name: &str, narrow: &Narrow, all: bool, li
 
     let defs = narrow.defs(&sym_t, &paths, name);
     if defs.is_empty() {
-        println!("# \"{name}\" の定義が index に無い{}。", narrow.describe());
+        println!("# \"{name}\" is not defined in the index{}.", narrow.describe());
         suggest_similar(&sym_t, &paths, name);
         return;
     }
     if defs.len() > 1 && !all {
         println!(
-            "# \"{name}\" は {} 定義 (同名)。絞る: `read {name} <container>` / `crate:<crate>` / `path:<path の一部>`、全部出すなら `--all`:",
+            "# \"{name}\" has {} same-named definitions. Narrow: `read {name} <container>` / `crate:<crate>` / `path:<part of path>`; show all with `--all`:",
             defs.len()
         );
         print_syms(&sym_t, &paths, &defs, limit, true);
@@ -704,16 +704,16 @@ pub fn cmd_search(args: &[String]) {
     let lexical = !args.iter().any(|a| a == "--no-lexical");
     let o = parse_opts(&args.iter().filter(|a| *a != "--no-lexical").cloned().collect::<Vec<_>>());
     if o.pos.is_empty() {
-        eprintln!("usage: kenning search <facet...> [--no-lexical]  例: kind:method vis:pub calls:unwrap");
+        eprintln!("usage: kenning search <facet...> [--no-lexical]  e.g. kind:method vis:pub calls:unwrap");
         eprintln!("  facet: name: kind:(fn|method|struct|enum|trait|const) vis:(pub|crate|restricted|priv)");
-        eprintln!("         async:(0|1) test:(0|1) traitimpl:(0|1) crate: container: module: path:(部分一致)");
-        eprintln!("         attr:<substr>  属性の部分一致 (deprecated / allow(dead_code) / serde / cfg(...))");
-        eprintln!("         reachable:(0|1)  live root (pub/test/trait 実装/main/item マクロ) からの到達可能性");
-        eprintln!("         callers:<n> namecalls:<n>  (被呼び出し数。`callers:0 namecalls:0` = 未使用候補)");
-        eprintln!("         calls:<name>  (本体で <name> を呼ぶ sym に絞る = grep 不可の edge×facet AND)");
-        eprintln!("         unsafe:(1|fn|block|0)  unsafe fn / 本体に unsafe block の safe fn (健全性の境界)");
-        eprintln!("         self:(ref|mut|owned|none)  受け手 &self / &mut self / self / 無し");
-        eprintln!("         reaches:<X> reachable-from:<X>  X に届く / X から届く sym (impact / callees の推移閉包と AND)");
+        eprintln!("         async:(0|1) test:(0|1) traitimpl:(0|1) crate: container: module: path:(substring)");
+        eprintln!("         attr:<substr>  attribute substring (deprecated / allow(dead_code) / serde / cfg(...))");
+        eprintln!("         reachable:(0|1)  reachability from live roots (pub/test/trait impls/main/item macros)");
+        eprintln!("         callers:<n> namecalls:<n>  (incoming call counts; `callers:0 namecalls:0` = unused candidates)");
+        eprintln!("         calls:<name>  (symbols whose body calls <name> = edge × facet AND, impossible with grep)");
+        eprintln!("         unsafe:(1|fn|block|0)  unsafe fn / safe fn with an unsafe block (soundness boundary)");
+        eprintln!("         self:(ref|mut|owned|none)  receiver &self / &mut self / self / none");
+        eprintln!("         reaches:<X> reachable-from:<X>  symbols that reach X / are reached from X (transitive impact / callees, ANDed)");
         return;
     }
     run_search_opt(&o.db, &o.pos, o.limit, false, lexical);
@@ -745,7 +745,7 @@ pub(crate) fn search_hits(sym_t: &Table, call_t: &Table, paths: &HashMap<EntityI
     let mut attr_filters: Vec<String> = Vec::new(); // attr:X = 属性文字列の部分一致 (複数は AND)
     for f in facets {
         let Some((k, v)) = f.split_once(':') else {
-            eprintln!("# 無視: \"{f}\" (key:value 形式で)");
+            eprintln!("# ignored: \"{f}\" (use key:value)");
             continue;
         };
         match k {
@@ -761,11 +761,11 @@ pub(crate) fn search_hits(sym_t: &Table, call_t: &Table, paths: &HashMap<EntityI
             }
             "kind" => match kind_code(v) {
                 Some(c) => { q = q.where_eq("kind", c); applied.push(format!("kind={v}")); }
-                None => eprintln!("# 無視: 未知 kind \"{v}\" (fn/method/struct/enum/trait/const)"),
+                None => eprintln!("# ignored: unknown kind \"{v}\" (fn/method/struct/enum/trait/const)"),
             },
             "vis" => match vis_code(v) {
                 Some(c) => { q = q.where_eq("vis", c); applied.push(format!("vis={v}")); }
-                None => eprintln!("# 無視: 未知 vis \"{v}\" (pub/crate/restricted/priv)"),
+                None => eprintln!("# ignored: unknown vis \"{v}\" (pub/crate/restricted/priv)"),
             },
             "async" => { q = q.where_eq("is_async", bool01(v)); applied.push(format!("async={v}")); }
             "test" => { q = q.where_eq("is_test", bool01(v)); applied.push(format!("test={v}")); }
@@ -777,13 +777,13 @@ pub(crate) fn search_hits(sym_t: &Table, call_t: &Table, paths: &HashMap<EntityI
                 "1" => { unsafe_any = true; applied.push("unsafe=1".into()); }
                 _ => match UNSAFE_NAMES.iter().position(|n| *n == v) {
                     Some(c) => { q = q.where_eq("unsafety", c as u32); applied.push(format!("unsafe={v}")); }
-                    None => eprintln!("# 無視: 未知 unsafe \"{v}\" (1/fn/block/0)"),
+                    None => eprintln!("# ignored: unknown unsafe \"{v}\" (1/fn/block/0)"),
                 },
             },
             // self:ref (&self) / self:mut (&mut self) / self:owned (self) / self:none (関連関数・自由関数) (#5)
             "self" => match RECV_NAMES.iter().position(|n| *n == v) {
                 Some(c) => { q = q.where_eq("recv", c as u32); applied.push(format!("self={v}")); }
-                None => eprintln!("# 無視: 未知 self \"{v}\" (ref/mut/owned/none)"),
+                None => eprintln!("# ignored: unknown self \"{v}\" (ref/mut/owned/none)"),
             },
             // 属性の部分一致 (`attr:deprecated` / `attr:allow(dead_code)` / `attr:serde`)。
             // 特定属性を特別扱いしないので、廃止予定 API の利用調査にも dead 判定の裏取りにも効く。
@@ -810,9 +810,9 @@ pub(crate) fn search_hits(sym_t: &Table, call_t: &Table, paths: &HashMap<EntityI
                     if k == "callers" { want_callers = Some(n) } else { want_namecalls = Some(n) }
                     applied.push(format!("{k}={n}"));
                 }
-                Err(_) => eprintln!("# 無視: {k}:\"{v}\" は数値で (例: {k}:0)"),
+                Err(_) => eprintln!("# ignored: {k}:\"{v}\" must be a number (e.g. {k}:0)"),
             },
-            _ => eprintln!("# 無視: 未知 facet key \"{k}\" (name/kind/vis/async/test/unsafe/self/crate/container/module/calls/path/reachable/reaches/reachable-from/callers/namecalls/attr/traitimpl)"),
+            _ => eprintln!("# ignored: unknown facet key \"{k}\" (name/kind/vis/async/test/unsafe/self/crate/container/module/calls/path/reachable/reaches/reachable-from/callers/namecalls/attr/traitimpl)"),
         }
     }
     let mut hits = q.find().unwrap();
@@ -862,8 +862,8 @@ pub(crate) fn search_hits(sym_t: &Table, call_t: &Table, paths: &HashMap<EntityI
         hits.retain(|e| !used.contains(&txt(sym_t.entity(*e).get("name"))));
         let dropped = before - hits.len();
         if dropped > 0 {
-            applied.push(format!("字句照合で -{dropped}"));
-            println!("# 字句照合で {dropped} 件除外 (定義以外に名前が出現 — コメント/文字列も含むので安全側に倒している)。除外分も見るなら `--no-lexical`");
+            applied.push(format!("lexical -{dropped}"));
+            println!("# lexical check dropped {dropped} (the name appears outside its definition — comments/strings count too, to stay safe). Use `--no-lexical` to see them");
         }
     }
     // edge facet: 本体が X を呼ぶ sym だけ残す (grep には表現できない sym facet × call edge の AND)。
@@ -880,7 +880,7 @@ pub(crate) fn search_hits(sym_t: &Table, call_t: &Table, paths: &HashMap<EntityI
     for (forward, name) in &reach_filters {
         let defs = defs_of(sym_t, name, None);
         if defs.is_empty() {
-            eprintln!("# ⚠ {} の起点 \"{name}\" の定義が index に無い → 0 件", if *forward { "reachable-from" } else { "reaches" });
+            eprintln!("# ⚠ {} target \"{name}\" is not defined in the index → 0 results", if *forward { "reachable-from" } else { "reaches" });
         }
         let set: HashSet<EntityId> = if *forward {
             callee_closure(call_t, &defs)
@@ -902,8 +902,8 @@ pub(crate) fn run_search_opt(db_path: &str, facets: &[String], limit: usize, wit
     let SearchHits { hits, applied, zero_query } = search_hits(&sym_t, &call_t, &paths, facets, lexical);
     println!("# {} symbols  [{}]", hits.len(), applied.join(" "));
     if zero_query {
-        println!("# 呼ばれていない = この index の中での話。pub は外部 crate から、trait impl の method は動的に呼ばれ得る (test:0 で #[test] を除ける)");
-        println!("# const / struct / enum は呼び出し edge を持たないので常に 0 → `kind:fn` / `kind:method` と併用する");
+        println!("# uncalled = within this index only. pub items may be called from other crates, trait impl methods dynamically (test:0 excludes #[test])");
+        println!("# const / struct / enum have no call edges, so they are always 0 → combine with `kind:fn` / `kind:method`");
     }
     // name 等値で 0 件 = typo の可能性 → callers と同じ救済 (`def` の主な失敗はこれ)。
     // 他 facet で 0 になった場合は名前自体は在るので黙る (嘘の「無い」を出さない)。
@@ -938,7 +938,7 @@ pub(crate) fn run_callers(db_path: &str, name: &str, narrow: &Narrow, limit: usi
     let bare = split_qualified(name).0;
     let name_total = call_t.where_eq("callee", bare).count().unwrap();
     if defs.is_empty() {
-        println!("# \"{name}\" の定義が index に無い{}。名前一致の call = {name_total} 件 (外部/未解決)", narrow.describe());
+        println!("# \"{name}\" is not defined in the index{}. Call sites with this name = {name_total} (external/unresolved)", narrow.describe());
         suggest_similar(&sym_t, &paths, name);
         return;
     }
@@ -952,7 +952,7 @@ pub(crate) fn run_callers(db_path: &str, name: &str, narrow: &Narrow, limit: usi
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.0)); // caller 数 降順
         let precise_sum: usize = rows.iter().map(|(n, _)| n).sum();
-        println!("# \"{name}\" は {} 型が定義 (同名)。定義ごとの精密 caller 数:", defs.len());
+        println!("# \"{name}\" has {} same-named definitions. Confirmed callers per definition:", defs.len());
         for (n, d) in rows.iter().take(limit) {
             let er = sym_t.entity(*d);
             let ct = txt(er.get("container"));
@@ -966,9 +966,9 @@ pub(crate) fn run_callers(db_path: &str, name: &str, narrow: &Narrow, limit: usi
             c if c.is_empty() => format!("path:{}", paths.get(&ref_of(top.get("file"))).map(String::as_str).unwrap_or("?")),
             c => c,
         };
-        println!("# 絞る: `callers {name} <container>` / `crate:<crate>` / `path:<path の一部>` (例: `callers {name} {hint}`) — 未確定の候補も位置付きで出る");
+        println!("# narrow: `callers {name} <container>` / `crate:<crate>` / `path:<part of path>` (e.g. `callers {name} {hint}`) — unresolved candidates are listed with positions too");
         if unresolved > 0 {
-            println!("# 名前一致 {name_total} 件中 {precise_sum} 件を確定。残り {unresolved} 件は未確定(候補、drill-in で位置表示)。");
+            println!("# {precise_sum} of {name_total} call sites with this name confirmed. The other {unresolved} are unresolved candidates (narrow to see positions).");
         }
         return;
     }
@@ -993,7 +993,7 @@ pub(crate) fn run_callers(db_path: &str, name: &str, narrow: &Narrow, limit: usi
         precise_sum += calls.len();
         let mut rows: Vec<(String, u32, String)> = calls.iter().map(|&c| caller_label(c)).collect();
         rows.sort();
-        println!("  ← {} 確実 callers (callee_sym 逆引き、誤りなし):", rows.len());
+        println!("  ← {} confirmed callers (never wrong):", rows.len());
         for (p, ln, cq) in rows.iter().take(limit) {
             println!("{}", append_src(format!("    {p}:{ln}\tin {cq}"), src.line(p, *ln)));
         }
@@ -1018,7 +1018,7 @@ pub(crate) fn run_callers(db_path: &str, name: &str, narrow: &Narrow, limit: usi
     let other = name_total.saturating_sub(precise_sum).saturating_sub(cand.len());
     if !cand.is_empty() {
         println!(
-            "  ⚠ {} 候補 (名前一致だが未確定 — 要確認、確実集合の漏れはここに全部):",
+            "  ⚠ {} unresolved candidates (name matches but unconfirmed — check these; anything missing from confirmed is here):",
             cand.len()
         );
         for (p, ln, cq, res) in cand.iter().take(limit) {
@@ -1042,18 +1042,18 @@ pub(crate) fn run_callers(db_path: &str, name: &str, narrow: &Narrow, limit: usi
         }
         let mut to: Vec<(usize, EntityId)> = to.into_iter().map(|(e, n)| (n, e)).collect();
         to.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        println!("  ↳ {other} 件は別の同名 sym に確定 (行き先の定義ごと。位置は `callers <その修飾名>`):");
+        println!("  ↳ {other} resolved to another same-named symbol (per target; positions via `callers <its qualified name>`):");
         for (n, e) in to.iter().take(limit) {
             let er = sym_t.entity(*e);
             let path = paths.get(&ref_of(er.get("file"))).map(String::as_str).unwrap_or("?");
             println!("    {n:>5}  {}  {path}:{}", sym_qual(&sym_t, *e), num(er.get("line")));
         }
         if to.len() > limit {
-            println!("    … (+{} 定義省略)", to.len() - limit);
+            println!("    … (+{} definitions omitted)", to.len() - limit);
         }
     }
     println!(
-        "# 名前一致 {name_total} = 確実 {precise_sum} + 候補未確定 {} + 別の同名 sym に確定 {other} — 名前 `{bare}` の呼び出し箇所は全部この 3 つのどれか (grep で数え直さなくていい)",
+        "# {name_total} call sites named `{bare}` = {precise_sum} confirmed + {} unresolved candidates + {other} resolved to another same-named symbol — every call site of `{bare}` is in one of these 3 (no need to re-count with grep)",
         cand.len()
     );
     // 0 件で終わる trait 実装 method は「使われていない」ではなく **trait 経由で呼ばれる** だけ。
@@ -1067,11 +1067,11 @@ pub(crate) fn run_callers(db_path: &str, name: &str, narrow: &Narrow, limit: usi
             let ct = txt(sym_t.entity(d).get("container"));
             let traits = traits_implemented_at(&db, &sym_t, d);
             let list = if traits.is_empty() { "?".to_string() } else { traits.join(" / ") };
-            println!("# {ct}::{bare} は trait 実装 → 呼び出しは trait 経由なので名前が現れない (0 件 ≠ 未使用)。");
-            println!("# この file が {ct} に実装している trait: {list}");
+            println!("# {ct}::{bare} is a trait impl → called through the trait, so the name does not appear at call sites (0 ≠ unused).");
+            println!("# traits this file implements for {ct}: {list}");
             match traits.first() {
-                Some(t) => println!("# 次: `callers {bare}` (同名 method 全体) / `impls {t}` (兄弟実装)"),
-                None => println!("# 次: `callers {bare}` (同名 method 全体)"),
+                Some(t) => println!("# next: `callers {bare}` (all same-named methods) / `impls {t}` (sibling impls)"),
+                None => println!("# next: `callers {bare}` (all same-named methods)"),
             }
             break;
         }
@@ -1163,13 +1163,13 @@ pub(crate) fn run_callees(db_path: &str, name: &str, narrow: &Narrow, limit: usi
     let paths = file_paths(&file_t);
     let defs = narrow.defs(&sym_t, &paths, name);
     if defs.is_empty() {
-        println!("# \"{name}\" の定義が index に無い{}。", narrow.describe());
+        println!("# \"{name}\" is not defined in the index{}.", narrow.describe());
         suggest_similar(&sym_t, &paths, name);
         return;
     }
     if defs.len() > 1 {
         // 同名を混ぜて読まれないよう、定義ごとに分けて出すことを先に言う。
-        println!("# \"{name}\"{} は同名 {} 定義 — 定義ごとに分けて出す (1 つに絞るなら container / crate:X / path:S)", narrow.describe(), defs.len());
+        println!("# \"{name}\"{} has {} same-named definitions — listed per definition (narrow with container / crate:X / path:S)", narrow.describe(), defs.len());
     }
     for &d in &defs {
         println!("{}", fmt_sym(&sym_t, &paths, d));
@@ -1191,7 +1191,7 @@ pub(crate) fn run_callees(db_path: &str, name: &str, narrow: &Narrow, limit: usi
             })
             .collect();
         rows.sort();
-        println!("  → {} 確定 callees (呼ぶ先 workspace 定義、path:line = 定義位置):", rows.len());
+        println!("  → {} confirmed callees (workspace definitions; path:line = definition):", rows.len());
         for (p, ln, t, n) in rows.iter().take(limit) {
             println!("    {p}:{ln}\t→ {}  (×{n})", sym_qual(&sym_t, *t));
         }
@@ -1203,7 +1203,7 @@ pub(crate) fn run_callees(db_path: &str, name: &str, narrow: &Narrow, limit: usi
             ext.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0))); // 呼び回数 降順
             let shown: Vec<String> = ext.iter().take(12).map(|(n, c)| format!("{n}(×{c})")).collect();
             println!(
-                "  → 外部/未解決 {} 種 (std/dep/型推論待ち): {}{}",
+                "  → {} external/unresolved (std/deps/type inference pending): {}{}",
                 external.len(), shown.join(", "), if external.len() > 12 { " …" } else { "" }
             );
         }
@@ -1224,7 +1224,7 @@ pub(crate) fn run_impls(db_path: &str, name: &str, limit: usize) {
     let Some(db) = open_ro(db_path) else { return };
     let file_t = db.get_table("file").unwrap();
     let Some(impl_t) = db.get_table("impl") else {
-        println!("# impl 情報が無い (旧 index)。`kenning index <dir>` で再 index すると使える。");
+        println!("# no impl data (old index). Rebuild with `kenning index <dir>`.");
         return;
     };
     let paths = file_paths(&file_t);
@@ -1253,21 +1253,21 @@ pub(crate) fn run_impls(db_path: &str, name: &str, limit: usize) {
         let sym_t = db.get_table("sym").unwrap();
         let defs = sym_t.where_eq("name", name).find().unwrap();
         if defs.is_empty() {
-            println!("# \"{name}\" という定義が index に無い。");
+            println!("# \"{name}\" is not defined in the index.");
             suggest_similar(&sym_t, &paths, name);
         } else {
-            println!("# \"{name}\" は定義済みだが trait 実装が無い (inherent impl のみ、or impl が外部・cfg 非活性)。");
+            println!("# \"{name}\" is defined but has no trait impls (inherent impls only, or impls are external / cfg-disabled).");
             println!("{}", fmt_sym(&sym_t, &paths, defs[0]));
-            println!("# メソッド一覧は `search container:{name}`、使われ方は `callers {name}` / `refs {name}`。");
+            println!("# methods: `search container:{name}`; usage: `callers {name}` / `refs {name}`.");
         }
         return;
     }
     if !as_trait.is_empty() {
-        println!("# trait \"{name}\" を実装する型 ({}):", as_trait.len());
+        println!("# types implementing trait \"{name}\" ({}):", as_trait.len());
         dump(&as_trait, "type_name");
     }
     if !as_type.is_empty() {
-        println!("# 型 \"{name}\" が実装する trait ({}):", as_type.len());
+        println!("# traits implemented by type \"{name}\" ({}):", as_type.len());
         dump(&as_type, "trait_name");
     }
 }
@@ -1290,8 +1290,8 @@ pub fn cmd_text(args: &[String]) {
     let terms: Vec<String> = terms.into_iter().cloned().collect();
     if terms.is_empty() {
         eprintln!("usage: kenning text <term>... [-e] [--and] [--files] [path:<substr>] [--db P] [--limit N]");
-        eprintln!("  複数語は既定 OR、--and で全語を含む行だけ。-e で正規表現 (大小無視、区別するなら (?-i)Foo)。");
-        eprintln!("  --files で file 別件数だけ (広い語の triage)。path: で対象ファイルを絞る (複数は OR)");
+        eprintln!("  several terms = OR by default; --and = lines with every term. -e = regex (case-insensitive; (?-i)Foo to match case).");
+        eprintln!("  --files = per-file counts only (to triage a wide term). path: narrows files (several = OR)");
         return;
     }
     let needle = terms.join(if and { " & " } else { " | " });
@@ -1396,23 +1396,23 @@ pub fn cmd_text(args: &[String]) {
         per_file.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         shown = per_file.len().min(o.limit);
         for (n, p) in per_file.iter().take(o.limit) {
-            println!("{p}\t{n} 件");
+            println!("{p}\t{n} hits");
         }
     }
-    let scope = if path_fs.is_empty() { String::new() } else { format!(" (path: {} の {} files)", path_fs.join(" | "), files.len()) };
+    let scope = if path_fs.is_empty() { String::new() } else { format!(" (path: {}, {} files)", path_fs.join(" | "), files.len()) };
     if files_only {
         if total == 0 {
-            println!("# \"{needle}\" は index 済みファイルに無い{scope}");
+            println!("# \"{needle}\" not found in indexed files{scope}");
         } else {
-            let more = if per_file.len() > shown { format!(" — 表示 {shown} file、`--limit {}` で全部", per_file.len()) } else { String::new() };
-            println!("# {total} 件 / {} files{scope}{more} — 本文は path: で file を絞って再検索 / `read <path>:<line>`", per_file.len());
+            let more = if per_file.len() > shown { format!(" — showing {shown} files, all with `--limit {}`", per_file.len()) } else { String::new() };
+            println!("# {total} hits / {} files{scope}{more} — for lines, re-run narrowed with path: / `read <path>:<line>`", per_file.len());
         }
     } else if total == 0 {
-        println!("# \"{needle}\" は index 済みファイルに無い{scope} (.rs + テキスト全般。binary と >1MiB と gitignore 済みは対象外)");
+        println!("# \"{needle}\" not found in indexed files{scope} (.rs + all text files; binary, >1MiB and gitignored files are excluded)");
     } else if total > shown {
-        println!("# {total} 件 / {n_files} files{scope} — 表示 {shown}、`--limit {total}` で全部");
+        println!("# {total} hits / {n_files} files{scope} — showing {shown}, all with `--limit {total}`");
     } else {
-        println!("# {total} 件 / {n_files} files{scope}");
+        println!("# {total} hits / {n_files} files{scope}");
     }
 }
 
@@ -1432,7 +1432,7 @@ impl TextMatcher {
             match regex::RegexBuilder::new(p).case_insensitive(true).build() {
                 Ok(re) => res.push(re),
                 Err(e) => {
-                    println!("# 正規表現が不正: {}: {e}", terms.join(" | "));
+                    println!("# invalid regex: {}: {e}", terms.join(" | "));
                     return None;
                 }
             }
@@ -1583,7 +1583,7 @@ pub(crate) fn run_outline(db_path: &str, path_arg: &str, limit: usize) {
     // 非 Rust は見出し構造 (md の # 階層 / toml の [table] / yaml のキーパス) を出す。`read <file>#<見出し>` の目次。
     if num(file_t.entity(fe).get("lang")) != LANG_RUST {
         let Ok(src) = std::fs::read_to_string(path) else {
-            eprintln!("# source を読めない: {path}");
+            eprintln!("# cannot read source: {path}");
             return;
         };
         let containers = text_containers(num(file_t.entity(fe).get("lang")), &src);
@@ -1634,7 +1634,7 @@ pub(crate) fn outline_dir(file_t: &Table, sym_t: &Table, paths: &HashMap<EntityI
     for s in sym_t.all().find().unwrap() {
         *n_syms.entry(ref_of(sym_t.entity(s).get("file"))).or_default() += 1;
     }
-    println!("# {pref} : {} files (詳細は outline <path>)", files.len());
+    println!("# {pref} : {} files (details: outline <path>)", files.len());
     for (p, e) in files.iter().take(limit) {
         let er = file_t.entity(*e);
         let loc = num(er.get("loc"));
@@ -1672,13 +1672,13 @@ pub fn cmd_stats(args: &[String]) {
         .iter()
         .filter_map(|t| db.table_eid_usage(t).map(|u| format!("{t} {}%", u.allocated as u64 * 100 / u.capacity.max(1) as u64)))
         .collect();
-    println!("capacity: {} (残 eid {})", usage.join(" "), db.remaining_eid_capacity());
+    println!("capacity: {} ({} eids left)", usage.join(" "), db.remaining_eid_capacity());
     // disk の内訳: vocab 索引 (hash) は予約全域に slot が散るので、予約 ≒ 実消費になる (#15)。
     let vocab = db.engine().vocab_orphan_stats().vocab_total;
     let vix = Path::new(&o.db).join(VOCAB_INDEX_SEG);
     let vix_slots = std::fs::metadata(&vix).map(|m| m.len() / VOCAB_SLOT_BYTES).unwrap_or(0);
     println!(
-        "disk: 実 {:.1} MB (うち vocab 索引 {:.1} MB) / vocab {vocab} 語 (索引 {vix_slots} slot = 充填 {:.1}%)",
+        "disk: {:.1} MB real (vocab index {:.1} MB) / vocab {vocab} terms (index {vix_slots} slots = {:.1}% full)",
         real_bytes(Path::new(&o.db)) as f64 / 1_048_576.0,
         real_bytes(&vix) as f64 / 1_048_576.0,
         pct_of(vocab as usize, vix_slots as usize)
@@ -1687,9 +1687,9 @@ pub fn cmd_stats(args: &[String]) {
     // (再 index で SCIP が落ちても気付けず、impact が静かに縮む事故が起きる)
     let n_ref = db.get_table("ref").map(|t| t.all().count().unwrap_or(0)).unwrap_or(0);
     match (scip_stale_files(&db), n_ref) {
-        (Some(u), n) if u >= SCIP_STALE_FILES => println!("bake: 済み ({n} refs) だが bake 後 {u} ファイル変更 → `kenning bake` で焼き直しを"),
-        (Some(_), n) => println!("bake: 済み ({n} refs) = refs / callers は rust-analyzer 同等精度"),
-        (None, _) => println!("bake: 無し = syn 層のみ (確実 edge は控えめ)。`kenning bake` で精密化"),
+        (Some(u), n) if u >= SCIP_STALE_FILES => println!("bake: done ({n} refs) but {u} files changed since → re-run `kenning bake`"),
+        (Some(_), n) => println!("bake: done ({n} refs) = refs / callers at rust-analyzer precision"),
+        (None, _) => println!("bake: none = syn layer only (fewer confirmed edges). `kenning bake` for precision"),
     }
     // 解決率は **外部呼び出しを分母から外して**出す。std / 依存 crate への呼び出しは index に
     // 定義が無く構造的に解決不能で、混ぜると「率が低い = 精度が低い」に読めてしまうため
@@ -1701,7 +1701,7 @@ pub fn cmd_stats(args: &[String]) {
         None => ResolveStats::of(&call_t),
     };
     if let Some(needle) = filter {
-        println!("(path:{needle} で絞り込み: {} call-sites)", rs.total);
+        println!("(narrowed to path:{needle}: {} call-sites)", rs.total);
     }
     print!("resolve:");
     for (r, nm) in RES_NAMES.iter().enumerate() {
@@ -1709,7 +1709,7 @@ pub fn cmd_stats(args: &[String]) {
     }
     println!();
     println!(
-        "  repo 内 {} 件 (外部/std {} を除く) の確定率 {:.1}% — 未確定 {}: 受け手不明の method {} / 同名複数 {} / 値渡し {} / マクロ {} / 未解決 {}",
+        "  {} in-repo call sites (excluding {} external/std): {:.1}% confirmed — {} unconfirmed: unknown receiver {} / same-named {} / passed as value {} / macro {} / unresolved {}",
         rs.local(),
         rs.n(R_EXTERNAL),
         rs.local_pct(),
@@ -1751,6 +1751,6 @@ pub(crate) fn timed<F: Fn() -> usize>(label: &str, f: F) -> usize {
         cnt = f();
         best = best.min(t.elapsed());
     }
-    println!("  {:<52} = {:>7} 件  [{:?}]", label, cnt, best);
+    println!("  {:<52} = {:>7}  [{:?}]", label, cnt, best);
     cnt
 }
